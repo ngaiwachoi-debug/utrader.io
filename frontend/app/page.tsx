@@ -1,146 +1,114 @@
-"use client";
-import React, { useState, useEffect } from 'react';
-import { Activity, ShieldCheck, Cpu, ArrowUpRight, Globe, Layers } from 'lucide-react';
+"use client"
 
-export default function UTraderDashboard() {
-  const [data, setData] = useState<any>(null);
+import Link from "next/link"
+import { useT } from "@/lib/i18n"
+import { TrendingUp, Zap, Shield, BarChart3 } from "lucide-react"
 
-  useEffect(() => {
-    const fetchStats = async () => {
-      try {
-        const response = await fetch('http://127.0.0.1:8000/bot-stats/1');
-        const result = await response.json();
-        if (result.active) setData(result);
-      } catch (e) { console.error("utrader.io uplink error:", e); }
-    };
-    fetchStats();
-    const interval = setInterval(fetchStats, 5000);
-    return () => clearInterval(interval);
-  }, []);
+export default function LandingPage() {
+  const t = useT()
 
   return (
-    <div className="min-h-screen bg-[#0a0a0b] text-slate-300 font-sans selection:bg-emerald-500/30">
-      {/* Institutional Top Bar */}
-      <nav className="border-b border-white/5 bg-[#0a0a0b]/80 backdrop-blur-md sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex justify-between items-center">
-          <div className="flex items-center gap-8">
-            <h1 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
-              <div className="w-6 h-6 bg-emerald-500 rounded-sm flex items-center justify-center">
-                <div className="w-2 h-2 bg-black rotate-45" />
-              </div>
-              utrader<span className="text-emerald-500">.io</span>
-            </h1>
-            <div className="hidden md:flex gap-6 text-xs font-medium text-slate-500 uppercase tracking-widest">
-              <span className="text-emerald-500 border-b border-emerald-500 pb-5 mt-5">Terminal</span>
-              <span className="hover:text-slate-300 cursor-pointer">Security</span>
-              <span className="hover:text-slate-300 cursor-pointer">API</span>
-            </div>
-          </div>
-          <div className="flex items-center gap-4 text-[10px] font-mono">
-            <div className="flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full border border-white/10">
-              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-slate-400">NODE_B_01: ACTIVE</span>
-            </div>
+    <div className="min-h-screen bg-background">
+      {/* Nav */}
+      <header className="sticky top-0 z-50 border-b border-border bg-card/80 backdrop-blur-md">
+        <div className="flex h-14 items-center justify-between px-4 lg:px-6">
+          <Link href="/" className="text-sm font-semibold text-foreground">
+            uTrader<span className="text-emerald">.io</span>
+          </Link>
+          <div className="flex items-center gap-3">
+            <Link
+              href="/login"
+              className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-secondary transition-colors"
+            >
+              {t("landing.login")}
+            </Link>
+            <Link
+              href="/login"
+              className="rounded-lg bg-emerald px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+            >
+              {t("landing.startFreeTrial")}
+            </Link>
           </div>
         </div>
-      </nav>
+      </header>
 
-      <main className="max-w-7xl mx-auto p-6 lg:p-10">
-        {/* Core Metrics: The "Decision Clarity" Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
-          <MetricBlock 
-            label="Avg. Yield (WAROC)" 
-            value={data?.engines[0]?.waroc || "0.00%"} 
-            sub="365D Projected" 
-            icon={<Activity size={16} className="text-emerald-500" />}
-          />
-          <MetricBlock 
-            label="Capital Deployed" 
-            value={`$${data?.total_loaned || "0.00"}`} 
-            sub="Live Exchange Exposure" 
-            icon={<Layers size={16} className="text-blue-500" />}
-          />
-          <MetricBlock 
-            label="Vault Efficiency" 
-            value={data?.engines[0]?.utilization || "0.0%"} 
-            sub="Current Utilization" 
-            icon={<Cpu size={16} className="text-purple-500" />}
-          />
+      {/* Hero */}
+      <section className="px-4 lg:px-6 py-16 lg:py-24 text-center">
+        <p className="text-sm font-medium uppercase tracking-wider text-emerald mb-4">
+          Professional Bitfinex Lending Bot
+        </p>
+        <h1 className="text-4xl lg:text-5xl font-bold text-foreground mb-4 max-w-3xl mx-auto">
+          {t("landing.heroTitle")}
+        </h1>
+        <p className="text-2xl lg:text-3xl font-semibold text-emerald mb-6">
+          {t("landing.heroSubtitle")}
+        </p>
+        <p className="text-muted-foreground max-w-2xl mx-auto mb-10">
+          {t("landing.heroDesc")}
+        </p>
+        <div className="flex flex-wrap items-center justify-center gap-4">
+          <Link
+            href="/login"
+            className="inline-flex items-center gap-2 rounded-lg bg-emerald px-6 py-3 text-base font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+          >
+            <Zap className="h-5 w-5" />
+            {t("landing.startFreeTrial")}
+          </Link>
+          <Link
+            href="/dashboard"
+            className="inline-flex items-center gap-2 rounded-lg border border-border px-6 py-3 text-base font-medium text-foreground hover:bg-secondary transition-colors"
+          >
+            <BarChart3 className="h-5 w-5" />
+            {t("header.dashboard")}
+          </Link>
         </div>
+      </section>
 
-        {/* Engine Details */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2 space-y-6">
-            <div className="bg-[#111113] border border-white/5 rounded-xl p-8">
-              <h3 className="text-sm font-bold text-white mb-6 flex items-center gap-2 uppercase tracking-wider">
-                Active Provisioning Engines
-              </h3>
-              <div className="space-y-4">
-                {data?.engines.map((e: any, i: number) => (
-                  <EngineRow key={i} asset={e.asset} apr={e.waroc} market={e.market_apr} />
-                ))}
-              </div>
+      {/* Features */}
+      <section className="px-4 lg:px-6 py-16 border-t border-border">
+        <div className="max-w-5xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-8">
+          <div className="rounded-xl border border-border bg-card p-6 text-center">
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
+              <TrendingUp className="h-6 w-6" />
             </div>
+            <h3 className="font-semibold text-foreground mb-2">Live profit tracking</h3>
+            <p className="text-sm text-muted-foreground">Real-time analytics and performance data</p>
           </div>
-
-          {/* Security & System Info */}
-          <div className="space-y-6">
-            <div className="bg-[#111113] border border-white/5 rounded-xl p-6">
-              <div className="flex items-center gap-2 text-white mb-4">
-                <ShieldCheck size={18} className="text-emerald-500" />
-                <h4 className="text-sm font-bold uppercase tracking-tight">System Integrity</h4>
-              </div>
-              <div className="space-y-3 text-[11px] font-mono text-slate-500">
-                <div className="flex justify-between border-b border-white/5 pb-2">
-                  <span>ENCRYPTION</span>
-                  <span className="text-white">AES-256-GCM</span>
-                </div>
-                <div className="flex justify-between border-b border-white/5 pb-2">
-                  <span>STORAGE</span>
-                  <span className="text-white">NEON_POSTGRES</span>
-                </div>
-                <div className="flex justify-between border-b border-white/5 pb-2">
-                  <span>LATENCY</span>
-                  <span className="text-white">~14ms</span>
-                </div>
-              </div>
+          <div className="rounded-xl border border-border bg-card p-6 text-center">
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
+              <Shield className="h-6 w-6" />
             </div>
+            <h3 className="font-semibold text-foreground mb-2">Secure Access</h3>
+            <p className="text-sm text-muted-foreground">Google OAuth — your keys stay secure</p>
+          </div>
+          <div className="rounded-xl border border-border bg-card p-6 text-center">
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
+              <BarChart3 className="h-6 w-6" />
+            </div>
+            <h3 className="font-semibold text-foreground mb-2">ROI Optimization</h3>
+            <p className="text-sm text-muted-foreground">Smart insights and automated rebalancing</p>
           </div>
         </div>
-      </main>
+      </section>
+
+      {/* CTA */}
+      <section className="px-4 lg:px-6 py-16 border-t border-border text-center">
+        <p className="text-muted-foreground mb-6">
+          Join thousands of traders using uTrader.io to maximize their Bitfinex lending returns.
+        </p>
+        <Link
+          href="/login"
+          className="inline-flex items-center gap-2 rounded-lg bg-emerald px-6 py-3 text-base font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+        >
+          {t("login.continueWithGoogle")}
+        </Link>
+      </section>
+
+      <footer className="border-t border-border py-6 px-4 text-center text-xs text-muted-foreground">
+        <Link href="/login" className="hover:text-foreground">Login</Link>
+        {" · "}
+        <Link href="/dashboard" className="hover:text-foreground">Dashboard</Link>
+      </footer>
     </div>
-  );
-}
-
-function MetricBlock({ label, value, sub, icon }: any) {
-  return (
-    <div className="bg-[#111113] border border-white/5 p-8 rounded-xl relative overflow-hidden group hover:border-white/10 transition-all">
-      <div className="flex justify-between items-start mb-4">
-        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em]">{label}</span>
-        {icon}
-      </div>
-      <div className="text-4xl font-bold text-white tracking-tight mb-2">{value}</div>
-      <div className="text-xs text-slate-600">{sub}</div>
-    </div>
-  );
-}
-
-function EngineRow({ asset, apr, market }: any) {
-  return (
-    <div className="flex items-center justify-between p-5 bg-black/20 rounded-lg border border-white/5 hover:bg-black/40 transition-all">
-      <div className="flex items-center gap-4">
-        <div className="w-10 h-10 bg-emerald-500/10 rounded flex items-center justify-center font-bold text-emerald-500">
-          {asset[0]}
-        </div>
-        <div>
-          <div className="text-white font-bold">{asset}_OMNI_V2</div>
-          <div className="text-[10px] text-slate-500 uppercase tracking-wider">Predator Matrix Mode</div>
-        </div>
-      </div>
-      <div className="text-right">
-        <div className="text-xl font-bold text-white">{apr} <span className="text-[10px] text-slate-500">APR</span></div>
-        <div className="text-[10px] text-emerald-500/80 font-mono">Market FRR: {market}</div>
-      </div>
-    </div>
-  );
+  )
 }
