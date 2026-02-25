@@ -2,7 +2,8 @@ import type { Metadata, Viewport } from 'next'
 import { Inter, Geist_Mono } from 'next/font/google'
 import { Analytics } from '@vercel/analytics/next'
 import { Providers } from '@/components/providers'
-import './globals.css'
+import { Toaster } from 'sonner'
+import '../globals.css'
 
 const _inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 const _geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
@@ -39,12 +40,14 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode
 }>) {
+  // suppressHydrationWarning: ignores mismatches from browser extensions (e.g. Bitdefender's bis_skin_checked).
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={`${_inter.variable} ${_geistMono.variable} font-sans antialiased`} suppressHydrationWarning>
         <Providers>
           {children}
         </Providers>
+        <Toaster theme="dark" richColors position="top-center" toastOptions={{ style: { background: '#0f172a', border: '1px solid #1e293b', color: '#e2e8f0' } }} />
         <Analytics />
       </body>
     </html>

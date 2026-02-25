@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
+import { useRouter, usePathname } from "next/navigation"
+import { toast } from "sonner"
 import { useT } from "@/lib/i18n"
 import {
   DollarSign,
@@ -325,6 +327,8 @@ function NotificationsTab({
 }
 
 /* ===================== API KEYS TAB ===================== */
+const BITFINEX_API_SETTINGS_URL = "https://setting.bitfinex.com/api"
+
 function ApiKeysTab({
   showSecret,
   setShowSecret,
@@ -332,15 +336,17 @@ function ApiKeysTab({
   showSecret: boolean
   setShowSecret: (v: boolean) => void
 }) {
+  const router = useRouter()
+  const pathname = usePathname()
   const [bfxKey, setBfxKey] = useState("")
   const [bfxSecret, setBfxSecret] = useState("")
   const [geminiKey, setGeminiKey] = useState("")
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
+  const [balance, setBalance] = useState<{ total_usd_all?: number; usd_only?: number; per_currency_usd?: Record<string, number> } | null>(null)
 
-  const clearMessage = () => {
-    setMessage(null)
-  }
+  const clearMessage = () => setMessage(null)
+  const isPermissionsError = (text: string) => /missing permission|invalid api key|enable them|bitfinex api settings/i.test(text)
 
   const handleSave = async () => {
     const key = (bfxKey || "").trim()
@@ -351,25 +357,36 @@ function ApiKeysTab({
     }
     setLoading(true)
     setMessage(null)
+    setBalance(null)
     try {
       const { getBackendToken } = await import("@/lib/auth")
       const token = typeof window !== "undefined" ? await getBackendToken() : null
       const allowDev = process.env.NEXT_PUBLIC_ALLOW_DEV_CONNECT === "1"
 
       if (token) {
-        const res = await fetch(`${API_BASE}/connect-exchange`, {
+        const res = await fetch(`${API_BASE}/api/keys`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
           body: JSON.stringify({ bfx_key: key, bfx_secret: secret, gemini_key: geminiKey || undefined }),
         })
         const data = await res.json().catch(() => ({}))
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "Failed to save API keys.")
+          const d = data.detail
+          const errMsg = typeof d === "string" ? d : Array.isArray(d) ? (d[0]?.msg ?? JSON.stringify(d)) : (data.message ?? "Invalid Keys")
+          throw new Error(String(errMsg))
         }
-        setMessage({ type: "success", text: data.message || "API keys saved." })
+        setBalance(data.balance ?? null)
+        setMessage({ type: "success", text: data.message || "Connection successful." })
         setBfxKey("")
         setBfxSecret("")
         setGeminiKey("")
+        toast.success("Connection Successful", {
+          description: data.balance?.total_usd_all != null
+            ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+            : undefined,
+        })
+        const locale = pathname?.startsWith("/zh") ? "zh" : "en"
+        router.push(`/${locale}/dashboard`)
       } else if (allowDev) {
         const res = await fetch(`${API_BASE}/connect-exchange/by-user`, {
           method: "POST",
@@ -383,25 +400,35 @@ function ApiKeysTab({
         })
         const data = await res.json().catch(() => ({}))
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "Failed to save API keys.")
+          const d = data.detail
+          const errMsg = typeof d === "string" ? d : Array.isArray(d) ? (d[0]?.msg ?? JSON.stringify(d)) : (data.message ?? "Invalid Keys")
+          throw new Error(String(errMsg))
         }
-        setMessage({ type: "success", text: data.message || "API keys saved." })
+        setBalance(data.balance ?? null)
+        setMessage({ type: "success", text: data.message || "Connection successful." })
         setBfxKey("")
         setBfxSecret("")
         setGeminiKey("")
+        toast.success("Connection Successful", {
+          description: data.balance?.total_usd_all != null
+            ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+            : undefined,
+        })
+        const locale = pathname?.startsWith("/zh") ? "zh" : "en"
+        router.push(`/${locale}/dashboard`)
       } else {
         setMessage({
           type: "error",
           text: "Sign in first to connect your Bitfinex account. Go to Login (or set ALLOW_DEV_CONNECT for dev).",
         })
+        setLoading(false)
         return
       }
       setTimeout(clearMessage, 6000)
     } catch (e) {
-      setMessage({
-        type: "error",
-        text: e instanceof Error ? e.message : "Failed to save API keys.",
-      })
+      const errMsg = e instanceof Error ? e.message : "Failed to save API keys."
+      setMessage({ type: "error", text: errMsg })
+      toast.error("Connection failed", { description: errMsg })
       setTimeout(clearMessage, 6000)
     } finally {
       setLoading(false)
@@ -482,17 +509,54 @@ function ApiKeysTab({
         <div
           className={`rounded-lg border px-4 py-3 text-sm ${
             message.type === "success"
-              ? "border-emerald/30 bg-emerald/10 text-emerald"
+              ? "border-[#10b981]/30 bg-[#10b981]/10 text-[#10b981]"
               : "border-destructive/30 bg-destructive/10 text-destructive"
           }`}
         >
           {message.text}
           {message.type === "error" && message.text.includes("Sign in") && (
             <span className="block mt-2">
-              <Link href="/login" className="font-medium text-foreground underline hover:text-emerald">
+              <Link href="/login" className="font-medium text-foreground underline hover:text-[#10b981]">
                 Go to Login →
               </Link>
             </span>
+          )}
+        </div>
+      )}
+
+      {message?.type === "error" && isPermissionsError(message.text) && (
+        <div className="rounded-lg border border-destructive bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          <p className="font-semibold flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            Permissions required
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            Enable Wallets (Read), Funding (Read/Write), and History (Read) for this API key.
+          </p>
+          <a
+            href={BITFINEX_API_SETTINGS_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-3 inline-flex items-center gap-2 rounded-lg bg-destructive/20 px-3 py-2 text-sm font-medium text-destructive hover:bg-destructive/30 transition-colors"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Open Bitfinex API settings
+          </a>
+        </div>
+      )}
+
+      {balance && balance.total_usd_all != null && (
+        <div className="rounded-lg border border-[#10b981]/30 bg-[#10b981]/5 px-4 py-3">
+          <p className="text-xs font-semibold text-foreground mb-1">Bitfinex balance (fetched)</p>
+          <p className="text-2xl font-bold text-[#10b981]">
+            ${Number(balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+          </p>
+          {balance.per_currency_usd && Object.keys(balance.per_currency_usd).length > 0 && (
+            <p className="text-xs text-muted-foreground mt-1">
+              USD: ${Number(balance.per_currency_usd.USD ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+              {" · "}
+              USDT: ${Number(balance.per_currency_usd.USDT ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+            </p>
           )}
         </div>
       )}

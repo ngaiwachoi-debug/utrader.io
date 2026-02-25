@@ -120,6 +120,7 @@ const translations: Record<string, { en: string; zh: string }> = {
   "dashboard.interestEarned": { en: "Interest Earned", zh: "利息收入" },
   "dashboard.interestEarnedDesc": { en: "Daily interest earnings breakdown", zh: "每日利息收入明細" },
   "dashboard.unableToLoadProfit": { en: "Unable to load live profit data.", zh: "無法載入即時利潤資料。" },
+  "dashboard.apiUnreachable": { en: "Cannot reach the API server. Make sure the backend is running.", zh: "無法連線至 API 伺服器，請確認後端已啟動。" },
   "dashboard.platformFee": { en: "Platform Fee (20%)", zh: "平台手續費 (20%)" },
   "dashboard.trialProgress": { en: "Trial Progress", zh: "試用進度" },
   "dashboard.dayXofY": { en: "Day {n} of {total}", zh: "第 {n} / {total} 天" },

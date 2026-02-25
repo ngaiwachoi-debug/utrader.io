@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -18,7 +18,7 @@ from google.auth.transport import requests as google_requests
 import database
 import models
 import security
-from services import bitfinex as bfx_service
+from services.bitfinex_service import BitfinexManager, hash_bitfinex_id
 
 
 app = FastAPI(title="utrader.io API")
@@ -224,6 +224,18 @@ async def get_all_bot_stats(user_id: int):
     }
 
 
+def _detail_invalid_keys(msg: str) -> str:
+    """Normalize error messages for frontend (Invalid Keys, Lending Permissions Missing, etc.)."""
+    if not msg:
+        return "Invalid API keys."
+    lower = msg.lower()
+    if "permission" in lower or "lending" in lower or "margin funding" in lower or "wallets" in lower:
+        return "Lending Permissions Missing. Enable Account History, Margin Funding, and Wallets."
+    if "unable" in lower or "verify" in lower or "identity" in lower:
+        return "Invalid Keys. Unable to verify Bitfinex account."
+    return msg
+
+
 # --- Connect Exchange (Bitfinex) ---
 @app.post("/connect-exchange")
 async def connect_exchange(
@@ -231,42 +243,163 @@ async def connect_exchange(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
-    # 1. Anti-abuse: Bitfinex master identity check
-    master_id = await bfx_service.get_master_user_id(payload.bfx_key, payload.bfx_secret)
-    if not master_id:
-        raise HTTPException(status_code=400, detail="Unable to verify Bitfinex account identity.")
+    balance, result = await _validate_and_save_bitfinex_keys(
+        payload, current_user, db
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {
+        "status": "success",
+        "message": result.get("message", "Exchange connected and trial activated."),
+        "balance": balance,
+    }
 
-    hashed_id = bfx_service.hash_bitfinex_id(master_id)
+
+@app.post("/api/keys")
+async def api_keys(
+    payload: APIKeysInput,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Validate Bitfinex API key and secret (v2/auth/r/wallets + permissions),
+    encrypt and save to DB, return balance on success.
+    """
+    balance, result = await _validate_and_save_bitfinex_keys(
+        payload, current_user, db
+    )
+    if "error" in result:
+        err_msg = result["error"]
+        url = result.get("permissions_url")
+        if url and "permission" in err_msg.lower():
+            err_msg = f"{err_msg} {url}"
+        raise HTTPException(status_code=400, detail=err_msg)
+    return {
+        "success": True,
+        "status": "success",
+        "message": result.get("message", "Connection successful."),
+        "balance": balance,
+    }
+
+
+def _check_permissions_response(perms_data: Any) -> tuple[bool, list[str]]:
+    """
+    Verify scope: wallets read, funding read+write, history read.
+    perms_data can be list of dicts or list of lists from Bitfinex.
+    Returns (ok, list_of_missing_descriptions).
+    """
+    missing: list[str] = []
+    # Normalize to list of {scope, read, write}
+    items: list[dict] = []
+    if isinstance(perms_data, list):
+        for p in perms_data:
+            if isinstance(p, dict):
+                items.append(p)
+            elif isinstance(p, (list, tuple)) and len(p) >= 3:
+                items.append({"scope": p[0], "read": p[1] if len(p) > 1 else 0, "write": p[2] if len(p) > 2 else 0})
+    by_scope: dict[str, dict] = {item.get("scope", ""): item for item in items if item.get("scope")}
+    # Required: wallets read, funding read+write, history read
+    if not (by_scope.get("wallets") or {}).get("read"):
+        missing.append("Wallets (Read)")
+    fund = by_scope.get("funding") or {}
+    if not fund.get("read"):
+        missing.append("Funding (Read)")
+    if not fund.get("write"):
+        missing.append("Funding (Write)")
+    if not (by_scope.get("history") or {}).get("read"):
+        missing.append("History (Read)")
+    return (len(missing) == 0, missing)
+
+
+async def _validate_and_save_bitfinex_keys(payload, current_user, db):
+    """
+    5-step validation. Do not save to DB until ALL pass.
+    Uses BitfinexManager with strict nonce/signature to fix 10100 invalid token.
+    """
+    mgr = BitfinexManager(payload.bfx_key, payload.bfx_secret)
+
+    # Step 1: Test connection — POST /v2/auth/r/info/user
+    user_data, err = await mgr.info_user()
+    if err:
+        return None, {"error": "Invalid API Key or Secret."}
+    if not user_data or not isinstance(user_data, list):
+        return None, {"error": "Invalid API Key or Secret."}
+    try:
+        master_id = str(user_data[0])
+    except (IndexError, TypeError):
+        return None, {"error": "Invalid API Key or Secret."}
+
+    # Step 2: Permission check — POST /v2/auth/r/permissions
+    perms_data, err = await mgr.permissions()
+    if err:
+        return None, {
+            "error": "Missing permissions: Could not fetch permissions. Please enable Wallets (Read), Funding (Read/Write), and History (Read) in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+    ok, missing_list = _check_permissions_response(perms_data)
+    if not ok:
+        missing_str = ", ".join(missing_list)
+        return None, {
+            "error": f"Missing permissions: {missing_str}. Please enable them in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+
+    # Step 3: Validate lending — wallets (funding with balance), funding/offers, funding/trades/hist
+    wallets, err = await mgr.wallets()
+    if err:
+        return None, {"error": "Could not fetch wallets. Please check API permissions."}
+    if not wallets or not isinstance(wallets, list):
+        return None, {"error": "Could not fetch wallets."}
+    has_funding = False
+    for w in wallets:
+        try:
+            w_type = w[0]
+            bal = float(w[2]) if len(w) > 2 else 0
+        except (IndexError, TypeError, ValueError):
+            continue
+        if w_type == "funding":
+            has_funding = True
+            break
+    if not has_funding:
+        return None, {"error": "No funding wallet found. Please ensure a Bitfinex funding wallet exists."}
+    _, err_offers = await mgr.funding_offers()
+    if err_offers:
+        return None, {
+            "error": "Missing permissions: Funding (Read). Please enable them in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+    _, err_hist = await mgr.funding_trades_hist()
+    if err_hist:
+        return None, {
+            "error": "Missing permissions: Funding history (Read). Please enable them in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+
+    # Step 4: (Errors returned above with specific messages and link.)
+
+    # Step 5: Save validated key — encrypt API_SECRET (Fernet), save to DB
+    balance = await mgr.compute_usd_balances()
+
+    hashed_id = hash_bitfinex_id(master_id)
     existing = (
         db.query(models.TrialHistory)
         .filter(models.TrialHistory.hashed_bitfinex_id == hashed_id)
         .first()
     )
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="This Bitfinex account has already used the Free Trial. Please upgrade.",
-        )
+        return None, {
+            "error": "This Bitfinex account has already used the Free Trial. Please upgrade.",
+        }
 
-    # 2. Permission validation
-    ok, error_msg = await bfx_service.validate_api_permissions(
-        payload.bfx_key, payload.bfx_secret
-    )
-    if not ok:
-        raise HTTPException(status_code=400, detail=error_msg or "Bitfinex API key permissions invalid.")
-
-    # 3. Store trial usage
     trial_row = models.TrialHistory(hashed_bitfinex_id=hashed_id)
     db.add(trial_row)
 
-    # 4. Grant 7‑day trial window on first connect, aligned with "Expert" tier limits
     current_user.plan_tier = "trial"
     current_user.lending_limit = 250_000.0
     current_user.rebalance_interval = 3
     if not current_user.pro_expiry or current_user.pro_expiry < datetime.utcnow():
         current_user.pro_expiry = datetime.utcnow() + timedelta(days=7)
 
-    # 5. Save encrypted keys in APIVault
     vault = (
         db.query(models.APIVault)
         .filter(models.APIVault.user_id == current_user.id)
@@ -282,7 +415,7 @@ async def connect_exchange(
         vault.encrypted_gemini_key = security.encrypt_key(payload.gemini_key)
 
     db.commit()
-    return {"status": "success", "message": "Exchange connected and trial activated."}
+    return balance, {"message": "Exchange connected and trial activated."}
 
 
 # Dev-only: connect exchange by user_id (no Google token). Set ALLOW_DEV_CONNECT=1 to enable.
@@ -303,47 +436,19 @@ async def connect_exchange_by_user(
     user = db.query(models.User).filter(models.User.id == payload.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    # Reuse same validation and storage logic
-    master_id = await bfx_service.get_master_user_id(payload.bfx_key, payload.bfx_secret)
-    if not master_id:
-        raise HTTPException(status_code=400, detail="Unable to verify Bitfinex account identity.")
-    hashed_id = bfx_service.hash_bitfinex_id(master_id)
-    existing = (
-        db.query(models.TrialHistory)
-        .filter(models.TrialHistory.hashed_bitfinex_id == hashed_id)
-        .first()
+    keys_payload = APIKeysInput(
+        bfx_key=payload.bfx_key,
+        bfx_secret=payload.bfx_secret,
+        gemini_key=payload.gemini_key,
     )
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="This Bitfinex account has already used the Free Trial. Please upgrade.",
-        )
-    ok, error_msg = await bfx_service.validate_api_permissions(
-        payload.bfx_key, payload.bfx_secret
-    )
-    if not ok:
-        raise HTTPException(status_code=400, detail=error_msg or "Bitfinex API key permissions invalid.")
-    trial_row = models.TrialHistory(hashed_bitfinex_id=hashed_id)
-    db.add(trial_row)
-    user.plan_tier = "trial"
-    user.lending_limit = 250_000.0
-    user.rebalance_interval = 3
-    if not user.pro_expiry or user.pro_expiry < datetime.utcnow():
-        user.pro_expiry = datetime.utcnow() + timedelta(days=7)
-    vault = (
-        db.query(models.APIVault)
-        .filter(models.APIVault.user_id == user.id)
-        .first()
-    )
-    if not vault:
-        vault = models.APIVault(user_id=user.id)
-        db.add(vault)
-    vault.encrypted_key = security.encrypt_key(payload.bfx_key)
-    vault.encrypted_secret = security.encrypt_key(payload.bfx_secret)
-    if payload.gemini_key:
-        vault.encrypted_gemini_key = security.encrypt_key(payload.gemini_key)
-    db.commit()
-    return {"status": "success", "message": "Exchange connected and trial activated."}
+    balance, result = await _validate_and_save_bitfinex_keys(keys_payload, user, db)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {
+        "status": "success",
+        "message": result.get("message", "Exchange connected and trial activated."),
+        "balance": balance,
+    }
 
 
 # --- Start / Stop Bot ---
@@ -551,10 +656,8 @@ async def wallet_summary(user_id: int, db: Session = Depends(database.get_db)):
         raise HTTPException(status_code=404, detail="API keys not found.")
 
     keys = user.vault.get_keys()
-    summary = await bfx_service.compute_usd_balances(
-        keys["bfx_key"],
-        keys["bfx_secret"],
-    )
+    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+    summary = await mgr.compute_usd_balances()
     return summary
 
 

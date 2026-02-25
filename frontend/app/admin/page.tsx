@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import Dashboard from "../page"
+import DashboardPage from "@/app/[locale]/dashboard/page"
 
 type AdminUser = {
   id: number
@@ -92,7 +92,7 @@ export default function AdminPage() {
   return (
     <div className="min-h-screen bg-background flex">
       <div className="flex-1">
-        <Dashboard />
+        <DashboardPage />
       </div>
       <aside className="hidden lg:block w-[360px] border-l border-border bg-card p-4 overflow-y-auto">
         <h2 className="text-sm font-semibold text-foreground mb-3">Admin Panel</h2>

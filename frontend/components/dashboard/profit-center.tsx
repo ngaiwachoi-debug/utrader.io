@@ -128,8 +128,11 @@ export function ProfitCenter() {
         setPlatformFee(data.fake_fee ?? 0)
         setNetProfit(data.net_profit ?? 0)
       } catch (e) {
-        console.error("Failed to fetch stats", e)
-        setError(t("dashboard.unableToLoadProfit"))
+        const isNetworkError =
+          (e instanceof TypeError && (e as Error).message === "Failed to fetch") ||
+          (e instanceof Error && (e.message === "Failed to fetch" || e.message.includes("NetworkError")))
+        setError(isNetworkError ? t("dashboard.apiUnreachable") : t("dashboard.unableToLoadProfit"))
+        if (!isNetworkError) console.error("Failed to fetch stats", e)
       } finally {
         setLoading(false)
       }
@@ -147,6 +150,12 @@ export function ProfitCenter() {
           {t("dashboard.profitCenterDesc")}
         </p>
       </div>
+
+      {error && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {error}
+        </div>
+      )}
 
       {/* Profit Stats Cards */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
