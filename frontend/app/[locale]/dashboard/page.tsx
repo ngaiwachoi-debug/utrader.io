@@ -1,24 +1,43 @@
 "use client"
 
-import { useState } from "react"
-import { DollarSign, Activity, TrendingUp, Settings } from "lucide-react"
+import { useState, useEffect } from "react"
+import { useSearchParams } from "next/navigation"
+import { DollarSign, Activity, TrendingUp, Settings, BarChart3, CreditCard } from "lucide-react"
 import { Sidebar } from "@/components/dashboard/sidebar"
 import { Header } from "@/components/dashboard/header"
 import { ProfitCenter } from "@/components/dashboard/profit-center"
 import { LiveStatus } from "@/components/dashboard/live-status"
+import { MarketStatus } from "@/components/dashboard/market-status"
 import { TrueROI } from "@/components/dashboard/true-roi"
+import { Subscription } from "@/components/dashboard/subscription"
 import { SettingsPage } from "@/components/dashboard/settings"
 import { useT } from "@/lib/i18n"
 import { DateRangeProvider } from "@/lib/date-range-context"
+import { CurrentUserProvider } from "@/lib/current-user-context"
 
 export default function DashboardPage() {
+  const searchParams = useSearchParams()
   const [activePage, setActivePage] = useState("profit-center")
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [mounted, setMounted] = useState(false)
   const t = useT()
 
+  useEffect(() => setMounted(true), [])
+
+  useEffect(() => {
+    if (searchParams?.get("page") === "subscription") setActivePage("subscription")
+  }, [searchParams])
+
+  if (!mounted) {
+    return (
+      <div className="min-h-screen bg-background" suppressHydrationWarning />
+    )
+  }
+
   return (
+    <CurrentUserProvider>
     <DateRangeProvider>
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background" suppressHydrationWarning>
       <Sidebar
         activePage={activePage}
         onPageChange={setActivePage}
@@ -29,12 +48,14 @@ export default function DashboardPage() {
       <div
         className={`transition-all duration-300 ${sidebarCollapsed ? "md:ml-16" : "md:ml-56"}`}
       >
-        <Header />
+        <Header onUpgradeClick={() => setActivePage("subscription")} />
 
         <main className="p-4 pb-20 md:pb-4 lg:p-6">
-          {activePage === "profit-center" && <ProfitCenter />}
+          {activePage === "profit-center" && <ProfitCenter onUpgradeClick={() => setActivePage("subscription")} />}
           {activePage === "live-status" && <LiveStatus />}
+          {activePage === "market-status" && <MarketStatus />}
           {activePage === "true-roi" && <TrueROI />}
+          {activePage === "subscription" && <Subscription />}
           {activePage === "settings" && <SettingsPage />}
         </main>
       </div>
@@ -42,6 +63,7 @@ export default function DashboardPage() {
       <MobileNav activePage={activePage} onPageChange={setActivePage} t={t} />
     </div>
     </DateRangeProvider>
+    </CurrentUserProvider>
   )
 }
 
@@ -57,7 +79,9 @@ function MobileNav({
   const items = [
     { id: "profit-center", labelKey: "nav.profit", Icon: DollarSign },
     { id: "live-status", labelKey: "nav.live", Icon: Activity },
+    { id: "market-status", labelKey: "sidebar.marketStatus", Icon: BarChart3 },
     { id: "true-roi", labelKey: "nav.roi", Icon: TrendingUp },
+    { id: "subscription", labelKey: "sidebar.subscription", Icon: CreditCard },
     { id: "settings", labelKey: "nav.settings", Icon: Settings },
   ]
 

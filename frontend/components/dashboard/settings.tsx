@@ -4,6 +4,7 @@ import { useEffect, useState } from "react"
 import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
 import { toast } from "sonner"
+import { useSession } from "next-auth/react"
 import { useT } from "@/lib/i18n"
 import {
   DollarSign,
@@ -23,40 +24,47 @@ import {
   BookOpen,
   Shield,
   Send,
+  Trash2,
+  RefreshCw,
+  CheckCircle,
 } from "lucide-react"
+import { useCurrentUserId } from "@/lib/current-user-context"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
-const USER_ID = 1
 
 type SettingsTab = "lending" | "notifications" | "api-keys" | "community"
 
 export function SettingsPage() {
   const t = useT()
+  const userId = useCurrentUserId()
+  const { data: session, status } = useSession()
+  const signedIn = status === "authenticated" && !!session?.user
   const [activeTab, setActiveTab] = useState<SettingsTab>("lending")
   const [showSecret, setShowSecret] = useState(false)
   const [enableLending, setEnableLending] = useState(true)
   const [customLimit, setCustomLimit] = useState(false)
   const [darkMode, setDarkMode] = useState(true)
   const [dailyEmail, setDailyEmail] = useState(false)
-  const [signedIn, setSignedIn] = useState(false)
 
   const [planTier, setPlanTier] = useState<string>("Trial User")
   const [planName, setPlanName] = useState<string>("Expert Plan")
   const [lendingLimit, setLendingLimit] = useState<number>(250000)
   const [rebalanceMinutes, setRebalanceMinutes] = useState<number>(3)
-  const [trialRemainingDays, setTrialRemainingDays] = useState<number | null>(9)
+  const [trialRemainingDays, setTrialRemainingDays] = useState<number | null>(null)
+  const [usedAmount, setUsedAmount] = useState<number>(0)
 
   useEffect(() => {
-    if (typeof window === "undefined") return
-    fetch("/api/auth/session", { credentials: "include" })
-      .then((r) => r.json())
-      .then((data) => setSignedIn(!!data?.user))
-  }, [])
-
-  useEffect(() => {
+    if (userId == null) {
+      setPlanTier("Trial User")
+      setPlanName("Expert Plan")
+      setLendingLimit(250000)
+      setRebalanceMinutes(3)
+      setTrialRemainingDays(null)
+      return
+    }
     const fetchUserStatus = async () => {
       try {
-        const res = await fetch(`${API_BASE}/user-status/${USER_ID}`)
+        const res = await fetch(`${API_BASE}/user-status/${userId}`)
         if (!res.ok) return
         const data = await res.json()
 
@@ -67,15 +75,16 @@ export function SettingsPage() {
         else if (tier === "guru") setPlanName("Guru Plan")
         else setPlanName("Trial Plan")
 
-        setLendingLimit(data.lending_limit ?? 0)
-        setRebalanceMinutes(data.rebalance_interval ?? 0)
+        setLendingLimit(Number(data.lending_limit) ?? 0)
+        setRebalanceMinutes(Number(data.rebalance_interval) ?? 0)
         setTrialRemainingDays(typeof data.trial_remaining_days === "number" ? data.trial_remaining_days : null)
+        setUsedAmount(Number(data.used_amount) ?? 0)
       } catch (e) {
         console.error("Failed to fetch user status", e)
       }
     }
     fetchUserStatus()
-  }, [])
+  }, [userId])
 
   const tabs: { id: SettingsTab; labelKey: string }[] = [
     { id: "lending", labelKey: "settings.tabs.lending" },
@@ -96,20 +105,22 @@ export function SettingsPage() {
           <p className="text-xs text-muted-foreground">{t("settings.accountMembershipDesc")}</p>
         </div>
 
-        {/* User Info – only when signed in (Lendingify: no name/plan when not logged in) */}
-        {signedIn && (
+        {/* User Info – current session; empty when logged out */}
+        {signedIn && (session?.user?.name || session?.user?.email) && (
           <div className="flex items-center gap-4 mb-6">
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-orange-500 text-lg font-bold text-foreground">
-              J
+              {(session?.user?.name || session?.user?.email || "?").charAt(0).toUpperCase()}
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-base font-semibold text-foreground">Jeremy Choi</span>
+                <span className="text-base font-semibold text-foreground">
+                  {session?.user?.name || session?.user?.email || t("Common.user")}
+                </span>
                 <span className="rounded-full bg-emerald px-2.5 py-0.5 text-[10px] font-semibold text-primary-foreground">
                   {planTier}
                 </span>
               </div>
-              <p className="text-xs text-muted-foreground">{planName}</p>
+              <p className="text-xs text-muted-foreground">{session?.user?.email ? `${planName} · ${session.user.email}` : planName}</p>
             </div>
           </div>
         )}
@@ -147,14 +158,19 @@ export function SettingsPage() {
         <div>
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs font-medium text-foreground">{t("settings.lendingUsage")}</span>
-            <span className="text-xs font-medium text-emerald">0.0%</span>
+            <span className="text-xs font-medium text-emerald">
+              {lendingLimit > 0 ? `${((usedAmount / lendingLimit) * 100).toFixed(1)}%` : "0%"}
+            </span>
           </div>
           <div className="h-2 w-full rounded-full bg-secondary">
-            <div className="h-2 rounded-full bg-emerald transition-all duration-500" style={{ width: "0%" }} />
+            <div
+              className="h-2 rounded-full bg-emerald transition-all duration-500"
+              style={{ width: lendingLimit > 0 ? `${Math.min(100, (usedAmount / lendingLimit) * 100)}%` : "0%" }}
+            />
           </div>
           <div className="flex items-center justify-between mt-1.5">
-            <span className="text-xs text-muted-foreground">$0</span>
-            <span className="text-xs text-muted-foreground">$250,000</span>
+            <span className="text-xs text-muted-foreground">${usedAmount.toLocaleString()}</span>
+            <span className="text-xs text-muted-foreground">${lendingLimit.toLocaleString()}</span>
           </div>
         </div>
       </div>
@@ -180,7 +196,7 @@ export function SettingsPage() {
       <div className="rounded-xl border border-border bg-card p-5">
         {activeTab === "lending" && <LendingTab enableLending={enableLending} setEnableLending={setEnableLending} customLimit={customLimit} setCustomLimit={setCustomLimit} darkMode={darkMode} setDarkMode={setDarkMode} />}
         {activeTab === "notifications" && <NotificationsTab dailyEmail={dailyEmail} setDailyEmail={setDailyEmail} />}
-        {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} />}
+        {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} userId={userId} />}
         {activeTab === "community" && <CommunityTab />}
       </div>
     </div>
@@ -332,9 +348,11 @@ const BITFINEX_API_SETTINGS_URL = "https://setting.bitfinex.com/api"
 function ApiKeysTab({
   showSecret,
   setShowSecret,
+  userId,
 }: {
   showSecret: boolean
   setShowSecret: (v: boolean) => void
+  userId: number | null
 }) {
   const t = useT()
   const router = useRouter()
@@ -345,9 +363,50 @@ function ApiKeysTab({
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [balance, setBalance] = useState<{ total_usd_all?: number; usd_only?: number; per_currency_usd?: Record<string, number> } | null>(null)
+  const [hasKeys, setHasKeys] = useState<boolean | null>(null)
+  const [keyPreview, setKeyPreview] = useState<string | null>(null)
+  const [createdAt, setCreatedAt] = useState<string | null>(null)
+  const [lastTestedAt, setLastTestedAt] = useState<string | null>(null)
+  const [lastTestBalance, setLastTestBalance] = useState<number | null>(null)
+  const [testModalOpen, setTestModalOpen] = useState(false)
+  const [testResult, setTestResult] = useState<{ success: boolean; fundingWallet?: number } | null>(null)
+  const [testingKeys, setTestingKeys] = useState(false)
+  const [removingKey, setRemovingKey] = useState(false)
 
   const clearMessage = () => setMessage(null)
   const isPermissionsError = (text: string) => /missing permission|invalid api key|enable them|bitfinex api settings/i.test(text)
+
+  const loadKeysStatus = async () => {
+    const { getBackendToken } = await import("@/lib/auth")
+    const token = typeof window !== "undefined" ? await getBackendToken() : null
+    if (!token) {
+      setHasKeys(null)
+      return
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/keys`, {
+        method: "GET",
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setHasKeys(!!data.has_keys)
+        setKeyPreview(data.key_preview ?? null)
+        setCreatedAt(data.created_at ?? null)
+        setLastTestedAt(data.last_tested_at ?? null)
+        setLastTestBalance(data.last_test_balance != null ? Number(data.last_test_balance) : null)
+      } else {
+        setHasKeys(false)
+      }
+    } catch {
+      setHasKeys(false)
+    }
+  }
+
+  useEffect(() => {
+    loadKeysStatus()
+  }, [])
 
   const handleSave = async () => {
     const key = (bfxKey || "").trim()
@@ -360,21 +419,36 @@ function ApiKeysTab({
     setMessage(null)
     setBalance(null)
     try {
-      const { getBackendToken } = await import("@/lib/auth")
-      const token = typeof window !== "undefined" ? await getBackendToken() : null
+      const { getBackendToken, clearBackendTokenCache } = await import("@/lib/auth")
+      let token = typeof window !== "undefined" ? await getBackendToken() : null
       const allowDev = process.env.NEXT_PUBLIC_ALLOW_DEV_CONNECT === "1"
 
       if (token) {
-        const res = await fetch(`${API_BASE}/api/keys`, {
+        let res = await fetch(`${API_BASE}/api/keys`, {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
           body: JSON.stringify({ bfx_key: key, bfx_secret: secret, gemini_key: geminiKey || undefined }),
         })
+        if (res.status === 401) {
+          clearBackendTokenCache()
+          token = await getBackendToken()
+          if (token) {
+            res = await fetch(`${API_BASE}/api/keys`, {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ bfx_key: key, bfx_secret: secret, gemini_key: geminiKey || undefined }),
+            })
+          }
+        }
         const data = await res.json().catch(() => ({}))
         if (!res.ok) {
           const d = data.detail
           const errMsg = typeof d === "string" ? d : Array.isArray(d) ? (d[0]?.msg ?? JSON.stringify(d)) : (data.message ?? "Invalid Keys")
+          if (res.status === 401) {
+            throw new Error("Session expired. Please log out and log in again, then try saving your API keys.")
+          }
           throw new Error(String(errMsg))
         }
         setBalance(data.balance ?? null)
@@ -382,20 +456,20 @@ function ApiKeysTab({
         setBfxKey("")
         setBfxSecret("")
         setGeminiKey("")
+        setHasKeys(true)
+        setKeyPreview("••••••••")
         toast.success("Connection Successful", {
           description: data.balance?.total_usd_all != null
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
-        const locale = pathname?.startsWith("/zh") ? "zh" : "en"
-        router.push(`/${locale}/dashboard`)
-      } else if (allowDev) {
+      } else if (allowDev && userId != null) {
         const res = await fetch(`${API_BASE}/connect-exchange/by-user`, {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            user_id: USER_ID,
+            user_id: userId,
             bfx_key: key,
             bfx_secret: secret,
             gemini_key: geminiKey || undefined,
@@ -412,13 +486,13 @@ function ApiKeysTab({
         setBfxKey("")
         setBfxSecret("")
         setGeminiKey("")
+        setHasKeys(true)
+        setKeyPreview("••••••••")
         toast.success("Connection Successful", {
           description: data.balance?.total_usd_all != null
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
-        const locale = pathname?.startsWith("/zh") ? "zh" : "en"
-        router.push(`/${locale}/dashboard`)
       } else {
         setMessage({
           type: "error",
@@ -440,6 +514,81 @@ function ApiKeysTab({
     }
   }
 
+  const handleTestKeys = async () => {
+    const { getBackendToken } = await import("@/lib/auth")
+    const token = typeof window !== "undefined" ? await getBackendToken() : null
+    if (!token) {
+      setMessage({ type: "error", text: "Sign in first to test API keys." })
+      return
+    }
+    setTestingKeys(true)
+    setMessage(null)
+    try {
+      const res = await fetch(`${API_BASE}/api/keys/test`, {
+        method: "POST",
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.detail || "Test failed.")
+      }
+      setLastTestedAt(new Date().toISOString())
+      const bal = data.balance?.total_usd_all ?? undefined
+      setLastTestBalance(bal != null ? Number(bal) : null)
+      setTestResult({
+        success: true,
+        fundingWallet: bal != null ? Number(bal) : undefined,
+      })
+      setTestModalOpen(true)
+      loadKeysStatus()
+    } catch (e) {
+      setMessage({ type: "error", text: e instanceof Error ? e.message : "Test failed." })
+    } finally {
+      setTestingKeys(false)
+    }
+  }
+
+  const handleRemoveKey = async () => {
+    if (!confirm("Remove stored API keys? You will need to add them again to connect.")) return
+    const { getBackendToken } = await import("@/lib/auth")
+    const token = typeof window !== "undefined" ? await getBackendToken() : null
+    if (!token) {
+      setMessage({ type: "error", text: "Sign in first to remove API keys." })
+      return
+    }
+    setRemovingKey(true)
+    setMessage(null)
+    try {
+      const res = await fetch(`${API_BASE}/api/keys`, {
+        method: "DELETE",
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) throw new Error("Failed to remove keys.")
+      setHasKeys(false)
+      setKeyPreview(null)
+      setCreatedAt(null)
+      setLastTestedAt(null)
+      setLastTestBalance(null)
+      toast.success("API keys removed")
+    } catch (e) {
+      setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to remove." })
+    } finally {
+      setRemovingKey(false)
+    }
+  }
+
+  const formatDate = (iso: string | null) => {
+    if (!iso) return "—"
+    try {
+      const d = new Date(iso)
+      return d.toLocaleString(undefined, { month: "numeric", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })
+    } catch {
+      return "—"
+    }
+  }
+
   return (
     <div className="flex flex-col gap-6">
       <div>
@@ -447,8 +596,107 @@ function ApiKeysTab({
           <Link2 className="h-5 w-5 text-emerald" />
           <h3 className="text-lg font-semibold text-foreground">Connect Bitfinex Account</h3>
         </div>
-        <p className="text-xs text-muted-foreground">Enter your read-only API keys to start automated lending.</p>
+        <p className="text-xs text-muted-foreground">Enter your read-only API keys to start automated lending. Only one key can be stored.</p>
       </div>
+
+      {/* Current Configuration (Image 3: masked key, Created, status, Test, red bin) */}
+      {hasKeys === true && (
+        <div className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <span className="text-sm font-semibold text-foreground">Current Configuration</span>
+            <div className="flex items-center gap-2">
+              {lastTestedAt ? (
+                <span className="rounded-full bg-emerald/20 px-2.5 py-0.5 text-xs font-medium text-emerald">{t("settings.verified")}</span>
+              ) : (
+                <span className="rounded-full bg-amber-500/20 px-2.5 py-0.5 text-xs font-medium text-amber-500">{t("settings.notTested")}</span>
+              )}
+              <button
+                type="button"
+                onClick={handleTestKeys}
+                disabled={testingKeys}
+                className="flex items-center gap-1.5 rounded-lg bg-emerald px-3 py-1.5 text-xs font-semibold text-primary-foreground hover:bg-emerald-dark disabled:opacity-60"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${testingKeys ? "animate-spin" : ""}`} />
+                {testingKeys ? "Testing…" : t("settings.testApiKeys")}
+              </button>
+              <button
+                type="button"
+                onClick={handleRemoveKey}
+                disabled={removingKey}
+                className="flex h-8 w-8 items-center justify-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive hover:bg-destructive/20 disabled:opacity-60"
+                aria-label={t("settings.removeKey")}
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            API Key: <span className="font-mono text-foreground">{keyPreview ?? "************"}</span>
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t("settings.apiKeysCreated")}: {formatDate(createdAt)}
+          </p>
+          {lastTestedAt && (
+            <>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {t("settings.testedOn", { date: formatDate(lastTestedAt) })}
+              </p>
+              {lastTestBalance != null && (
+                <p className="mt-1 text-xs text-foreground">
+                  All required permissions are enabled. Funding wallet contains ~${lastTestBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} available for lending.
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Test result modal (Image 4) */}
+      {testModalOpen && testResult?.success && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60" onClick={() => setTestModalOpen(false)}>
+          <div
+            className="rounded-xl border border-border bg-card p-6 max-w-md w-full shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold text-foreground">{t("settings.apiKeyTestResult")}</h3>
+            <p className="mt-2 text-sm text-foreground">{t("settings.keysWorkingCorrectly")}</p>
+            <div className="flex justify-center my-6">
+              <CheckCircle className="h-16 w-16 text-emerald" />
+            </div>
+            <p className="text-sm font-medium text-emerald">{t("settings.connectionSuccessful")}</p>
+            <p className="text-xs text-muted-foreground">{t("settings.keysVerifiedReady")}</p>
+            {testResult.fundingWallet != null && (
+              <div className="mt-4 rounded-lg border border-emerald/30 bg-emerald/10 p-4 flex items-center gap-2">
+                <CheckCircle className="h-5 w-5 text-emerald shrink-0" />
+                <span className="text-sm font-medium text-foreground">
+                  {t("settings.fundingWalletAvailable", {
+                    amount: `$${Number(testResult.fundingWallet).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+                  })}
+                </span>
+              </div>
+            )}
+            <p className="mt-4 text-xs text-muted-foreground">
+              You're all set! Join our Telegram community for updates and support.
+            </p>
+            <div className="mt-4 flex gap-3">
+              <a
+                href="#"
+                className="inline-flex items-center gap-2 rounded-lg bg-[#229ED9] px-4 py-2 text-sm font-medium text-white hover:opacity-90"
+              >
+                <Send className="h-4 w-4" />
+                {t("settings.joinTelegram")}
+              </a>
+              <button
+                type="button"
+                onClick={() => setTestModalOpen(false)}
+                className="rounded-lg border border-border bg-secondary px-4 py-2 text-sm font-medium text-foreground hover:bg-secondary/80"
+              >
+                {t("settings.close")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Security Notice */}
       <div className="flex items-center justify-between rounded-lg border border-emerald/30 bg-emerald/5 px-4 py-3">
@@ -466,9 +714,9 @@ function ApiKeysTab({
         </a>
       </div>
 
-      {/* API Key Inputs */}
+      {/* Update API Keys (Image 3) */}
       <div className="flex flex-col gap-4">
-        <h4 className="text-sm font-semibold text-foreground">Add API Keys</h4>
+        <h4 className="text-sm font-semibold text-foreground">{hasKeys ? t("settings.updateApiKeys") : "Add API Keys"}</h4>
         <div>
           <label className="text-sm font-semibold text-foreground">API Key</label>
           <input

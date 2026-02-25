@@ -12,10 +12,13 @@ import {
   ChevronRight,
   LogOut,
   User,
+  BarChart3,
+  CreditCard,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useT } from "@/lib/i18n"
 import { signOut } from "next-auth/react"
+import { clearBackendTokenCache } from "@/lib/auth"
 import { useSession } from "next-auth/react"
 
 interface SidebarProps {
@@ -28,7 +31,9 @@ interface SidebarProps {
 const navItems = [
   { id: "profit-center", labelKey: "sidebar.profitCenter", icon: DollarSign },
   { id: "live-status", labelKey: "sidebar.liveStatus", icon: Activity },
+  { id: "market-status", labelKey: "sidebar.marketStatus", icon: BarChart3 },
   { id: "true-roi", labelKey: "sidebar.trueRoi", icon: TrendingUp },
+  { id: "subscription", labelKey: "sidebar.subscription", icon: CreditCard },
   { id: "settings", labelKey: "sidebar.settings", icon: Settings },
 ]
 
@@ -39,6 +44,7 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle }: Sideb
   const signedIn = status === "authenticated" && !!session?.user
 
   const handleLogout = () => {
+    clearBackendTokenCache()
     signOut({ callbackUrl: "/" }).then(() => router.refresh())
   }
 

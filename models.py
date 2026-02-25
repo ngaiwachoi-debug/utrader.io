@@ -48,6 +48,10 @@ class APIVault(Base):
     # Optional extra key used by the engine (e.g., Gemini/Gemini AI key)
     encrypted_gemini_key = Column(String, nullable=True)
 
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=True)
+    last_tested_at = Column(DateTime, nullable=True)
+    last_test_balance = Column(Float, nullable=True)
+
     user = relationship("User", back_populates="vault")
 
     def get_keys(self) -> dict:

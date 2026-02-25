@@ -4,6 +4,7 @@ import { useState, useEffect } from "react"
 import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
 import { signOut } from "next-auth/react"
+import { clearBackendTokenCache } from "@/lib/auth"
 import { Star, Clock, Search, Bell, HelpCircle, User, Globe, Calendar, LogOut } from "lucide-react"
 import { useLanguage } from "@/lib/i18n"
 import { useSession } from "next-auth/react"
@@ -18,16 +19,19 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Calendar as CalendarComponent } from "@/components/ui/calendar"
 import type { DateRange as PickerRange } from "react-day-picker"
+import { useCurrentUserId } from "@/lib/current-user-context"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
-const USER_ID = 1
 
 type CurrencyView = "USD" | "USDT"
 
-export function Header() {
+type HeaderProps = { onUpgradeClick?: () => void }
+
+export function Header({ onUpgradeClick }: HeaderProps) {
   const router = useRouter()
   const pathname = usePathname()
   const { data: session, status } = useSession()
+  const userId = useCurrentUserId()
   const { language, setLanguage, t } = useLanguage()
   const { range, setRange, formatRange } = useDateRange()
   const signedIn = status === "authenticated" && !!session?.user
@@ -36,26 +40,56 @@ export function Header() {
   const [usdOnly, setUsdOnly] = useState<number | null>(null)
   const [walletsLoading, setWalletsLoading] = useState(true)
   const [dateOpen, setDateOpen] = useState(false)
+  const [trialDaysRemaining, setTrialDaysRemaining] = useState<number | null>(null)
+  const [lendingLimit, setLendingLimit] = useState<number>(250_000)
+  const [walletDataSource, setWalletDataSource] = useState<"live" | "cache" | null>(null)
+  const [walletRateLimited, setWalletRateLimited] = useState(false)
 
   useEffect(() => {
+    if (userId == null) {
+      setTotalUsdAll(null)
+      setUsdOnly(null)
+      setTrialDaysRemaining(null)
+      setLendingLimit(250_000)
+      setWalletDataSource(null)
+      setWalletRateLimited(false)
+      setWalletsLoading(false)
+      return
+    }
     let cancelled = false
     const run = async () => {
       setWalletsLoading(true)
       try {
-        const res = await fetch(`${API_BASE}/wallets/${USER_ID}`)
+        const [walletRes, statusRes] = await Promise.all([
+          fetch(`${API_BASE}/wallets/${userId}`),
+          fetch(`${API_BASE}/user-status/${userId}`),
+        ])
         if (cancelled) return
-        if (res.ok) {
-          const data = await res.json()
+        if (walletRes.ok) {
+          const data = await walletRes.json()
           setTotalUsdAll(Number(data.total_usd_all) ?? 0)
           setUsdOnly(Number(data.usd_only) ?? 0)
+          const src = walletRes.headers.get("X-Data-Source")
+          setWalletDataSource(src === "cache" ? "cache" : "live")
+          setWalletRateLimited(walletRes.headers.get("X-Rate-Limited") === "true")
         } else {
           setTotalUsdAll(null)
           setUsdOnly(null)
+          setWalletDataSource(null)
+          setWalletRateLimited(false)
+        }
+        if (statusRes.ok) {
+          const statusData = await statusRes.json()
+          setTrialDaysRemaining(typeof statusData.trial_remaining_days === "number" ? statusData.trial_remaining_days : null)
+          setLendingLimit(Number(statusData.lending_limit) ?? 250_000)
         }
       } catch {
         if (!cancelled) {
           setTotalUsdAll(null)
           setUsdOnly(null)
+          setWalletDataSource(null)
+          setWalletRateLimited(false)
+          setTrialDaysRemaining(null)
         }
       } finally {
         if (!cancelled) setWalletsLoading(false)
@@ -63,7 +97,7 @@ export function Header() {
     }
     run()
     return () => { cancelled = true }
-  }, [])
+  }, [userId])
 
   const displayValue =
     currencyView === "USD"
@@ -144,8 +178,14 @@ export function Header() {
               <SelectItem value="USDT">USDT</SelectItem>
             </SelectContent>
           </Select>
-          <span className="hidden sm:inline text-foreground font-medium min-w-[4rem] text-right text-xs">
+          <span className="hidden sm:inline text-foreground font-medium min-w-[4rem] text-right text-xs" title={walletRateLimited ? t("header.rateLimited") : walletDataSource === "cache" ? t("header.dataCached") : undefined}>
             {walletsLoading ? "…" : displayValue}
+            {!walletsLoading && walletDataSource === "cache" && (
+              <span className="ml-1 text-[10px] text-muted-foreground">({t("header.dataCached")})</span>
+            )}
+            {walletRateLimited && (
+              <span className="ml-1 text-[10px] text-amber-600 dark:text-amber-400" title={t("header.rateLimited")}>⚠</span>
+            )}
           </span>
 
           <div className="flex items-center gap-1">
@@ -161,7 +201,7 @@ export function Header() {
             </button>
             {signedIn ? (
               <button
-                onClick={() => signOut({ callbackUrl: "/" }).then(() => router.refresh())}
+                onClick={() => { clearBackendTokenCache(); signOut({ callbackUrl: "/" }).then(() => router.refresh()) }}
                 className="hidden sm:flex items-center gap-1.5 rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
                 aria-label={t("header.logout")}
               >
@@ -200,16 +240,21 @@ export function Header() {
           </div>
           <div className="flex items-center gap-1.5 text-muted-foreground">
             <Clock className="h-3.5 w-3.5" />
-            <span className="font-medium text-foreground">9 {t("header.daysRemaining")}</span>
+            <span className="font-medium text-foreground">
+              {trialDaysRemaining !== null ? `${trialDaysRemaining} ` : "— "}{t("header.daysRemaining")}
+            </span>
             <span className="text-muted-foreground">{"·"}</span>
-            <span>{t("header.lendingLimit")}: $250,000</span>
+            <span>{t("header.lendingLimit")}: ${(lendingLimit ?? 0).toLocaleString()}</span>
           </div>
         </div>
         <div className="flex items-center gap-3">
           <span className="hidden lg:inline text-xs text-muted-foreground">
             {t("header.keepEarning")}
           </span>
-          <button className="rounded-lg bg-destructive px-4 py-1.5 text-xs font-semibold text-destructive-foreground hover:bg-destructive/90 transition-colors">
+          <button
+            onClick={() => onUpgradeClick?.()}
+            className="rounded-lg bg-emerald px-4 py-1.5 text-xs font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+          >
             {t("header.upgradeNow")}
           </button>
         </div>

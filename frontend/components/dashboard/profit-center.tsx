@@ -4,16 +4,13 @@ import { useEffect, useState } from "react"
 import {
   DollarSign,
   TrendingUp,
-  Percent,
-  ArrowUpRight,
-  ArrowDownRight,
   Wallet,
   BarChart3,
   Clock,
-  Info,
 } from "lucide-react"
 import { useDateRange } from "@/lib/date-range-context"
 import { useT } from "@/lib/i18n"
+import { useCurrentUserId } from "@/lib/current-user-context"
 import {
   AreaChart,
   Area,
@@ -27,7 +24,6 @@ import {
 } from "recharts"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
-const USER_ID = 1
 
 const chartData = [
   { date: "02-19", volume: 12400, interest: 32 },
@@ -102,44 +98,103 @@ const lendingEngines = [
   },
 ]
 
-export function ProfitCenter() {
+type ProfitCenterProps = { onUpgradeClick?: () => void }
+
+export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const t = useT()
+  const userId = useCurrentUserId()
   const { range } = useDateRange()
   const [timeRange, setTimeRange] = useState("30d")
   const [grossProfit, setGrossProfit] = useState<number | null>(null)
-  const [platformFee, setPlatformFee] = useState<number | null>(null)
   const [netProfit, setNetProfit] = useState<number | null>(null)
+  const [chartHistory, setChartHistory] = useState<{ date: string; volume: number; interest: number }[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [trialDaysRemaining, setTrialDaysRemaining] = useState<number | null>(null)
+  const [lendingLimit, setLendingLimit] = useState<number>(250_000)
+  const [lendingDataSource, setLendingDataSource] = useState<"live" | "cache" | null>(null)
+  const [lendingRateLimited, setLendingRateLimited] = useState(false)
 
   useEffect(() => {
+    if (userId == null) {
+      setGrossProfit(null)
+      setNetProfit(null)
+      setChartHistory([])
+      setTrialDaysRemaining(null)
+      setLendingLimit(250_000)
+      setLendingDataSource(null)
+      setLendingRateLimited(false)
+      setLoading(false)
+      return
+    }
     const fetchStats = async () => {
       try {
         setLoading(true)
         setError(null)
         const start = range.start.toISOString().slice(0, 10)
         const end = range.end.toISOString().slice(0, 10)
-        const res = await fetch(`${API_BASE}/stats/${USER_ID}?start=${start}&end=${end}`)
-        if (!res.ok) {
-          throw new Error("Failed to load profit stats")
+        // Prefer lending stats (Bitfinex since registration); fallback to /stats
+        const lendingRes = await fetch(`${API_BASE}/stats/${userId}/lending`)
+        const src = lendingRes.headers.get("X-Data-Source")
+        setLendingDataSource(src === "cache" ? "cache" : "live")
+        setLendingRateLimited(lendingRes.headers.get("X-Rate-Limited") === "true")
+        let gross = 0
+        let net = 0
+        if (lendingRes.ok) {
+          const lendingData = await lendingRes.json()
+          gross = lendingData.gross_profit ?? 0
+          net = lendingData.net_profit ?? 0
+        } else {
+          const statsRes = await fetch(`${API_BASE}/stats/${userId}?start=${start}&end=${end}`)
+          if (statsRes.ok) {
+            const data = await statsRes.json()
+            gross = data.gross_profit ?? 0
+            net = data.net_profit ?? 0
+          }
         }
-        const data = await res.json()
-        setGrossProfit(data.gross_profit ?? 0)
-        setPlatformFee(data.fake_fee ?? 0)
-        setNetProfit(data.net_profit ?? 0)
+        setGrossProfit(gross)
+        setNetProfit(net)
+
+        const [historyRes, statusRes] = await Promise.all([
+          fetch(`${API_BASE}/stats/${userId}/history?start=${start}&end=${end}`),
+          fetch(`${API_BASE}/user-status/${userId}`),
+        ])
+        if (historyRes.ok) {
+          const history = await historyRes.json()
+          setChartHistory(Array.isArray(history) ? history : [])
+        } else {
+          setChartHistory([])
+        }
+        if (statusRes.ok) {
+          const statusData = await statusRes.json()
+          setTrialDaysRemaining(typeof statusData.trial_remaining_days === "number" ? statusData.trial_remaining_days : null)
+          setLendingLimit(Number(statusData.lending_limit) ?? 250_000)
+        }
       } catch (e) {
         const isNetworkError =
           (e instanceof TypeError && (e as Error).message === "Failed to fetch") ||
           (e instanceof Error && (e.message === "Failed to fetch" || e.message.includes("NetworkError")))
         setError(isNetworkError ? t("dashboard.apiUnreachable") : t("dashboard.unableToLoadProfit"))
         if (!isNetworkError) console.error("Failed to fetch stats", e)
+        setChartHistory([])
       } finally {
         setLoading(false)
       }
     }
 
     fetchStats()
-  }, [range.start, range.end])
+  }, [userId, range.start, range.end, t])
+
+  if (userId == null) {
+    return (
+      <div className="flex flex-col gap-6">
+        <h1 className="text-2xl font-bold text-foreground">{t("dashboard.profitCenter")}</h1>
+        <div className="rounded-xl border border-border bg-card p-8 text-center">
+          <p className="text-muted-foreground">Sign in to see your profit data.</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col gap-6">
@@ -171,32 +226,16 @@ export function ProfitCenter() {
             <span className="text-2xl font-bold text-foreground">
               {loading && grossProfit === null ? "…" : `$${(grossProfit ?? 0).toFixed(2)}`}
             </span>
-            <span className="flex items-center gap-0.5 text-xs font-medium text-emerald">
-              <ArrowUpRight className="h-3 w-3" />
-              +12.4%
-            </span>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.totalInterestThisPeriod")}</p>
-        </div>
-
-        {/* Platform Fee */}
-        <div className="rounded-xl border border-border bg-card p-5">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-              {t("dashboard.platformFee")}
-            </span>
-            <Percent className="h-4 w-4 text-chart-2" />
-          </div>
-          <div className="mt-3 flex items-baseline gap-2">
-            <span className="text-2xl font-bold text-foreground">
-              {loading && platformFee === null ? "…" : `-$${(platformFee ?? 0).toFixed(2)}`}
-            </span>
-            <div className="flex items-center gap-1">
-              <Info className="h-3 w-3 text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">{t("dashboard.displayOnly")}</span>
-            </div>
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.visualFeeBreakdown")}</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {!loading && !error && (grossProfit ?? 0) === 0 ? t("dashboard.noDataYet") : t("dashboard.grossProfitSinceRegistration")}
+            {lendingDataSource === "cache" && (
+              <span className="ml-1 text-muted-foreground"> · {t("dashboard.dataCached")}</span>
+            )}
+            {lendingRateLimited && (
+              <span className="ml-1 text-amber-600 dark:text-amber-400" title={t("dashboard.rateLimited")}> · ⚠</span>
+            )}
+          </p>
         </div>
 
         {/* Net Earnings */}
@@ -211,14 +250,17 @@ export function ProfitCenter() {
             <span className="text-2xl font-bold text-emerald">
               {loading && netProfit === null ? "…" : `$${(netProfit ?? 0).toFixed(2)}`}
             </span>
-            <span className="flex items-center gap-0.5 text-xs font-medium text-emerald">
-              <ArrowUpRight className="h-3 w-3" />
-              +12.4%
-            </span>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.takeHomeIncome")}</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {!loading && !error && (netProfit ?? 0) === 0 ? t("dashboard.noDataYet") : t("dashboard.netProfitSinceRegistration")}
+          </p>
         </div>
       </div>
+      {(lendingDataSource === "cache" || lendingRateLimited) && (
+        <p className="text-xs text-muted-foreground">
+          {lendingRateLimited ? t("dashboard.rateLimited") : t("dashboard.dataCached")}
+        </p>
+      )}
 
       {/* Trial Countdown Bar */}
       <div className="rounded-xl border border-emerald/20 bg-card p-5">
@@ -233,8 +275,14 @@ export function ProfitCenter() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <span className="text-sm font-bold text-emerald">9 {t("dashboard.daysRemainingShort")}</span>
-            <button className="rounded-lg bg-emerald px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald-dark transition-colors">
+            <span className="text-sm font-bold text-emerald">
+              {trialDaysRemaining !== null ? `${trialDaysRemaining} ` : "— "}{t("dashboard.daysRemainingShort")}
+            </span>
+            <span className="text-xs text-muted-foreground">{t("header.lendingLimit")}: ${(lendingLimit ?? 0).toLocaleString()}</span>
+            <button
+              onClick={() => onUpgradeClick?.()}
+              className="rounded-lg bg-emerald px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+            >
               {t("dashboard.upgradeToPro")}
             </button>
           </div>
@@ -242,12 +290,12 @@ export function ProfitCenter() {
         <div className="mt-4">
           <div className="flex items-center justify-between text-xs text-muted-foreground mb-2">
             <span>{t("dashboard.trialProgress")}</span>
-            <span>{t("dashboard.dayXofY", { n: 5, total: 7 })}</span>
+            <span>{t("dashboard.dayXofY", { n: trialDaysRemaining !== null ? Math.max(0, 7 - trialDaysRemaining) : 0, total: 7 })}</span>
           </div>
           <div className="h-2 w-full rounded-full bg-secondary">
             <div
-              className="h-2 rounded-full bg-gradient-to-r from-emerald to-emerald-light transition-all duration-500"
-              style={{ width: "71%" }}
+              className="h-2 rounded-full bg-gradient-to-r from-emerald to-emerald/80 transition-all duration-500"
+              style={{ width: trialDaysRemaining !== null ? `${Math.min(100, ((7 - trialDaysRemaining) / 7) * 100)}%` : "0%" }}
             />
           </div>
         </div>
@@ -279,35 +327,41 @@ export function ProfitCenter() {
             </div>
           </div>
           <div className="h-[220px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData}>
-                <defs>
-                  <linearGradient id="volumeGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
-                    <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                <XAxis dataKey="date" tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
-                <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "#0f1729",
-                    borderColor: "#1e293b",
-                    borderRadius: "8px",
-                    color: "#e2e8f0",
-                    fontSize: "12px",
-                  }}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="volume"
-                  stroke="#10b981"
-                  strokeWidth={2}
-                  fill="url(#volumeGradient)"
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+            {!loading && chartHistory.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                {t("dashboard.noDataYet")}
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartHistory.length > 0 ? chartHistory : chartData}>
+                  <defs>
+                    <linearGradient id="volumeGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
+                      <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="date" tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
+                  <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "#0f1729",
+                      borderColor: "#1e293b",
+                      borderRadius: "8px",
+                      color: "#e2e8f0",
+                      fontSize: "12px",
+                    }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="volume"
+                    stroke="#10b981"
+                    strokeWidth={2}
+                    fill="url(#volumeGradient)"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </div>
 
@@ -318,8 +372,13 @@ export function ProfitCenter() {
             <p className="text-xs text-muted-foreground">{t("dashboard.interestEarnedDesc")}</p>
           </div>
           <div className="h-[220px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData}>
+            {!loading && chartHistory.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                {t("dashboard.noDataYet")}
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartHistory.length > 0 ? chartHistory : chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                 <XAxis dataKey="date" tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
                 <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
@@ -335,6 +394,7 @@ export function ProfitCenter() {
                 <Bar dataKey="interest" fill="#10b981" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
+            )}
           </div>
         </div>
       </div>
