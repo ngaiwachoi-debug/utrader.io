@@ -1,17 +1,15 @@
-import NextAuth from "next-auth"
-import GoogleProvider from "next-auth/providers/google"
-import { UpstashRedisAdapter } from "@auth/upstash-redis-adapter"
-import { Redis } from "@upstash/redis"
+import NextAuth, { NextAuthOptions } from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+import { UpstashRedisAdapter } from "@next-auth/upstash-redis-adapter";
+import { Redis } from "@upstash/redis";
 
-const redisUrl = process.env.UPSTASH_REDIS_REST_URL
-const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN
-const redis =
-  redisUrl && redisToken
-    ? new Redis({ url: redisUrl, token: redisToken })
-    : null
+const redis = new Redis({
+  url: process.env.REDIS_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!, // Make sure this is in .env or use the full URL logic
+});
 
-const handler = NextAuth({
-  ...(redis && { adapter: UpstashRedisAdapter(redis) }),
+export const authOptions: NextAuthOptions = {
+  adapter: UpstashRedisAdapter(redis),
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID!,
@@ -19,38 +17,23 @@ const handler = NextAuth({
     }),
   ],
   callbacks: {
-    signIn: async ({ user }) => {
-      if (!user.email || !user.email.endsWith("@gmail.com")) {
-        return false
+    async signIn({ user }) {
+      if (user.email && user.email.endsWith("@gmail.com")) {
+        return true;
       }
-      return true
+      return "/?error=AccessDenied"; // Redirects to login page with error
     },
-    jwt: async ({ token, user }) => {
-      if (user?.id) token.id = user.id
-      if (user?.email) token.email = user.email
-      return token
-    },
-    session: async ({ session, token }) => {
+    async session({ session, user }) {
       if (session.user) {
-        const u = session.user as { id?: string; email?: string }
-        u.id = String(token.sub ?? token.id ?? "")
-        u.email = String(token.email ?? "")
+        session.user.id = user.id; // Pass user ID to frontend
       }
-      return session
+      return session;
     },
-  },
-  session: {
-    strategy: "jwt",
-    maxAge: 30 * 24 * 60 * 60,
   },
   pages: {
-    signIn: "/login",
+    signIn: "/", // Custom login page (your landing page)
   },
-  theme: {
-    colorScheme: "dark",
-    brandColor: "#10b981",
-  },
-  secret: process.env.NEXTAUTH_SECRET,
-})
+};
 
-export { handler as GET, handler as POST }
+const handler = NextAuth(authOptions);
+export { handler as GET, handler as POST };
