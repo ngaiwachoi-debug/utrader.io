@@ -45,7 +45,10 @@ export function SettingsPage() {
   const [trialRemainingDays, setTrialRemainingDays] = useState<number | null>(9)
 
   useEffect(() => {
-    setSignedIn(!!(typeof window !== "undefined" && localStorage.getItem("utrader_id_token")))
+    if (typeof window === "undefined") return
+    fetch("/api/auth/session", { credentials: "include" })
+      .then((r) => r.json())
+      .then((data) => setSignedIn(!!data?.user))
   }, [])
 
   useEffect(() => {
@@ -349,7 +352,8 @@ function ApiKeysTab({
     setLoading(true)
     setMessage(null)
     try {
-      const token = typeof window !== "undefined" ? localStorage.getItem("utrader_id_token") : null
+      const { getBackendToken } = await import("@/lib/auth")
+      const token = typeof window !== "undefined" ? await getBackendToken() : null
       const allowDev = process.env.NEXT_PUBLIC_ALLOW_DEV_CONNECT === "1"
 
       if (token) {

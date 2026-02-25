@@ -35,7 +35,7 @@ export default function LandingPage() {
       {/* Hero */}
       <section className="px-4 lg:px-6 py-16 lg:py-24 text-center">
         <p className="text-sm font-medium uppercase tracking-wider text-emerald mb-4">
-          Professional Bitfinex Lending Bot
+          {t("landing.heroBadge")}
         </p>
         <h1 className="text-4xl lg:text-5xl font-bold text-foreground mb-4 max-w-3xl mx-auto">
           {t("landing.heroTitle")}
@@ -71,22 +71,22 @@ export default function LandingPage() {
             <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
               <TrendingUp className="h-6 w-6" />
             </div>
-            <h3 className="font-semibold text-foreground mb-2">Live profit tracking</h3>
-            <p className="text-sm text-muted-foreground">Real-time analytics and performance data</p>
+            <h3 className="font-semibold text-foreground mb-2">{t("landing.feature1Title")}</h3>
+            <p className="text-sm text-muted-foreground">{t("landing.feature1Desc")}</p>
           </div>
           <div className="rounded-xl border border-border bg-card p-6 text-center">
             <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
               <Shield className="h-6 w-6" />
             </div>
-            <h3 className="font-semibold text-foreground mb-2">Secure Access</h3>
-            <p className="text-sm text-muted-foreground">Google OAuth — your keys stay secure</p>
+            <h3 className="font-semibold text-foreground mb-2">{t("landing.feature2Title")}</h3>
+            <p className="text-sm text-muted-foreground">{t("landing.feature2Desc")}</p>
           </div>
           <div className="rounded-xl border border-border bg-card p-6 text-center">
             <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
               <BarChart3 className="h-6 w-6" />
             </div>
-            <h3 className="font-semibold text-foreground mb-2">ROI Optimization</h3>
-            <p className="text-sm text-muted-foreground">Smart insights and automated rebalancing</p>
+            <h3 className="font-semibold text-foreground mb-2">{t("landing.feature3Title")}</h3>
+            <p className="text-sm text-muted-foreground">{t("landing.feature3Desc")}</p>
           </div>
         </div>
       </section>
@@ -94,7 +94,7 @@ export default function LandingPage() {
       {/* CTA */}
       <section className="px-4 lg:px-6 py-16 border-t border-border text-center">
         <p className="text-muted-foreground mb-6">
-          Join thousands of traders using uTrader.io to maximize their Bitfinex lending returns.
+          {t("landing.ctaText")}
         </p>
         <Link
           href="/login"
@@ -105,9 +105,9 @@ export default function LandingPage() {
       </section>
 
       <footer className="border-t border-border py-6 px-4 text-center text-xs text-muted-foreground">
-        <Link href="/login" className="hover:text-foreground">Login</Link>
+        <Link href="/login" className="hover:text-foreground">{t("landing.footerLogin")}</Link>
         {" · "}
-        <Link href="/dashboard" className="hover:text-foreground">Dashboard</Link>
+        <Link href="/dashboard" className="hover:text-foreground">{t("landing.footerDashboard")}</Link>
       </footer>
     </div>
   )

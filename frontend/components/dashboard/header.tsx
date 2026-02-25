@@ -3,9 +3,10 @@
 import { useState, useEffect } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
+import { signOut } from "next-auth/react"
 import { Star, Clock, Search, Bell, HelpCircle, User, Globe, Calendar, LogOut } from "lucide-react"
-import { useLanguage, useT } from "@/lib/i18n"
-import { getToken, clearToken } from "@/lib/auth"
+import { useLanguage } from "@/lib/i18n"
+import { useSession } from "next-auth/react"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 const USER_ID = 1
@@ -14,16 +15,13 @@ type CurrencyView = "all" | "usd"
 
 export function Header() {
   const router = useRouter()
+  const { data: session, status } = useSession()
   const { language, setLanguage, t } = useLanguage()
-  const [signedIn, setSignedIn] = useState(false)
+  const signedIn = status === "authenticated" && !!session?.user
   const [currencyView, setCurrencyView] = useState<CurrencyView>("all")
   const [totalUsdAll, setTotalUsdAll] = useState<number | null>(null)
   const [usdOnly, setUsdOnly] = useState<number | null>(null)
   const [walletsLoading, setWalletsLoading] = useState(true)
-
-  useEffect(() => {
-    setSignedIn(!!getToken())
-  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -113,12 +111,7 @@ export function Header() {
             </button>
             {signedIn ? (
               <button
-                onClick={() => {
-                  clearToken()
-                  setSignedIn(false)
-                  router.push("/")
-                  router.refresh()
-                }}
+                onClick={() => signOut({ callbackUrl: "/" }).then(() => router.refresh())}
                 className="hidden sm:flex items-center gap-1.5 rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
                 aria-label={t("header.logout")}
               >

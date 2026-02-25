@@ -10,6 +10,7 @@ import {
   RefreshCw,
   BarChart3,
 } from "lucide-react"
+import { useT } from "@/lib/i18n"
 import {
   LineChart,
   Line,
@@ -69,6 +70,7 @@ type WalletSummary = {
 }
 
 export function LiveStatus() {
+  const t = useT()
   const [activeTab, setActiveTab] = useState("total")
   const [totalAssets, setTotalAssets] = useState<number | null>(null)
   const [walletSummary, setWalletSummary] = useState<WalletSummary | null>(null)
@@ -247,7 +249,7 @@ export function LiveStatus() {
         <div className="rounded-xl border border-border bg-card p-5 lg:col-span-3">
           <div className="mb-4">
             <h3 className="text-sm font-semibold text-foreground">24h Lending Record</h3>
-            <p className="text-xs text-muted-foreground">Real-time lending volume and rate tracking</p>
+            <p className="text-xs text-muted-foreground">{t("liveStatus.realtimeLending")}</p>
           </div>
           <div className="h-[300px]">
             <ResponsiveContainer width="100%" height="100%">

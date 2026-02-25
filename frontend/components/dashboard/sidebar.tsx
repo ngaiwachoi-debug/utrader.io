@@ -15,7 +15,8 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useT } from "@/lib/i18n"
-import { getToken, clearToken } from "@/lib/auth"
+import { signOut } from "next-auth/react"
+import { useSession } from "next-auth/react"
 
 interface SidebarProps {
   activePage: string
@@ -34,17 +35,11 @@ const navItems = [
 export function Sidebar({ activePage, onPageChange, collapsed, onToggle }: SidebarProps) {
   const t = useT()
   const router = useRouter()
-  const [signedIn, setSignedIn] = useState(false)
-
-  useEffect(() => {
-    setSignedIn(!!getToken())
-  }, [])
+  const { data: session, status } = useSession()
+  const signedIn = status === "authenticated" && !!session?.user
 
   const handleLogout = () => {
-    clearToken()
-    setSignedIn(false)
-    router.push("/")
-    router.refresh()
+    signOut({ callbackUrl: "/" }).then(() => router.refresh())
   }
 
   return (
@@ -69,7 +64,7 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle }: Sideb
         <button
           onClick={onToggle}
           className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground transition-colors"
-          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-label={collapsed ? t("sidebar.expandSidebar") : t("sidebar.collapseSidebar")}
         >
           {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
         </button>
@@ -110,7 +105,7 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle }: Sideb
               </div>
               {!collapsed && (
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium text-foreground">Jeremy Choi</p>
+                  <p className="truncate text-sm font-medium text-foreground">{session?.user?.name ?? session?.user?.email ?? "User"}</p>
                   <p className="truncate text-xs text-muted-foreground">{t("sidebar.googleAccount")}</p>
                 </div>
               )}

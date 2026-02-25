@@ -3,6 +3,7 @@ import json
 import os
 from typing import Optional
 
+import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,6 +22,9 @@ from services import bitfinex as bfx_service
 
 
 app = FastAPI(title="utrader.io API")
+
+# NextAuth JWT (from /api/auth/token). Set NEXTAUTH_SECRET in env to enable.
+NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
 
 
 # --- CORS ---
@@ -80,32 +84,54 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
     return new_user
 
 
+def _get_user_by_email(email: str, db: Session) -> models.User:
+    if not email or not email.endswith("@gmail.com"):
+        raise HTTPException(status_code=400, detail="Only @gmail.com accounts are allowed.")
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not registered.")
+    return user
+
+
 async def get_current_user(
     authorization: str = Header(..., alias="Authorization"),
     db: Session = Depends(database.get_db),
 ) -> models.User:
     """
-    Simple Bearer <id_token> based auth where the frontend sends a Google ID token.
+    Verify Bearer token: either NextAuth JWT (from /api/auth/token) or Google ID token.
+    NextAuth JWT is verified against NEXTAUTH_SECRET; then user is looked up by email.
     """
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header.")
 
     token = authorization.split(" ", 1)[1]
+
+    # 1) Try NextAuth JWT (session token from Upstash/NextAuth flow)
+    if NEXTAUTH_SECRET:
+        try:
+            payload = jwt.decode(
+                token,
+                NEXTAUTH_SECRET,
+                algorithms=["HS256"],
+                options={"verify_exp": True},
+            )
+            email = (payload.get("email") or "").strip()
+            if email:
+                return _get_user_by_email(email, db)
+        except jwt.PyJWTError:
+            pass
+        except Exception:
+            pass
+
+    # 2) Fallback: Google ID token (legacy)
     try:
         idinfo = id_token.verify_oauth2_token(
             token, google_requests.Request(), GOOGLE_CLIENT_ID
         )
+        email = idinfo.get("email")
+        return _get_user_by_email(email or "", db)
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid Google ID token.")
-
-    email = idinfo.get("email")
-    if not email or not email.endswith("@gmail.com"):
-        raise HTTPException(status_code=400, detail="Only @gmail.com accounts are allowed.")
-
-    user = db.query(models.User).filter(models.User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not registered.")
-    return user
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
 
 def get_admin_user(current_user: models.User = Depends(get_current_user)) -> models.User:
