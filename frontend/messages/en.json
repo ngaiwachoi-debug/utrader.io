@@ -1,0 +1,62 @@
+{
+    "Common": {
+      "loading": "Loading...",
+      "save": "Save",
+      "cancel": "Cancel",
+      "confirm": "Confirm",
+      "error": "Error",
+      "success": "Success",
+      "status": "Status",
+      "active": "Active",
+      "inactive": "Inactive",
+      "language": "Language",
+      "currency": "Currency"
+    },
+    "Auth": {
+      "signInTitle": "Sign in to your account",
+      "signInGoogle": "Sign in with Google",
+      "signOut": "Sign Out",
+      "welcome": "Welcome back",
+      "unauthorized": "Unauthorized Access",
+      "gmailOnly": "Only @gmail.com accounts are allowed."
+    },
+    "Sidebar": {
+      "dashboard": "Dashboard",
+      "analytics": "Analytics",
+      "bots": "My Bots",
+      "wallet": "Wallet",
+      "settings": "Settings",
+      "help": "Help & Support",
+      "documentation": "Documentation"
+    },
+    "Dashboard": {
+      "title": "Dashboard",
+      "overview": "Overview",
+      "netAssets": "Net Assets",
+      "totalProfit": "Total Profit",
+      "dailyProfit": "Daily Profit", 
+      "apy": "Current APY",
+      "activeBots": "Active Bots",
+      "recentActivity": "Recent Activity",
+      "dateRange": "Date Range",
+      "refresh": "Refresh Data"
+    },
+    "BotStatus": {
+      "running": "Running",
+      "stopped": "Stopped",
+      "paused": "Paused",
+      "error": "Error",
+      "lending": "Lending",
+      "borrowing": "Borrowing"
+    },
+    "Settings": {
+      "profile": "Profile",
+      "security": "Security",
+      "apiKeys": "API Keys",
+      "connectBitfinex": "Connect Bitfinex",
+      "notifications": "Notifications",
+      "theme": "Theme",
+      "light": "Light",
+      "dark": "Dark"
+    }
+  }
