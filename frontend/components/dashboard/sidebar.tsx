@@ -105,7 +105,7 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle }: Sideb
               </div>
               {!collapsed && (
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium text-foreground">{session?.user?.name ?? session?.user?.email ?? "User"}</p>
+                  <p className="truncate text-sm font-medium text-foreground">{session?.user?.name ?? session?.user?.email ?? t("Common.user")}</p>
                   <p className="truncate text-xs text-muted-foreground">{t("sidebar.googleAccount")}</p>
                 </div>
               )}

@@ -1,6 +1,7 @@
 "use client"
 
 import Link from "next/link"
+import { signIn } from "next-auth/react"
 import { useT } from "@/lib/i18n"
 import { TrendingUp, Zap, Shield, BarChart3 } from "lucide-react"
 
@@ -47,13 +48,14 @@ export default function LandingPage() {
           {t("landing.heroDesc")}
         </p>
         <div className="flex flex-wrap items-center justify-center gap-4">
-          <Link
-            href="/login"
-            className="inline-flex items-center gap-2 rounded-lg bg-emerald px-6 py-3 text-base font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+          <button
+            type="button"
+            onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+            className="inline-flex items-center gap-2 rounded-lg bg-[#10b981] px-6 py-3 text-base font-semibold text-white hover:bg-emerald/90 transition-colors"
           >
             <Zap className="h-5 w-5" />
-            {t("landing.startFreeTrial")}
-          </Link>
+            {t("login.signInWithGoogle")}
+          </button>
           <Link
             href="/dashboard"
             className="inline-flex items-center gap-2 rounded-lg border border-border px-6 py-3 text-base font-medium text-foreground hover:bg-secondary transition-colors"
@@ -96,12 +98,13 @@ export default function LandingPage() {
         <p className="text-muted-foreground mb-6">
           {t("landing.ctaText")}
         </p>
-        <Link
-          href="/login"
-          className="inline-flex items-center gap-2 rounded-lg bg-emerald px-6 py-3 text-base font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+        <button
+          type="button"
+          onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+          className="inline-flex items-center gap-2 rounded-lg bg-[#10b981] px-6 py-3 text-base font-semibold text-white hover:bg-emerald/90 transition-colors"
         >
-          {t("login.continueWithGoogle")}
-        </Link>
+          {t("login.signInWithGoogle")}
+        </button>
       </section>
 
       <footer className="border-t border-border py-6 px-4 text-center text-xs text-muted-foreground">

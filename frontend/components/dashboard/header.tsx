@@ -2,26 +2,40 @@
 
 import { useState, useEffect } from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { useRouter, usePathname } from "next/navigation"
 import { signOut } from "next-auth/react"
 import { Star, Clock, Search, Bell, HelpCircle, User, Globe, Calendar, LogOut } from "lucide-react"
 import { useLanguage } from "@/lib/i18n"
 import { useSession } from "next-auth/react"
+import { useDateRange } from "@/lib/date-range-context"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { Calendar as CalendarComponent } from "@/components/ui/calendar"
+import type { DateRange as PickerRange } from "react-day-picker"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 const USER_ID = 1
 
-type CurrencyView = "all" | "usd"
+type CurrencyView = "USD" | "USDT"
 
 export function Header() {
   const router = useRouter()
+  const pathname = usePathname()
   const { data: session, status } = useSession()
   const { language, setLanguage, t } = useLanguage()
+  const { range, setRange, formatRange } = useDateRange()
   const signedIn = status === "authenticated" && !!session?.user
-  const [currencyView, setCurrencyView] = useState<CurrencyView>("all")
+  const [currencyView, setCurrencyView] = useState<CurrencyView>("USD")
   const [totalUsdAll, setTotalUsdAll] = useState<number | null>(null)
   const [usdOnly, setUsdOnly] = useState<number | null>(null)
   const [walletsLoading, setWalletsLoading] = useState(true)
+  const [dateOpen, setDateOpen] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -51,60 +65,96 @@ export function Header() {
     return () => { cancelled = true }
   }, [])
 
-  const displayValue = currencyView === "usd"
-    ? (usdOnly != null ? `$${usdOnly.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—")
-    : (totalUsdAll != null ? `$${totalUsdAll.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—")
+  const displayValue =
+    currencyView === "USD"
+      ? usdOnly != null
+        ? `$${usdOnly.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+        : "—"
+      : totalUsdAll != null
+        ? `$${totalUsdAll.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+        : "—"
+
+  const handleLocaleChange = (value: string) => {
+    setLanguage(value as "en" | "zh")
+    const locale = value === "zh" ? "zh" : "en"
+    const path = pathname ?? "/dashboard"
+    const hasLocale = /^\/(en|zh)(\/|$)/.test(path)
+    if (hasLocale) {
+      const withoutLocale = path.replace(/^\/(en|zh)/, "") || "/"
+      const newPath = `/${locale}${withoutLocale === "/" ? "" : withoutLocale}`
+      if (path !== newPath) router.push(newPath)
+    }
+  }
+
+  const pickerRange: PickerRange | undefined = range
+    ? { from: range.start, to: range.end }
+    : undefined
 
   return (
-    <header
-      className="sticky top-0 z-30 flex flex-col border-b border-border bg-card/80 backdrop-blur-md"
-    >
-      {/* Main header */}
+    <header className="sticky top-0 z-30 flex flex-col border-b border-border bg-card/80 backdrop-blur-md">
       <div className="flex h-14 items-center justify-between px-4 lg:px-6">
         <div className="flex items-center gap-2">
           <Link href="/dashboard" className="text-sm font-semibold text-foreground">
-            uTrader<span className="text-emerald">.io</span>
+            uTrader<span className="text-[#10b981]">.io</span>
           </Link>
           <span className="text-sm text-muted-foreground">{t("header.dashboard")}</span>
         </div>
 
         <div className="flex items-center gap-2 lg:gap-3">
-          {/* Date Range */}
-          <div className="hidden md:flex items-center gap-2 rounded-lg border border-border bg-secondary px-3 py-1.5 text-xs text-muted-foreground">
-            <Calendar className="h-3.5 w-3.5" />
-            <span>Jan 26, 2026 - Feb 25, 2026</span>
-          </div>
+          {/* Date Range Picker */}
+          <Popover open={dateOpen} onOpenChange={setDateOpen}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="hidden md:flex items-center gap-2 rounded-lg border border-border bg-secondary px-3 py-1.5 text-xs text-muted-foreground hover:bg-secondary/80 transition-colors"
+              >
+                <Calendar className="h-3.5 w-3.5" />
+                <span>{formatRange()}</span>
+              </button>
+            </PopoverTrigger>
+            <PopoverContent className="w-auto p-0 bg-card border-border" align="end">
+              <CalendarComponent
+                mode="range"
+                selected={pickerRange}
+                onSelect={(v) => {
+                  if (v?.from) {
+                    setRange({
+                      start: v.from,
+                      end: v.to ?? v.from,
+                    })
+                    setDateOpen(false)
+                  }
+                }}
+                numberOfMonths={2}
+                defaultMonth={range.start}
+              />
+            </PopoverContent>
+          </Popover>
 
-          {/* Currency Selector: All currencies (total USD) / USD only */}
-          <div className="hidden sm:flex items-center gap-2 rounded-lg border border-border bg-secondary px-3 py-1.5 text-xs text-muted-foreground">
-            <button
-              type="button"
-              onClick={() => setCurrencyView("all")}
-              className={`cursor-pointer hover:text-foreground transition-colors ${currencyView === "all" ? "font-semibold text-foreground" : ""}`}
-            >
-              {t("header.allCurrencies")}
-            </button>
-            <span className="text-muted-foreground/60">|</span>
-            <button
-              type="button"
-              onClick={() => setCurrencyView("usd")}
-              className={`cursor-pointer hover:text-foreground transition-colors ${currencyView === "usd" ? "font-semibold text-foreground" : ""}`}
-            >
-              {t("header.usd")}
-            </button>
-            <span className="text-foreground font-medium min-w-[4rem] text-right">
-              {walletsLoading ? "…" : displayValue}
-            </span>
-          </div>
+          {/* Currency Select: USD | USDT (do not translate) */}
+          <Select
+            value={currencyView}
+            onValueChange={(v) => setCurrencyView(v as CurrencyView)}
+          >
+            <SelectTrigger size="sm" className="hidden sm:flex w-[120px] text-xs border-border bg-secondary">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="USD">USD</SelectItem>
+              <SelectItem value="USDT">USDT</SelectItem>
+            </SelectContent>
+          </Select>
+          <span className="hidden sm:inline text-foreground font-medium min-w-[4rem] text-right text-xs">
+            {walletsLoading ? "…" : displayValue}
+          </span>
 
-          {/* Icon Buttons */}
           <div className="flex items-center gap-1">
             <button className="rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.search")}>
               <Search className="h-4 w-4" />
             </button>
             <button className="relative rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.notifications")}>
               <Bell className="h-4 w-4" />
-              <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-emerald"></span>
+              <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-[#10b981]" />
             </button>
             <button className="hidden sm:flex rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.help")}>
               <HelpCircle className="h-4 w-4" />
@@ -124,22 +174,17 @@ export function Header() {
                 <span className="text-xs">{t("header.login")}</span>
               </Link>
             )}
-            <div className="hidden sm:flex items-center gap-1 rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
-              <Globe className="h-4 w-4" />
-              <button
-                className={`text-xs ${language === "en" ? "font-semibold text-foreground" : ""}`}
-                onClick={() => setLanguage("en")}
-              >
-                {t("header.langEn")}
-              </button>
-              <span className="text-xs text-muted-foreground">/</span>
-              <button
-                className={`text-xs ${language === "zh" ? "font-semibold text-foreground" : ""}`}
-                onClick={() => setLanguage("zh")}
-              >
-                {t("header.langZh")}
-              </button>
-            </div>
+            {/* Language Select: English | 中文, toggle /en and /zh */}
+            <Select value={language} onValueChange={handleLocaleChange}>
+              <SelectTrigger size="sm" className="hidden sm:flex w-[100px] text-xs border-border bg-secondary">
+                <Globe className="h-3.5 w-3.5 mr-1" />
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="en">English</SelectItem>
+                <SelectItem value="zh">中文</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         </div>
       </div>
@@ -149,7 +194,7 @@ export function Header() {
         <div className="flex flex-wrap items-center gap-3 text-xs">
           <div className="flex items-center gap-1.5">
             <Star className="h-3.5 w-3.5 text-yellow-400" />
-            <span className="rounded-full bg-emerald px-2.5 py-0.5 text-xs font-semibold text-primary-foreground">
+            <span className="rounded-full bg-[#10b981] px-2.5 py-0.5 text-xs font-semibold text-primary-foreground">
               {t("header.proTrial")}
             </span>
           </div>

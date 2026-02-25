@@ -12,6 +12,8 @@ import {
   Clock,
   Info,
 } from "lucide-react"
+import { useDateRange } from "@/lib/date-range-context"
+import { useT } from "@/lib/i18n"
 import {
   AreaChart,
   Area,
@@ -101,6 +103,8 @@ const lendingEngines = [
 ]
 
 export function ProfitCenter() {
+  const t = useT()
+  const { range } = useDateRange()
   const [timeRange, setTimeRange] = useState("30d")
   const [grossProfit, setGrossProfit] = useState<number | null>(null)
   const [platformFee, setPlatformFee] = useState<number | null>(null)
@@ -113,7 +117,9 @@ export function ProfitCenter() {
       try {
         setLoading(true)
         setError(null)
-        const res = await fetch(`${API_BASE}/stats/${USER_ID}`)
+        const start = range.start.toISOString().slice(0, 10)
+        const end = range.end.toISOString().slice(0, 10)
+        const res = await fetch(`${API_BASE}/stats/${USER_ID}?start=${start}&end=${end}`)
         if (!res.ok) {
           throw new Error("Failed to load profit stats")
         }
@@ -123,22 +129,22 @@ export function ProfitCenter() {
         setNetProfit(data.net_profit ?? 0)
       } catch (e) {
         console.error("Failed to fetch stats", e)
-        setError("Unable to load live profit data.")
+        setError(t("dashboard.unableToLoadProfit"))
       } finally {
         setLoading(false)
       }
     }
 
     fetchStats()
-  }, [])
+  }, [range.start, range.end])
 
   return (
     <div className="flex flex-col gap-6">
       {/* Page Title */}
       <div>
-        <h1 className="text-2xl font-bold text-foreground">Profit Center</h1>
+        <h1 className="text-2xl font-bold text-foreground">{t("dashboard.profitCenter")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Track your lending profits, fees, and net earnings in real time.
+          {t("dashboard.profitCenterDesc")}
         </p>
       </div>
 
@@ -161,14 +167,14 @@ export function ProfitCenter() {
               +12.4%
             </span>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Total interest earned this period</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.totalInterestThisPeriod")}</p>
         </div>
 
         {/* Platform Fee */}
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-              Platform Fee (20%)
+              {t("dashboard.platformFee")}
             </span>
             <Percent className="h-4 w-4 text-chart-2" />
           </div>
@@ -178,17 +184,17 @@ export function ProfitCenter() {
             </span>
             <div className="flex items-center gap-1">
               <Info className="h-3 w-3 text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">Display only</span>
+              <span className="text-xs text-muted-foreground">{t("dashboard.displayOnly")}</span>
             </div>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Visual fee breakdown (not deducted)</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.visualFeeBreakdown")}</p>
         </div>
 
         {/* Net Earnings */}
         <div className="rounded-xl border border-emerald/30 bg-emerald/5 p-5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium uppercase tracking-wider text-emerald">
-              Net Earnings
+              {t("dashboard.netEarnings")}
             </span>
             <Wallet className="h-4 w-4 text-emerald" />
           </div>
@@ -201,7 +207,7 @@ export function ProfitCenter() {
               +12.4%
             </span>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Your take-home lending income</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.takeHomeIncome")}</p>
         </div>
       </div>
 
@@ -213,21 +219,21 @@ export function ProfitCenter() {
               <Clock className="h-5 w-5 text-emerald" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-foreground">7-Day Pro Trial</p>
-              <p className="text-xs text-muted-foreground">Expert Plan features included</p>
+              <p className="text-sm font-semibold text-foreground">{t("dashboard.proTrialCard")}</p>
+              <p className="text-xs text-muted-foreground">{t("dashboard.expertPlanFeatures")}</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <span className="text-sm font-bold text-emerald">9 days remaining</span>
+            <span className="text-sm font-bold text-emerald">9 {t("dashboard.daysRemainingShort")}</span>
             <button className="rounded-lg bg-emerald px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald-dark transition-colors">
-              Upgrade to Pro
+              {t("dashboard.upgradeToPro")}
             </button>
           </div>
         </div>
         <div className="mt-4">
           <div className="flex items-center justify-between text-xs text-muted-foreground mb-2">
-            <span>Trial Progress</span>
-            <span>Day 5 of 7</span>
+            <span>{t("dashboard.trialProgress")}</span>
+            <span>{t("dashboard.dayXofY", { n: 5, total: 7 })}</span>
           </div>
           <div className="h-2 w-full rounded-full bg-secondary">
             <div
@@ -244,8 +250,8 @@ export function ProfitCenter() {
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h3 className="text-sm font-semibold text-foreground">24h Lending Volume</h3>
-              <p className="text-xs text-muted-foreground">Daily lending volume over the past week</p>
+              <h3 className="text-sm font-semibold text-foreground">{t("dashboard.lendingVolume24h")}</h3>
+              <p className="text-xs text-muted-foreground">{t("dashboard.lendingVolumeDesc")}</p>
             </div>
             <div className="flex items-center gap-1 rounded-lg border border-border p-0.5">
               {["7d", "30d", "90d"].map((range) => (
@@ -299,8 +305,8 @@ export function ProfitCenter() {
         {/* Interest Earned Chart */}
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="mb-4">
-            <h3 className="text-sm font-semibold text-foreground">Interest Earned</h3>
-            <p className="text-xs text-muted-foreground">Daily interest earnings breakdown</p>
+            <h3 className="text-sm font-semibold text-foreground">{t("dashboard.interestEarned")}</h3>
+            <p className="text-xs text-muted-foreground">{t("dashboard.interestEarnedDesc")}</p>
           </div>
           <div className="h-[220px]">
             <ResponsiveContainer width="100%" height="100%">

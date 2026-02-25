@@ -109,11 +109,11 @@ export function LiveStatus() {
         })
       } else {
         setWalletSummary(null)
-        setWalletError("Connect API keys in Settings to see assets.")
+        setWalletError(t("liveStatus.connectApiKeys"))
       }
     } catch (e) {
       console.error("Failed to fetch live status", e)
-      setError("Unable to load live status.")
+      setError(t("liveStatus.unableToLoad"))
       setBotActive(null)
       setTotalAssets(null)
       setWalletSummary(null)
@@ -159,7 +159,7 @@ export function LiveStatus() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-xs font-medium uppercase tracking-wider text-emerald">February 25, 2026</p>
-          <h1 className="text-2xl font-bold text-foreground">Live Status</h1>
+          <h1 className="text-2xl font-bold text-foreground">{t("liveStatus.title")}</h1>
         </div>
         <div className="flex items-center gap-2">
           <span
@@ -167,28 +167,28 @@ export function LiveStatus() {
               botActive ? "bg-emerald/10 text-emerald" : "bg-destructive/10 text-destructive"
             }`}
           >
-            {botActive === null ? "Status Unknown" : botActive ? "Bot Active" : "Bot Stopped"}
+            {botActive === null ? t("liveStatus.statusUnknown") : botActive ? t("liveStatus.botActive") : t("liveStatus.botStopped")}
           </span>
           <button
             onClick={refreshStatus}
             className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground hover:border-emerald/50 hover:text-foreground transition-colors"
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            Refresh
+            {t("liveStatus.refresh")}
           </button>
           <button
             onClick={handleStart}
             disabled={isStarting}
             className="rounded-lg bg-emerald px-3 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald-dark disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
           >
-            {isStarting ? "Starting..." : "Start Bot"}
+            {isStarting ? t("liveStatus.starting") : t("liveStatus.startBot")}
           </button>
           <button
             onClick={handleStop}
             disabled={isStopping}
             className="rounded-lg bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground hover:bg-destructive/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
           >
-            {isStopping ? "Stopping..." : "Stop Bot"}
+            {isStopping ? t("liveStatus.stopping") : t("liveStatus.stopBot")}
           </button>
         </div>
       </div>
@@ -198,7 +198,7 @@ export function LiveStatus() {
         <button
           className="rounded-full bg-emerald px-4 py-1.5 text-xs font-semibold text-primary-foreground"
         >
-          Total
+          {t("liveStatus.total")}
         </button>
       </div>
 
@@ -208,8 +208,8 @@ export function LiveStatus() {
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <span className="rounded-md bg-emerald/10 px-2 py-0.5 text-xs font-semibold text-emerald">ASSETS</span>
-              <span className="text-xs text-muted-foreground">All currencies (Bitfinex)</span>
+              <span className="rounded-md bg-emerald/10 px-2 py-0.5 text-xs font-semibold text-emerald">{t("liveStatus.assets")}</span>
+              <span className="text-xs text-muted-foreground">{t("liveStatus.allCurrencies")}</span>
             </div>
             <Wallet className="h-5 w-5 text-emerald" />
           </div>
@@ -219,7 +219,7 @@ export function LiveStatus() {
             </span>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            {walletError ?? (walletSummary ? "Total USD value across funding wallet." : "Loading…")}
+            {walletError ?? (walletSummary ? t("liveStatus.totalUsdValue") : t("liveStatus.loading"))}
           </p>
         </div>
 
@@ -227,8 +227,8 @@ export function LiveStatus() {
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <span className="rounded-md bg-destructive/10 px-2 py-0.5 text-xs font-semibold text-destructive">LOANED</span>
-              <span className="text-xs text-muted-foreground">Currently loaned</span>
+              <span className="rounded-md bg-destructive/10 px-2 py-0.5 text-xs font-semibold text-destructive">{t("liveStatus.loaned")}</span>
+              <span className="text-xs text-muted-foreground">{t("liveStatus.currentlyLoaned")}</span>
             </div>
             <DollarSign className="h-5 w-5 text-emerald" />
           </div>
@@ -297,14 +297,14 @@ export function LiveStatus() {
         {/* Market Overview */}
         <div className="rounded-xl border border-border bg-card lg:col-span-2">
           <div className="border-b border-border p-4">
-            <h3 className="text-sm font-semibold text-foreground">Market Overview</h3>
+            <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.marketOverview")}</h3>
           </div>
           {/* Market Header */}
           <div className="grid grid-cols-4 gap-2 border-b border-border px-4 py-2 text-xs font-medium text-muted-foreground">
             <span>Currency</span>
-            <span className="text-right">Rate</span>
+            <span className="text-right">{t("liveStatus.rate")}</span>
             <span className="text-right">1d Change</span>
-            <span className="text-right">Volume</span>
+            <span className="text-right">{t("liveStatus.volume")}</span>
           </div>
           {/* Market Rows */}
           <div className="max-h-[320px] overflow-y-auto">
@@ -337,29 +337,29 @@ export function LiveStatus() {
       {/* Lending Ledger Table */}
       <div className="rounded-xl border border-border bg-card">
         <div className="border-b border-border p-5">
-          <h3 className="text-sm font-semibold text-foreground">Bitfinex Lending Ledger</h3>
-          <p className="text-xs text-muted-foreground">Hourly high-low rate range and lending history</p>
+          <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.bitfinexLendingLedger")}</h3>
+          <p className="text-xs text-muted-foreground">{t("liveStatus.lendingLedgerDesc")}</p>
         </div>
 
         {/* Current Rate Card */}
         <div className="m-5 rounded-xl bg-emerald/10 border border-emerald/20 p-5">
-          <p className="text-xs text-muted-foreground">Current Annual Rate:</p>
+          <p className="text-xs text-muted-foreground">{t("liveStatus.currentAnnualRate")}</p>
           <p className="text-3xl font-bold text-emerald mt-1">$2.64%</p>
-          <p className="text-xs text-muted-foreground mt-1">Daily rate: 0.007229</p>
+          <p className="text-xs text-muted-foreground mt-1">{t("liveStatus.dailyRate")} 0.007229</p>
         </div>
 
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs" role="table">
             <thead>
               <tr className="border-b border-border text-xs uppercase text-muted-foreground">
-                <th className="px-5 py-3 font-medium">Time</th>
-                <th className="px-5 py-3 font-medium">Rate Range</th>
-                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">Max Days</th>
-                <th className="hidden px-5 py-3 font-medium text-right md:table-cell">Cumulative</th>
-                <th className="px-5 py-3 font-medium text-right">Rate</th>
-                <th className="hidden px-5 py-3 font-medium text-right lg:table-cell">Amount</th>
-                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">Count</th>
-                <th className="px-5 py-3 font-medium text-right">Total</th>
+                <th className="px-5 py-3 font-medium">{t("liveStatus.time")}</th>
+                <th className="px-5 py-3 font-medium">{t("liveStatus.rateRange")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">{t("liveStatus.maxDays")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right md:table-cell">{t("liveStatus.cumulative")}</th>
+                <th className="px-5 py-3 font-medium text-right">{t("liveStatus.rate")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right lg:table-cell">{t("liveStatus.amount")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">{t("liveStatus.count")}</th>
+                <th className="px-5 py-3 font-medium text-right">{t("liveStatus.totalCol")}</th>
               </tr>
             </thead>
             <tbody>

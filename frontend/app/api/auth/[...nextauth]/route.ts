@@ -1,15 +1,17 @@
-import NextAuth, { NextAuthOptions } from "next-auth";
-import GoogleProvider from "next-auth/providers/google";
-import { UpstashRedisAdapter } from "@next-auth/upstash-redis-adapter";
-import { Redis } from "@upstash/redis";
+import NextAuth, { NextAuthOptions } from "next-auth"
+import GoogleProvider from "next-auth/providers/google"
+import { UpstashRedisAdapter } from "@auth/upstash-redis-adapter"
+import { Redis } from "@upstash/redis"
 
-const redis = new Redis({
-  url: process.env.REDIS_URL!,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN!, // Make sure this is in .env or use the full URL logic
-});
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL ?? process.env.REDIS_URL
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN
+const redis =
+  redisUrl && redisToken
+    ? new Redis({ url: redisUrl, token: redisToken })
+    : null
 
 export const authOptions: NextAuthOptions = {
-  adapter: UpstashRedisAdapter(redis),
+  ...(redis && { adapter: UpstashRedisAdapter(redis) }),
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID!,
@@ -19,21 +21,27 @@ export const authOptions: NextAuthOptions = {
   callbacks: {
     async signIn({ user }) {
       if (user.email && user.email.endsWith("@gmail.com")) {
-        return true;
+        return true
       }
-      return "/?error=AccessDenied"; // Redirects to login page with error
+      return "/?error=AccessDenied"
     },
-    async session({ session, user }) {
+    async session({ session, token }) {
       if (session.user) {
-        session.user.id = user.id; // Pass user ID to frontend
+        (session.user as { id?: string }).id = token.sub ?? (token as { id?: string }).id
       }
-      return session;
+      return session
     },
   },
+  session: { strategy: "jwt", maxAge: 30 * 24 * 60 * 60 },
   pages: {
-    signIn: "/", // Custom login page (your landing page)
+    signIn: "/",
   },
-};
+  theme: {
+    colorScheme: "dark",
+    brandColor: "#10b981",
+  },
+  secret: process.env.NEXTAUTH_SECRET,
+}
 
-const handler = NextAuth(authOptions);
-export { handler as GET, handler as POST };
+const handler = NextAuth(authOptions)
+export { handler as GET, handler as POST }

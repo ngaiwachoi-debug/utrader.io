@@ -9,6 +9,7 @@ import { LiveStatus } from "@/components/dashboard/live-status"
 import { TrueROI } from "@/components/dashboard/true-roi"
 import { SettingsPage } from "@/components/dashboard/settings"
 import { useT } from "@/lib/i18n"
+import { DateRangeProvider } from "@/lib/date-range-context"
 
 export default function DashboardPage() {
   const [activePage, setActivePage] = useState("profit-center")
@@ -16,6 +17,7 @@ export default function DashboardPage() {
   const t = useT()
 
   return (
+    <DateRangeProvider>
     <div className="min-h-screen bg-background">
       <Sidebar
         activePage={activePage}
@@ -39,6 +41,7 @@ export default function DashboardPage() {
 
       <MobileNav activePage={activePage} onPageChange={setActivePage} t={t} />
     </div>
+    </DateRangeProvider>
   )
 }
 

@@ -6,6 +6,8 @@ import {
   Activity,
   ArrowUpRight,
 } from "lucide-react"
+import { useDateRange } from "@/lib/date-range-context"
+import { useT } from "@/lib/i18n"
 import {
   AreaChart,
   Area,
@@ -15,6 +17,17 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts"
+
+const MONTH_ABBR: Record<string, number> = {
+  Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+  Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+}
+
+function parseChartDate(dateStr: string, year: number): Date {
+  const [month, day] = dateStr.split(" ")
+  const m = MONTH_ABBR[month] ?? 0
+  return new Date(year, m, parseInt(day, 10))
+}
 
 const navHistory = [
   { date: "Jan 26", nav: 1.0, capital: 0 },
@@ -28,13 +41,22 @@ const navHistory = [
 ]
 
 export function TrueROI() {
+  const t = useT()
+  const { range } = useDateRange()
+  const year = range.start.getFullYear()
+  const filteredNavHistory = navHistory.filter((d) => {
+    const date = parseChartDate(d.date, year)
+    return date >= range.start && date <= range.end
+  })
+  const chartData = filteredNavHistory.length ? filteredNavHistory : navHistory
+
   return (
     <div className="flex flex-col gap-6">
       {/* Page Title */}
       <div>
-        <h1 className="text-2xl font-bold text-foreground">{"Performance & True ROI"}</h1>
+        <h1 className="text-2xl font-bold text-foreground">{t("dashboard.trueRoiTitle")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Institutional-grade accounting separated from capital flows.
+          {t("dashboard.trueRoiDesc")}
         </p>
       </div>
 
@@ -43,49 +65,49 @@ export function TrueROI() {
         {/* NAV */}
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">Net Asset Value (NAV)</span>
-            <Activity className="h-4 w-4 text-emerald" />
+            <span className="text-xs font-medium text-muted-foreground">{t("dashboard.nav")}</span>
+            <Activity className="h-4 w-4 text-[#10b981]" />
           </div>
           <div className="mt-3">
             <span className="text-3xl font-bold text-foreground">1.0000</span>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Current value per unit</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.navPerUnit")}</p>
         </div>
 
         {/* True ROI */}
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">True ROI</span>
-            <TrendingUp className="h-4 w-4 text-emerald" />
+            <span className="text-xs font-medium text-muted-foreground">{t("dashboard.trueRoi")}</span>
+            <TrendingUp className="h-4 w-4 text-[#10b981]" />
           </div>
           <div className="mt-3">
-            <span className="text-3xl font-bold text-emerald">+0.00%</span>
+            <span className="text-3xl font-bold text-[#10b981]">+0.00%</span>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Pure yield since inception</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.pureYieldInception")}</p>
         </div>
 
         {/* Net Capital Flow */}
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">Net Capital Flow</span>
-            <DollarSign className="h-4 w-4 text-emerald" />
+            <span className="text-xs font-medium text-muted-foreground">{t("dashboard.capitalFlow")}</span>
+            <DollarSign className="h-4 w-4 text-[#10b981]" />
           </div>
           <div className="mt-3">
-            <span className="text-3xl font-bold text-emerald">+$0.00</span>
+            <span className="text-3xl font-bold text-[#10b981]">+$0.00</span>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Total Deposits - Withdrawals</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.depositsWithdrawals")}</p>
         </div>
       </div>
 
       {/* NAV vs Capital Flow History */}
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-4">
-          <h3 className="text-sm font-semibold text-foreground">NAV vs Capital Flow History</h3>
-          <p className="text-xs text-muted-foreground">Visualizing pure yield independently from your total capital size.</p>
+          <h3 className="text-sm font-semibold text-foreground">{t("dashboard.navVsCapitalTitle")}</h3>
+          <p className="text-xs text-muted-foreground">{t("dashboard.navVsCapitalDesc")}</p>
         </div>
         <div className="h-[350px]">
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={navHistory}>
+            <AreaChart data={chartData}>
               <defs>
                 <linearGradient id="navGradient" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor="#10b981" stopOpacity={0.2} />
@@ -120,12 +142,12 @@ export function TrueROI() {
       {/* Capital Ledger */}
       <div className="rounded-xl border border-border bg-card">
         <div className="border-b border-border p-5">
-          <h3 className="text-sm font-semibold text-foreground">Capital Ledger</h3>
-          <p className="text-xs text-muted-foreground">History of deposits and withdrawals affecting your unit allocation.</p>
+          <h3 className="text-sm font-semibold text-foreground">{t("dashboard.capitalLedger")}</h3>
+          <p className="text-xs text-muted-foreground">{t("dashboard.capitalLedgerDesc")}</p>
         </div>
         <div className="flex flex-col items-center justify-center py-16">
           <Activity className="h-10 w-10 text-muted-foreground/30 mb-3" />
-          <p className="text-sm text-muted-foreground">No capital transactions recorded in this period.</p>
+          <p className="text-sm text-muted-foreground">{t("dashboard.noCapitalTransactions")}</p>
         </div>
       </div>
     </div>
