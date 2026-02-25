@@ -336,6 +336,7 @@ function ApiKeysTab({
   showSecret: boolean
   setShowSecret: (v: boolean) => void
 }) {
+  const t = useT()
   const router = useRouter()
   const pathname = usePathname()
   const [bfxKey, setBfxKey] = useState("")
@@ -366,6 +367,7 @@ function ApiKeysTab({
       if (token) {
         const res = await fetch(`${API_BASE}/api/keys`, {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
           body: JSON.stringify({ bfx_key: key, bfx_secret: secret, gemini_key: geminiKey || undefined }),
         })
@@ -390,6 +392,7 @@ function ApiKeysTab({
       } else if (allowDev) {
         const res = await fetch(`${API_BASE}/connect-exchange/by-user`, {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             user_id: USER_ID,
@@ -426,9 +429,11 @@ function ApiKeysTab({
       }
       setTimeout(clearMessage, 6000)
     } catch (e) {
-      const errMsg = e instanceof Error ? e.message : "Failed to save API keys."
+      const rawMsg = e instanceof Error ? e.message : "Failed to save API keys."
+      const isNetworkError = rawMsg === "Failed to fetch" || rawMsg.includes("NetworkError")
+      const errMsg = isNetworkError ? t("dashboard.apiUnreachable") : rawMsg
       setMessage({ type: "error", text: errMsg })
-      toast.error("Connection failed", { description: errMsg })
+      toast.error(isNetworkError ? "Unable to connect" : "Connection failed", { description: errMsg })
       setTimeout(clearMessage, 6000)
     } finally {
       setLoading(false)

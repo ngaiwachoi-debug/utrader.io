@@ -27,10 +27,10 @@ app = FastAPI(title="utrader.io API")
 NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
 
 
-# --- CORS ---
+# --- CORS: explicitly allow frontend origins so browser can reach backend ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://127.0.0.1:3000", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,17 +94,19 @@ def _get_user_by_email(email: str, db: Session) -> models.User:
 
 
 async def get_current_user(
-    authorization: str = Header(..., alias="Authorization"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(database.get_db),
 ) -> models.User:
     """
     Verify Bearer token: either NextAuth JWT (from /api/auth/token) or Google ID token.
-    NextAuth JWT is verified against NEXTAUTH_SECRET; then user is looked up by email.
+    User is looked up by email from the token. If no valid session, return 401 with friendly message.
     """
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header.")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
-    token = authorization.split(" ", 1)[1]
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
     # 1) Try NextAuth JWT (session token from Upstash/NextAuth flow)
     if NEXTAUTH_SECRET:
@@ -131,7 +133,9 @@ async def get_current_user(
         email = idinfo.get("email")
         return _get_user_by_email(email or "", db)
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+        pass
+
+    raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
 
 def get_admin_user(current_user: models.User = Depends(get_current_user)) -> models.User:
@@ -262,8 +266,8 @@ async def api_keys(
     db: Session = Depends(database.get_db),
 ):
     """
-    Validate Bitfinex API key and secret (v2/auth/r/wallets + permissions),
-    encrypt and save to DB, return balance on success.
+    Validate Bitfinex API key and secret, encrypt and save to DB, return balance on success.
+    get_current_user ensures the user exists in the database before proceeding.
     """
     balance, result = await _validate_and_save_bitfinex_keys(
         payload, current_user, db
