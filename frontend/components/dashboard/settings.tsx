@@ -1,0 +1,648 @@
+"use client"
+
+import { useEffect, useState } from "react"
+import Link from "next/link"
+import { useT } from "@/lib/i18n"
+import {
+  DollarSign,
+  Clock,
+  Calendar,
+  Link2,
+  Lock,
+  Eye,
+  EyeOff,
+  ExternalLink,
+  Bell,
+  Mail,
+  MessageSquare,
+  AlertTriangle,
+  TrendingDown,
+  BarChart3,
+  BookOpen,
+  Shield,
+  Send,
+} from "lucide-react"
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+const USER_ID = 1
+
+type SettingsTab = "lending" | "notifications" | "api-keys" | "community"
+
+export function SettingsPage() {
+  const t = useT()
+  const [activeTab, setActiveTab] = useState<SettingsTab>("lending")
+  const [showSecret, setShowSecret] = useState(false)
+  const [enableLending, setEnableLending] = useState(true)
+  const [customLimit, setCustomLimit] = useState(false)
+  const [darkMode, setDarkMode] = useState(true)
+  const [dailyEmail, setDailyEmail] = useState(false)
+  const [signedIn, setSignedIn] = useState(false)
+
+  const [planTier, setPlanTier] = useState<string>("Trial User")
+  const [planName, setPlanName] = useState<string>("Expert Plan")
+  const [lendingLimit, setLendingLimit] = useState<number>(250000)
+  const [rebalanceMinutes, setRebalanceMinutes] = useState<number>(3)
+  const [trialRemainingDays, setTrialRemainingDays] = useState<number | null>(9)
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    fetch("/api/auth/session", { credentials: "include" })
+      .then((r) => r.json())
+      .then((data) => setSignedIn(!!data?.user))
+  }, [])
+
+  useEffect(() => {
+    const fetchUserStatus = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/user-status/${USER_ID}`)
+        if (!res.ok) return
+        const data = await res.json()
+
+        setPlanTier((data.plan_tier ?? "trial").toUpperCase() + " User")
+        const tier = (data.plan_tier ?? "trial").toLowerCase()
+        if (tier === "pro") setPlanName("Pro Plan")
+        else if (tier === "expert") setPlanName("Expert Plan")
+        else if (tier === "guru") setPlanName("Guru Plan")
+        else setPlanName("Trial Plan")
+
+        setLendingLimit(data.lending_limit ?? 0)
+        setRebalanceMinutes(data.rebalance_interval ?? 0)
+        setTrialRemainingDays(typeof data.trial_remaining_days === "number" ? data.trial_remaining_days : null)
+      } catch (e) {
+        console.error("Failed to fetch user status", e)
+      }
+    }
+    fetchUserStatus()
+  }, [])
+
+  const tabs: { id: SettingsTab; labelKey: string }[] = [
+    { id: "lending", labelKey: "settings.tabs.lending" },
+    { id: "notifications", labelKey: "settings.tabs.notifications" },
+    { id: "api-keys", labelKey: "settings.tabs.apiKeys" },
+    { id: "community", labelKey: "settings.tabs.community" },
+  ]
+
+  return (
+    <div className="flex flex-col gap-6">
+      {/* Page Title */}
+      <h1 className="text-2xl font-bold text-foreground">{t("settings.title")}</h1>
+
+      {/* Account & Membership Card */}
+      <div className="rounded-xl border border-border bg-card p-5">
+        <div className="mb-4">
+          <h2 className="text-lg font-semibold text-foreground">{t("settings.accountMembership")}</h2>
+          <p className="text-xs text-muted-foreground">{t("settings.accountMembershipDesc")}</p>
+        </div>
+
+        {/* User Info – only when signed in (Lendingify: no name/plan when not logged in) */}
+        {signedIn && (
+          <div className="flex items-center gap-4 mb-6">
+            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-orange-500 text-lg font-bold text-foreground">
+              J
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-base font-semibold text-foreground">Jeremy Choi</span>
+                <span className="rounded-full bg-emerald px-2.5 py-0.5 text-[10px] font-semibold text-primary-foreground">
+                  {planTier}
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground">{planName}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Plan Details */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3 mb-6">
+          <div className="flex items-center gap-3">
+            <DollarSign className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs font-semibold text-foreground">{t("settings.lendingLimit")}</p>
+              <p className="text-xs text-muted-foreground">
+                ${lendingLimit.toLocaleString()}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <Clock className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs font-semibold text-foreground">{t("settings.rebalancingFrequency")}</p>
+              <p className="text-xs text-muted-foreground">{t("settings.everyMinutes", { n: rebalanceMinutes })}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <Calendar className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs font-semibold text-foreground">{t("settings.trialRemaining")}</p>
+              <p className="text-xs text-muted-foreground">
+                {trialRemainingDays !== null ? `${trialRemainingDays} ${t("settings.days")}` : "—"}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Lending Usage */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-medium text-foreground">{t("settings.lendingUsage")}</span>
+            <span className="text-xs font-medium text-emerald">0.0%</span>
+          </div>
+          <div className="h-2 w-full rounded-full bg-secondary">
+            <div className="h-2 rounded-full bg-emerald transition-all duration-500" style={{ width: "0%" }} />
+          </div>
+          <div className="flex items-center justify-between mt-1.5">
+            <span className="text-xs text-muted-foreground">$0</span>
+            <span className="text-xs text-muted-foreground">$250,000</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex items-center gap-1 rounded-lg bg-secondary/50 p-1 w-fit">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`rounded-md px-4 py-2 text-xs font-medium transition-all ${
+              activeTab === tab.id
+                ? "bg-card text-foreground shadow-sm border border-border"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {t(tab.labelKey)}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab Content */}
+      <div className="rounded-xl border border-border bg-card p-5">
+        {activeTab === "lending" && <LendingTab enableLending={enableLending} setEnableLending={setEnableLending} customLimit={customLimit} setCustomLimit={setCustomLimit} darkMode={darkMode} setDarkMode={setDarkMode} />}
+        {activeTab === "notifications" && <NotificationsTab dailyEmail={dailyEmail} setDailyEmail={setDailyEmail} />}
+        {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} />}
+        {activeTab === "community" && <CommunityTab />}
+      </div>
+    </div>
+  )
+}
+
+/* ===================== LENDING TAB ===================== */
+function LendingTab({
+  enableLending,
+  setEnableLending,
+  customLimit,
+  setCustomLimit,
+  darkMode,
+  setDarkMode,
+}: {
+  enableLending: boolean
+  setEnableLending: (v: boolean) => void
+  customLimit: boolean
+  setCustomLimit: (v: boolean) => void
+  darkMode: boolean
+  setDarkMode: (v: boolean) => void
+}) {
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <h3 className="text-lg font-semibold text-foreground">Lending Configuration</h3>
+        <p className="text-xs text-muted-foreground">Configure your lending settings and risk parameters</p>
+      </div>
+
+      {/* Lending Controls */}
+      <div>
+        <h4 className="text-sm font-semibold text-foreground mb-4">Lending Controls</h4>
+        <div className="flex flex-col gap-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-foreground">Enable Lending</p>
+              <p className="text-xs text-muted-foreground">Turn on automatic lending for your available funds</p>
+            </div>
+            <ToggleSwitch checked={enableLending} onChange={setEnableLending} />
+          </div>
+          <div className="ml-4 flex items-center justify-between border-l-2 border-border pl-4">
+            <div>
+              <p className="text-sm font-medium text-foreground">Custom Lending Limit</p>
+              <p className="text-xs text-muted-foreground">Set a maximum amount for lending operations</p>
+            </div>
+            <ToggleSwitch checked={customLimit} onChange={setCustomLimit} />
+          </div>
+        </div>
+      </div>
+
+      <div className="h-px bg-border" />
+
+      {/* General Settings */}
+      <div>
+        <h4 className="text-sm font-semibold text-foreground mb-4">General Settings</h4>
+        <div className="flex flex-col gap-4">
+          <div>
+            <label className="text-sm font-medium text-foreground">Base Currency</label>
+            <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
+              <option>USD</option>
+              <option>USDt</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-sm font-medium text-foreground">Time Zone</label>
+            <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
+              <option>UTC</option>
+              <option>EST</option>
+              <option>PST</option>
+              <option>CET</option>
+              <option>JST</option>
+            </select>
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-foreground">Dark Mode</p>
+              <p className="text-xs text-muted-foreground">Enable dark mode for the dashboard</p>
+            </div>
+            <ToggleSwitch checked={darkMode} onChange={setDarkMode} />
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ===================== NOTIFICATIONS TAB ===================== */
+function NotificationsTab({
+  dailyEmail,
+  setDailyEmail,
+}: {
+  dailyEmail: boolean
+  setDailyEmail: (v: boolean) => void
+}) {
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <h3 className="text-lg font-semibold text-foreground">Notifications</h3>
+        <p className="text-xs text-muted-foreground">Configure how you receive alerts and updates</p>
+      </div>
+
+      {/* Daily Email Reports */}
+      <div className="rounded-xl border border-border bg-secondary/30 p-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Mail className="h-5 w-5 text-muted-foreground" />
+            <div>
+              <p className="text-sm font-semibold text-foreground">Daily Email Reports</p>
+              <p className="text-xs text-muted-foreground">Receive a daily summary of your lending performance and key metrics</p>
+            </div>
+          </div>
+          <ToggleSwitch checked={dailyEmail} onChange={setDailyEmail} />
+        </div>
+      </div>
+
+      {/* Coming Soon Notifications */}
+      <div>
+        <p className="text-sm font-medium text-muted-foreground mb-3">Additional Notifications (Coming Soon)</p>
+        <div className="flex flex-col gap-3">
+          {[
+            { label: "Bot Errors", icon: AlertTriangle },
+            { label: "Low Utilization Rate", icon: TrendingDown },
+            { label: "Significant Rate Changes", icon: BarChart3 },
+          ].map((item) => (
+            <div key={item.label} className="flex items-center justify-between py-2">
+              <div className="flex items-center gap-3">
+                <item.icon className="h-4 w-4 text-muted-foreground/50" />
+                <span className="text-sm text-muted-foreground">{item.label}</span>
+              </div>
+              <ToggleSwitch checked={false} onChange={() => {}} disabled />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Save Button */}
+      <div className="flex justify-end">
+        <button className="rounded-lg bg-emerald px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-emerald-dark transition-colors">
+          Save Notification Settings
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/* ===================== API KEYS TAB ===================== */
+function ApiKeysTab({
+  showSecret,
+  setShowSecret,
+}: {
+  showSecret: boolean
+  setShowSecret: (v: boolean) => void
+}) {
+  const [bfxKey, setBfxKey] = useState("")
+  const [bfxSecret, setBfxSecret] = useState("")
+  const [geminiKey, setGeminiKey] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
+
+  const clearMessage = () => {
+    setMessage(null)
+  }
+
+  const handleSave = async () => {
+    const key = (bfxKey || "").trim()
+    const secret = (bfxSecret || "").trim()
+    if (!key || !secret) {
+      setMessage({ type: "error", text: "Please enter API Key and API Secret." })
+      return
+    }
+    setLoading(true)
+    setMessage(null)
+    try {
+      const { getBackendToken } = await import("@/lib/auth")
+      const token = typeof window !== "undefined" ? await getBackendToken() : null
+      const allowDev = process.env.NEXT_PUBLIC_ALLOW_DEV_CONNECT === "1"
+
+      if (token) {
+        const res = await fetch(`${API_BASE}/connect-exchange`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ bfx_key: key, bfx_secret: secret, gemini_key: geminiKey || undefined }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "Failed to save API keys.")
+        }
+        setMessage({ type: "success", text: data.message || "API keys saved." })
+        setBfxKey("")
+        setBfxSecret("")
+        setGeminiKey("")
+      } else if (allowDev) {
+        const res = await fetch(`${API_BASE}/connect-exchange/by-user`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_id: USER_ID,
+            bfx_key: key,
+            bfx_secret: secret,
+            gemini_key: geminiKey || undefined,
+          }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "Failed to save API keys.")
+        }
+        setMessage({ type: "success", text: data.message || "API keys saved." })
+        setBfxKey("")
+        setBfxSecret("")
+        setGeminiKey("")
+      } else {
+        setMessage({
+          type: "error",
+          text: "Sign in first to connect your Bitfinex account. Go to Login (or set ALLOW_DEV_CONNECT for dev).",
+        })
+        return
+      }
+      setTimeout(clearMessage, 6000)
+    } catch (e) {
+      setMessage({
+        type: "error",
+        text: e instanceof Error ? e.message : "Failed to save API keys.",
+      })
+      setTimeout(clearMessage, 6000)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <div className="flex items-center gap-2 mb-1">
+          <Link2 className="h-5 w-5 text-emerald" />
+          <h3 className="text-lg font-semibold text-foreground">Connect Bitfinex Account</h3>
+        </div>
+        <p className="text-xs text-muted-foreground">Enter your read-only API keys to start automated lending.</p>
+      </div>
+
+      {/* Security Notice */}
+      <div className="flex items-center justify-between rounded-lg border border-emerald/30 bg-emerald/5 px-4 py-3">
+        <div className="flex items-center gap-2">
+          <span className="flex h-5 w-5 items-center justify-center rounded-full border border-emerald/30">
+            <span className="h-2 w-2 rounded-full bg-emerald"></span>
+          </span>
+          <Lock className="h-3.5 w-3.5 text-emerald" />
+          <span className="text-xs text-foreground">
+            Read-only access {"·"} Your funds stay secure
+          </span>
+        </div>
+        <a href="#" className="text-xs font-medium text-emerald hover:text-emerald-light transition-colors">
+          {"Need help? \u2192"}
+        </a>
+      </div>
+
+      {/* API Key Inputs */}
+      <div className="flex flex-col gap-4">
+        <h4 className="text-sm font-semibold text-foreground">Add API Keys</h4>
+        <div>
+          <label className="text-sm font-semibold text-foreground">API Key</label>
+          <input
+            type="text"
+            value={bfxKey}
+            onChange={(e) => setBfxKey(e.target.value)}
+            placeholder="Enter your Bitfinex API Key"
+            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+          />
+        </div>
+        <div>
+          <label className="text-sm font-semibold text-foreground">API Secret</label>
+          <div className="relative mt-1.5">
+            <input
+              type={showSecret ? "text" : "password"}
+              value={bfxSecret}
+              onChange={(e) => setBfxSecret(e.target.value)}
+              placeholder="Enter your Bitfinex API Secret"
+              className="w-full rounded-lg border border-border bg-secondary px-3 py-2.5 pr-10 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+            />
+            <button
+              onClick={() => setShowSecret(!showSecret)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+              aria-label={showSecret ? "Hide secret" : "Show secret"}
+            >
+              {showSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className="text-sm font-semibold text-foreground">Gemini API Key (optional)</label>
+          <input
+            type="text"
+            value={geminiKey}
+            onChange={(e) => setGeminiKey(e.target.value)}
+            placeholder="Optional: for AI features"
+            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+          />
+        </div>
+      </div>
+
+      {message && (
+        <div
+          className={`rounded-lg border px-4 py-3 text-sm ${
+            message.type === "success"
+              ? "border-emerald/30 bg-emerald/10 text-emerald"
+              : "border-destructive/30 bg-destructive/10 text-destructive"
+          }`}
+        >
+          {message.text}
+          {message.type === "error" && message.text.includes("Sign in") && (
+            <span className="block mt-2">
+              <Link href="/login" className="font-medium text-foreground underline hover:text-emerald">
+                Go to Login →
+              </Link>
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Instructions */}
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p className="text-sm font-semibold text-foreground mb-2">{"Create Bitfinex API Key:"}</p>
+          <ol className="flex flex-col gap-1 text-xs text-muted-foreground">
+            <li>{"1. Go to Bitfinex \u2192 Settings \u2192 API"}</li>
+            <li>{"2. Enable: "}
+              <span className="text-emerald">Account History</span>, {" "}
+              <span className="text-emerald">Margin Funding</span>, {" "}
+              <span className="text-emerald">Wallets</span>, {" "}
+              <span className="text-emerald">Settings</span>
+            </li>
+            <li>{"3. Move funds to "}
+              <span className="text-emerald">Funding wallet</span>
+            </li>
+          </ol>
+        </div>
+        <a
+          href="https://www.bitfinex.com"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-2 rounded-lg border border-border bg-secondary px-4 py-2.5 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors"
+        >
+          <ExternalLink className="h-3.5 w-3.5" />
+          Open Bitfinex
+        </a>
+      </div>
+
+      {/* Save Button */}
+      <div className="flex justify-end">
+        <button
+          onClick={handleSave}
+          disabled={loading}
+          className="rounded-lg bg-emerald px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-emerald-dark disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+        >
+          {loading ? "Saving…" : "Save API Keys"}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/* ===================== COMMUNITY TAB ===================== */
+function CommunityTab() {
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <div className="flex items-center gap-2 mb-1">
+          <MessageSquare className="h-5 w-5 text-emerald" />
+          <h3 className="text-lg font-semibold text-foreground">{"Community & Support"}</h3>
+        </div>
+        <p className="text-xs text-muted-foreground">Connect with other uTrader.io users and get real-time support</p>
+      </div>
+
+      {/* Telegram */}
+      <div className="rounded-xl border border-border bg-secondary/30 p-5">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#229ED9]">
+            <Send className="h-5 w-5 text-foreground" />
+          </div>
+          <h4 className="text-base font-semibold text-foreground">Join Our Telegram Community</h4>
+        </div>
+        <ul className="flex flex-col gap-2 text-sm text-muted-foreground mb-4">
+          <li><span className="text-emerald font-medium">Get instant support</span> from our team and experienced users</li>
+          <li><span className="text-chart-3 font-medium">Share strategies</span> and learn from successful lenders</li>
+          <li><span className="text-chart-2 font-medium">Receive updates</span> about new features and market insights</li>
+          <li><span className="text-destructive font-medium">Connect with the community</span> with uTrader.io users</li>
+        </ul>
+        <button className="flex items-center gap-2 rounded-lg bg-[#229ED9] px-4 py-2.5 text-sm font-semibold text-foreground hover:bg-[#229ED9]/80 transition-colors">
+          <Send className="h-4 w-4" />
+          Join Telegram Group
+        </button>
+      </div>
+
+      {/* Resources */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        {/* Learning Hub */}
+        <div className="rounded-xl border border-border bg-secondary/30 p-5">
+          <div className="flex items-center gap-2 mb-2">
+            <BookOpen className="h-4 w-4 text-muted-foreground" />
+            <h4 className="text-sm font-semibold text-foreground">Learning Hub</h4>
+          </div>
+          <p className="text-xs text-muted-foreground mb-4">Comprehensive guides and tutorials for crypto lending success</p>
+          <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors">
+            Explore Guides
+          </button>
+        </div>
+
+        {/* Security Center */}
+        <div className="rounded-xl border border-border bg-secondary/30 p-5">
+          <div className="flex items-center gap-2 mb-2">
+            <Shield className="h-4 w-4 text-muted-foreground" />
+            <h4 className="text-sm font-semibold text-foreground">Security Center</h4>
+          </div>
+          <p className="text-xs text-muted-foreground mb-4">Learn about our security measures and best practices</p>
+          <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors">
+            Security Guide
+          </button>
+        </div>
+      </div>
+
+      {/* Follow on X */}
+      <div className="rounded-xl border border-border bg-secondary/30 p-5">
+        <div className="flex items-center gap-2 mb-2">
+          <svg className="h-4 w-4 text-foreground" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+          </svg>
+          <h4 className="text-sm font-semibold text-foreground">Follow us on X</h4>
+        </div>
+        <p className="text-xs text-muted-foreground mb-4">Follow us for the latest news, updates, and market analysis.</p>
+        <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors">
+          Follow on X
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/* ===================== TOGGLE SWITCH ===================== */
+function ToggleSwitch({
+  checked,
+  onChange,
+  disabled = false,
+}: {
+  checked: boolean
+  onChange: (v: boolean) => void
+  disabled?: boolean
+}) {
+  return (
+    <button
+      role="switch"
+      aria-checked={checked}
+      onClick={() => !disabled && onChange(!checked)}
+      className={`relative h-6 w-11 rounded-full transition-colors duration-200 ${
+        disabled
+          ? "bg-secondary cursor-not-allowed opacity-50"
+          : checked
+          ? "bg-emerald"
+          : "bg-secondary"
+      }`}
+    >
+      <span
+        className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-foreground shadow-sm transition-transform duration-200 ${
+          checked ? "translate-x-5" : "translate-x-0"
+        }`}
+      />
+    </button>
+  )
+}

@@ -1,0 +1,3 @@
+# Backend (main.py)
+# Install with: pip install -r requirements.txt
+PyJWT>=2.0.0

@@ -1,0 +1,62 @@
+{
+    "Common": {
+      "loading": "加載中...",
+      "save": "保存",
+      "cancel": "取消",
+      "confirm": "確認",
+      "error": "錯誤",
+      "success": "成功",
+      "status": "狀態",
+      "active": "活躍",
+      "inactive": "不活躍",
+      "language": "語言",
+      "currency": "貨幣"
+    },
+    "Auth": {
+      "signInTitle": "登錄您的帳戶",
+      "signInGoogle": "使用 Google 登錄",
+      "signOut": "登出",
+      "welcome": "歡迎回來",
+      "unauthorized": "未授權訪問",
+      "gmailOnly": "僅限使用 @gmail.com 帳號登錄。"
+    },
+    "Sidebar": {
+      "dashboard": "控制面板",
+      "analytics": "數據分析",
+      "bots": "我的機器人",
+      "wallet": "錢包資產",
+      "settings": "設置",
+      "help": "幫助與支持",
+      "documentation": "文檔"
+    },
+    "Dashboard": {
+      "title": "控制面板",
+      "overview": "總覽",
+      "netAssets": "淨資產",
+      "totalProfit": "總利潤",
+      "dailyProfit": "今日利潤",
+      "apy": "當前年化 (APY)",
+      "activeBots": "活躍機器人",
+      "recentActivity": "最近活動",
+      "dateRange": "日期範圍",
+      "refresh": "刷新數據"
+    },
+    "BotStatus": {
+      "running": "運行中",
+      "stopped": "已停止",
+      "paused": "已暫停",
+      "error": "錯誤",
+      "lending": "放貸中",
+      "borrowing": "借貸中"
+    },
+    "Settings": {
+      "profile": "個人資料",
+      "security": "安全設置",
+      "apiKeys": "API 密鑰",
+      "connectBitfinex": "連接 Bitfinex",
+      "notifications": "通知設置",
+      "theme": "主題",
+      "light": "淺色",
+      "dark": "深色"
+    }
+  }
