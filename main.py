@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timedelta
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -30,9 +30,16 @@ NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
 
 
 # --- CORS: explicitly allow frontend origins so browser can reach backend ---
+_cors_origins = [
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://0.0.0.0:3000",
+]
+if os.getenv("CORS_ORIGINS"):
+    _cors_origins.extend(o.strip() for o in os.getenv("CORS_ORIGINS").split(",") if o.strip())
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:3000", "http://localhost:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,9 +47,28 @@ app.add_middleware(
 
 
 # --- Redis / ARQ ---
+REDIS_CONNECT_TIMEOUT = 5.0  # seconds; avoid hanging the request if Redis is down
+
+
 async def get_redis():
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
     return await create_pool(RedisSettings.from_dsn(redis_url))
+
+
+async def get_redis_or_raise():
+    """Get Redis with timeout; raises HTTPException 503 if unavailable."""
+    try:
+        return await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Queue service unavailable. Make sure Redis is running (e.g. redis-server) and REDIS_URL is set.",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Queue service unavailable. Make sure Redis is running (e.g. redis-server) and REDIS_URL is set.",
+        )
 
 
 # --- Google OAuth ---
@@ -73,8 +99,7 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
         email=email,
         plan_tier="trial",
         lending_limit=250_000.0,
-        rebalance_interval=3,
-        pro_expiry=datetime.utcnow() + timedelta(days=7),
+        rebalance_interval=30,
         referred_by=referrer.id if referrer else None,
     )
     # Simple referral code: user email hash suffix
@@ -165,12 +190,67 @@ class StatsResponse(BaseModel):
 # Bitfinex charges 15% on margin funding income for the lender (see bitfinex.com/fees).
 BITFINEX_LENDER_FEE_PCT = 0.15
 
+# Token (credit) system: 1 USDT gross profit = 10 tokens used.
+TOKENS_PER_USDT_GROSS = 10
+FREE_TIER_TOKENS = 100
+PLAN_TOKEN_CREDITS = {
+    "trial": FREE_TIER_TOKENS,
+    "free": FREE_TIER_TOKENS,
+    "pro": 1500,
+    "ai_ultra": 9000,
+    "whales": 40000,
+}
+
 
 class LendingStatsResponse(BaseModel):
     """Gross = total interest from Bitfinex since registration; Net = Gross × (1 - 15%)."""
     gross_profit: float
     bitfinex_fee: float
     net_profit: float
+    trades: Optional[List["FundingTradeRecord"]] = None
+    calculation_breakdown: Optional["CalculationBreakdown"] = None
+
+
+class FundingTradeRecord(BaseModel):
+    """Single repaid funding trade from Bitfinex (POST auth/r/funding/trades/hist)."""
+    id: int
+    currency: str
+    mts_create: int
+    offer_id: int
+    amount: float
+    rate: float
+    period: float
+    interest_usd: float
+
+
+class FundingTradesResponse(BaseModel):
+    """Funding trades between registration and latest, with gross profit."""
+    trades: List[FundingTradeRecord]
+    gross_profit: float
+    bitfinex_fee: float
+    net_profit: float
+    calculation_breakdown: Optional[CalculationBreakdown] = None
+
+
+class CurrencyBreakdownItem(BaseModel):
+    """Per-currency interest used in gross profit calculation."""
+    currency: str
+    interest_ccy: float
+    ticker_price_usd: float
+    interest_usd: float
+
+
+class CalculationBreakdown(BaseModel):
+    """Shows how gross profit was computed from funding trades."""
+    trades_count: int
+    per_currency: List[CurrencyBreakdownItem]
+    total_gross_usd: float
+    formula_note: str = "Interest per trade = |AMOUNT| * RATE * (PERIOD/365 days). USD/USDt/USDT/UST use 1:1; others use Bitfinex t{CCY}USD price."
+
+
+# Bitfinex does not expose a single "sum profit for date range" endpoint. We use POST /v2/auth/r/funding/trades/hist
+# to fetch all repaid trades in the period and sum interest ourselves. Alternatives: v1 /summary (30-day only);
+# v2 /auth/r/ledgers/{currency}/hist for transaction-level data (different format).
 
 
 class UserStatusResponse(BaseModel):
@@ -180,6 +260,17 @@ class UserStatusResponse(BaseModel):
     trial_remaining_days: Optional[int]
     utilization_pct: float
     used_amount: float
+    tokens_remaining: Optional[float] = None
+    tokens_used: int = 0
+    initial_token_credit: int = 0
+    gross_profit_usd: float = 0.0
+
+
+class TokenBalanceResponse(BaseModel):
+    tokens_remaining: float
+    tokens_used: int
+    initial_credit: int
+    gross_profit_usd: float
 
 
 class AdminUserOut(BaseModel):
@@ -213,12 +304,15 @@ def google_login(payload: GoogleAuthPayload, db: Session = Depends(database.get_
     return {"user_id": user.id, "email": user.email, "plan_tier": user.plan_tier}
 
 
-# --- Live Bot Stats Route (existing dashboard) ---
+# --- Live Bot Stats Route (existing dashboard); user end: auth required, own data only ---
 @app.get("/bot-stats/{user_id}")
-async def get_all_bot_stats(user_id: int):
-    """
-    Fetches live heartbeat data from Redis for the utrader.io dashboard.
-    """
+async def get_all_bot_stats(
+    user_id: int,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Fetches live heartbeat data from Redis. Caller must be the same user (user end only)."""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
     redis = await get_redis()
 
     keys = await redis.keys(f"status:{user_id}:*")
@@ -239,6 +333,28 @@ async def get_all_bot_stats(user_id: int):
         "engines": all_engines,
         "total_loaned": f"{total_val:,.2f}",
     }
+
+
+# --- Whales terminal: cached logs; user end: auth required, own data only ---
+@app.get("/terminal-logs/{user_id}")
+async def get_terminal_logs(
+    user_id: int,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Returns last 500 terminal log lines for the user (from worker). Caller must be the same user."""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
+    try:
+        redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+    except (asyncio.TimeoutError, Exception):
+        return {"lines": []}
+    try:
+        key = f"terminal_logs:{user_id}"
+        lines = await asyncio.wait_for(redis.lrange(key, 0, -1), timeout=5.0)
+    except (asyncio.TimeoutError, Exception):
+        return {"lines": []}
+    decoded = [line.decode("utf-8") if isinstance(line, bytes) else line for line in (lines or [])]
+    return {"lines": decoded}
 
 
 def _detail_invalid_keys(msg: str) -> str:
@@ -422,6 +538,61 @@ def _check_permissions_response(perms_data: Any) -> tuple[bool, list[str]]:
     return (len(missing) == 0, missing)
 
 
+async def _validate_bitfinex_keys_only(payload) -> tuple[Optional[dict], Optional[dict]]:
+    """
+    Validate Bitfinex keys (auth, permissions, wallets, funding). No DB write.
+    Returns (balance, None) on success or (None, {"error": "..."}) on failure.
+    """
+    mgr = BitfinexManager(payload.bfx_key, payload.bfx_secret)
+    user_data, err = await mgr.info_user()
+    if err:
+        return None, {"error": "Invalid API Key or Secret."}
+    if not user_data or not isinstance(user_data, list):
+        return None, {"error": "Invalid API Key or Secret."}
+    perms_data, err = await mgr.permissions()
+    if err:
+        return None, {
+            "error": "Missing permissions: Could not fetch permissions. Please enable Wallets (Read), Funding (Read/Write), and History (Read) in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+    ok, missing_list = _check_permissions_response(perms_data)
+    if not ok:
+        missing_str = ", ".join(missing_list)
+        return None, {
+            "error": f"Missing permissions: {missing_str}. Please enable them in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+    wallets, err = await mgr.wallets()
+    if err:
+        return None, {"error": "Could not fetch wallets. Please check API permissions."}
+    if not wallets or not isinstance(wallets, list):
+        return None, {"error": "Could not fetch wallets."}
+    has_funding = False
+    for w in wallets:
+        try:
+            if len(w) > 0 and w[0] == "funding":
+                has_funding = True
+                break
+        except (IndexError, TypeError):
+            continue
+    if not has_funding:
+        return None, {"error": "No funding wallet found. Please ensure a Bitfinex funding wallet exists."}
+    _, err_offers = await mgr.funding_offers()
+    if err_offers:
+        return None, {
+            "error": "Missing permissions: Funding (Read). Please enable them in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+    _, err_hist = await mgr.funding_trades_hist()
+    if err_hist:
+        return None, {
+            "error": "Missing permissions: Funding history (Read). Please enable them in your Bitfinex API settings.",
+            "permissions_url": "https://setting.bitfinex.com/api",
+        }
+    balance = await mgr.compute_usd_balances()
+    return balance, None
+
+
 async def _validate_and_save_bitfinex_keys(payload, current_user, db):
     """
     5-step validation. Do not save to DB until ALL pass.
@@ -507,9 +678,8 @@ async def _validate_and_save_bitfinex_keys(payload, current_user, db):
 
     current_user.plan_tier = "trial"
     current_user.lending_limit = 250_000.0
-    current_user.rebalance_interval = 3
-    if not current_user.pro_expiry or current_user.pro_expiry < datetime.utcnow():
-        current_user.pro_expiry = datetime.utcnow() + timedelta(days=7)
+    current_user.rebalance_interval = 30  # free tier: 30-min rebalancing
+    # No 7-day trial; free tier uses token credit (100 tokens)
 
     vault = (
         db.query(models.APIVault)
@@ -556,8 +726,7 @@ def _get_or_create_user_by_email(email: str, db: Session) -> models.User:
         email=email,
         plan_tier="trial",
         lending_limit=250_000.0,
-        rebalance_interval=3,
-        pro_expiry=datetime.utcnow() + timedelta(days=7),
+        rebalance_interval=30,
     )
     new_user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
     db.add(new_user)
@@ -586,6 +755,42 @@ async def connect_exchange_by_email(
     return {
         "status": "success",
         "message": result.get("message", "Exchange connected and trial activated."),
+        "balance": balance,
+        "user_id": user.id,
+    }
+
+
+@app.post("/connect-exchange/update-by-email")
+async def connect_exchange_update_by_email(
+    payload: ConnectByEmailInput,
+    db: Session = Depends(database.get_db),
+):
+    """Dev-only: update API keys for an existing user by email (skips trial check). Set ALLOW_DEV_CONNECT=1."""
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    user = db.query(models.User).filter(models.User.email == payload.email.strip().lower()).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    keys_payload = APIKeysInput(
+        bfx_key=payload.bfx_key,
+        bfx_secret=payload.bfx_secret,
+        gemini_key=payload.gemini_key,
+    )
+    balance, err = await _validate_bitfinex_keys_only(keys_payload)
+    if err:
+        raise HTTPException(status_code=400, detail=err.get("error", "Validation failed."))
+    vault = db.query(models.APIVault).filter(models.APIVault.user_id == user.id).first()
+    if not vault:
+        vault = models.APIVault(user_id=user.id)
+        db.add(vault)
+    vault.encrypted_key = security.encrypt_key(payload.bfx_key)
+    vault.encrypted_secret = security.encrypt_key(payload.bfx_secret)
+    if payload.gemini_key is not None:
+        vault.encrypted_gemini_key = security.encrypt_key(payload.gemini_key) if payload.gemini_key else None
+    db.commit()
+    return {
+        "status": "success",
+        "message": "API keys updated.",
         "balance": balance,
         "user_id": user.id,
     }
@@ -625,25 +830,39 @@ async def start_bot(
     if not current_user.vault:
         raise HTTPException(status_code=404, detail="API keys not found.")
 
-    # Ensure subscription is not expired before starting
     if current_user.pro_expiry and current_user.pro_expiry < datetime.utcnow():
         current_user.status = "expired"
         db.commit()
         raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
 
-    redis = await get_redis()
-    await redis.enqueue_job("run_bot_task", current_user.id, _job_id=f"bot_user_{current_user.id}")
+    # Balance is checked in the worker right before execution; bypass gate here so user can always enqueue
+    redis = await get_redis_or_raise()
+    job_id = f"bot_user_{current_user.id}"
+    job = await redis.enqueue_job("run_bot_task", current_user.id, _job_id=job_id)
+    if job is None:
+        # Clear stale result from a previous run so user can start again (worker uses keep_result=0 for new runs)
+        try:
+            await redis.delete(f"arq:result:{job_id}")
+            job = await redis.enqueue_job("run_bot_task", current_user.id, _job_id=job_id)
+        except Exception:
+            pass
+    if job is None:
+        return {"status": "success", "message": "Bot already running or queued."}
     return {"status": "success", "message": f"Bot queued for user {current_user.id}"}
 
 
 @app.post("/stop-bot")
 async def stop_bot(current_user: models.User = Depends(get_current_user)):
-    redis = await get_redis()
+    from arq.jobs import Job
+    redis = await get_redis_or_raise()
     job_id = f"bot_user_{current_user.id}"
-    job = await redis.get_job(job_id)
-    if job:
-        await job.abort()
-        return {"status": "success", "message": "Shutdown signal sent"}
+    job = Job(job_id=job_id, redis=redis)
+    try:
+        aborted = await job.abort()
+        if aborted:
+            return {"status": "success", "message": "Shutdown signal sent"}
+    except Exception:
+        pass
     return {"status": "error", "message": "No active bot found"}
 
 
@@ -651,28 +870,47 @@ async def stop_bot(current_user: models.User = Depends(get_current_user)):
 # Useful for simple frontends or internal tools without Google auth wiring yet.
 @app.post("/start-bot/{user_id}")
 async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user or not user.vault:
-        raise HTTPException(status_code=404, detail="API keys not found.")
+    try:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user or not user.vault:
+            raise HTTPException(status_code=404, detail="API keys not found.")
 
-    if user.pro_expiry and user.pro_expiry < datetime.utcnow():
-        user.status = "expired"
-        db.commit()
-        raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
+        if user.pro_expiry and user.pro_expiry < datetime.utcnow():
+            user.status = "expired"
+            db.commit()
+            raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
 
-    redis = await get_redis()
-    await redis.enqueue_job("run_bot_task", user.id, _job_id=f"bot_user_{user.id}")
-    return {"status": "success", "message": f"Bot queued for user {user.id}"}
+        # Balance checked in worker before execution; bypass here so user can always enqueue
+        redis = await get_redis_or_raise()
+        job_id = f"bot_user_{user.id}"
+        job = await redis.enqueue_job("run_bot_task", user.id, _job_id=job_id)
+        if job is None:
+            try:
+                await redis.delete(f"arq:result:{job_id}")
+                job = await redis.enqueue_job("run_bot_task", user.id, _job_id=job_id)
+            except Exception:
+                pass
+        if job is None:
+            return {"status": "success", "message": "Bot already running or queued."}
+        return {"status": "success", "message": f"Bot queued for user {user.id}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Start bot failed: {type(e).__name__}: {e}")
 
 
 @app.post("/stop-bot/{user_id}")
 async def stop_bot_for_user(user_id: int):
-    redis = await get_redis()
+    from arq.jobs import Job
+    redis = await get_redis_or_raise()
     job_id = f"bot_user_{user_id}"
-    job = await redis.get_job(job_id)
-    if job:
-        await job.abort()
-        return {"status": "success", "message": "Shutdown signal sent"}
+    job = Job(job_id=job_id, redis=redis)
+    try:
+        aborted = await job.abort()
+        if aborted:
+            return {"status": "success", "message": "Shutdown signal sent"}
+    except Exception:
+        pass
     return {"status": "error", "message": "No active bot found"}
 
 
@@ -739,13 +977,73 @@ def get_stats_history(
     return out
 
 
+async def _fetch_all_funding_trades(
+    mgr: BitfinexManager,
+    start_ms: Optional[int],
+    end_ms: Optional[int] = None,
+    limit_per_request: int = 1000,
+) -> tuple[list, Optional[str]]:
+    """
+    Fetch all repaid lending trades between start_ms and end_ms (or now) from Bitfinex.
+    Uses POST /v2/auth/r/funding/trades/hist (Bitfinex auth uses POST; this is the funding trades endpoint).
+    Paginates until no more results.
+    """
+    if end_ms is None:
+        end_ms = int(datetime.utcnow().timestamp() * 1000)
+    all_trades: list = []
+    current_end = end_ms
+    while True:
+        trades, err = await mgr.funding_trades_hist(
+            start_ms=start_ms,
+            end_ms=current_end,
+            limit=limit_per_request,
+        )
+        if err:
+            return all_trades, err
+        if not isinstance(trades, list) or len(trades) == 0:
+            break
+        all_trades.extend(trades)
+        if len(trades) < limit_per_request:
+            break
+        min_mts = min(
+            (row[2] for row in trades if isinstance(row, (list, tuple)) and len(row) > 2),
+            default=0,
+        )
+        if min_mts <= (start_ms or 0):
+            break
+        current_end = min_mts - 1
+        await asyncio.sleep(0.2)
+    return all_trades, None
+
+
+# Stablecoins: use 1:1 USD when Bitfinex ticker missing or zero (e.g. tUSTUSD may be delisted)
+_STABLECOINS_1TO1 = frozenset(("USD", "USDt", "USDT", "UST", "USDC", "DAI", "TUSD", "BUSD", "FRAX"))
+
+
+def _usd_price_for_currency(currency: str, ticker_prices: Dict[str, float]) -> float:
+    """Return USD price for a currency: 1 for stablecoins (USD, USDt, USDT, UST, etc.), else from ticker t{CCY}USD."""
+    if currency in _STABLECOINS_1TO1:
+        return 1.0
+    return ticker_prices.get(f"t{currency}USD", 0.0) or 0.0
+
+
 def _interest_usd_from_trades(trades: Any, ticker_prices: Dict[str, float]) -> float:
+    """Sum interest from Bitfinex funding trade arrays. See _interest_usd_from_trades_with_breakdown for formula."""
+    total, _ = _interest_usd_from_trades_with_breakdown(trades, ticker_prices)
+    return total
+
+
+def _interest_usd_from_trades_with_breakdown(
+    trades: Any, ticker_prices: Dict[str, float]
+) -> tuple[float, List[CurrencyBreakdownItem]]:
     """
     Sum interest from Bitfinex funding trade arrays. Each row: [ID, CURRENCY, MTS_CREATE, OFFER_ID, AMOUNT, RATE, PERIOD, ...].
-    Interest per trade = |AMOUNT| * RATE * (PERIOD/365). Convert to USD: USD/USDt/USDT=1, others use ticker_prices (e.g. tBTCUSD last price).
+    Interest per trade = |AMOUNT| * RATE * (PERIOD/365 days). Convert to USD: stablecoins=1:1, others use ticker_prices.
+    Returns (total_usd, per_currency_breakdown).
     """
+    breakdown: List[CurrencyBreakdownItem] = []
     if not isinstance(trades, list):
-        return 0.0
+        return 0.0, breakdown
     by_currency: Dict[str, float] = {}
     for row in trades:
         try:
@@ -765,13 +1063,57 @@ def _interest_usd_from_trades(trades: Any, ticker_prices: Dict[str, float]) -> f
         except (TypeError, ValueError, IndexError):
             continue
     total_usd = 0.0
-    for currency, interest in by_currency.items():
-        if currency in ("USD", "USDt", "USDT"):
-            total_usd += interest
-        else:
-            price = ticker_prices.get(f"t{currency}USD", 0.0)
-            total_usd += interest * price if price else 0.0
-    return total_usd
+    for currency, interest_ccy in sorted(by_currency.items()):
+        price = _usd_price_for_currency(currency, ticker_prices)
+        interest_usd = interest_ccy * price if price else 0.0
+        total_usd += interest_usd
+        breakdown.append(CurrencyBreakdownItem(
+            currency=currency,
+            interest_ccy=round(interest_ccy, 6),
+            ticker_price_usd=price,
+            interest_usd=round(interest_usd, 6),
+        ))
+    return total_usd, breakdown
+
+
+def _trades_with_interest_usd(trades: Any, ticker_prices: Dict[str, float]) -> List[FundingTradeRecord]:
+    """
+    Convert Bitfinex funding trade arrays to FundingTradeRecord with interest_usd per trade.
+    Same formula as _interest_usd_from_trades: |AMOUNT| * RATE * (PERIOD/365), then to USD.
+    """
+    out: List[FundingTradeRecord] = []
+    if not isinstance(trades, list):
+        return out
+    for row in trades:
+        try:
+            if not isinstance(row, (list, tuple)) or len(row) < 7:
+                continue
+            trade_id = int(row[0]) if row[0] is not None else 0
+            currency = (row[1] or "").strip()
+            if currency.startswith("f") or currency.startswith("F"):
+                currency = currency[1:]
+            currency = currency.upper() if currency else ""
+            mts_create = int(row[2]) if row[2] is not None else 0
+            offer_id = int(row[3]) if row[3] is not None else 0
+            amount = float(row[4]) if row[4] is not None else 0.0
+            rate = float(row[5]) if row[5] is not None else 0.0
+            period = float(row[6]) if row[6] is not None else 0.0
+            interest_ccy = abs(amount) * rate * (period / 365.0) if period > 0 else 0.0
+            price = _usd_price_for_currency(currency, ticker_prices)
+            interest_usd = interest_ccy * price if price else 0.0
+            out.append(FundingTradeRecord(
+                id=trade_id,
+                currency=currency or row[1],
+                mts_create=mts_create,
+                offer_id=offer_id,
+                amount=amount,
+                rate=rate,
+                period=period,
+                interest_usd=round(interest_usd, 6),
+            ))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
 
 
 def _ticker_prices_from_trades(trades: Any) -> Dict[str, float]:
@@ -807,6 +1149,84 @@ def _ticker_prices_from_trades(trades: Any) -> Dict[str, float]:
     return out
 
 
+async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[LendingStatsResponse, bool, List[FundingTradeRecord]]:
+    """
+    Fetch all repaid lending trades from Bitfinex between vault.created_at and now
+    (Bitfinex: POST /v2/auth/r/funding/trades/hist — same data as "GET funding trades").
+    Sum interest (gross), update UserProfitSnapshot and token balance. No cache read/write.
+    Returns (result, rate_limited, trade_records). When rate_limited True, caller should set cooldown and use cache.
+    """
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user or not user.vault:
+        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0), False, []
+    keys = user.vault.get_keys()
+    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+    start_ms = None
+    if getattr(user.vault, "created_at", None) and user.vault.created_at:
+        start_ms = int(user.vault.created_at.timestamp() * 1000)
+    trades, err = await _fetch_all_funding_trades(mgr, start_ms)
+    if bitfinex_cache.is_rate_limit_error(err):
+        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+        if snap and snap.gross_profit_usd is not None:
+            gross = float(snap.gross_profit_usd)
+            return LendingStatsResponse(gross_profit=gross, bitfinex_fee=round(gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(gross * (1 - BITFINEX_LENDER_FEE_PCT), 2)), True, []
+        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0), True, []
+    records: List[FundingTradeRecord] = []
+    breakdown_obj: Optional[CalculationBreakdown] = None
+    if err or not trades:
+        result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+    else:
+        ticker_prices = _ticker_prices_from_trades(trades)
+        gross, per_currency_breakdown = _interest_usd_from_trades_with_breakdown(trades, ticker_prices)
+        fee = gross * BITFINEX_LENDER_FEE_PCT
+        net = gross - fee
+        breakdown_obj = CalculationBreakdown(
+            trades_count=len(trades),
+            per_currency=per_currency_breakdown,
+            total_gross_usd=round(gross, 6),
+            formula_note="Interest per trade = |AMOUNT| * RATE * (PERIOD/365 days). USD/USDt/USDT/UST use 1:1; others use Bitfinex t{CCY}USD price.",
+        )
+        result = LendingStatsResponse(
+            gross_profit=round(gross, 2),
+            bitfinex_fee=round(fee, 2),
+            net_profit=round(net, 2),
+            calculation_breakdown=breakdown_obj,
+        )
+        records = _trades_with_interest_usd(trades, ticker_prices)
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    if snap:
+        snap.gross_profit_usd = result.gross_profit
+        snap.net_profit_usd = result.net_profit
+        snap.bitfinex_fee_usd = result.bitfinex_fee
+        snap.updated_at = datetime.utcnow()
+    else:
+        db.add(models.UserProfitSnapshot(
+            user_id=user_id,
+            gross_profit_usd=result.gross_profit,
+            net_profit_usd=result.net_profit,
+            bitfinex_fee_usd=result.bitfinex_fee,
+        ))
+    tier = (user.plan_tier or "trial").lower()
+    initial_credit = PLAN_TOKEN_CREDITS.get(tier, FREE_TIER_TOKENS)
+    token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
+    gross = float(result.gross_profit)
+    tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
+    tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
+    if token_row:
+        token_row.tokens_remaining = tokens_remaining
+        token_row.last_gross_usd_used = gross
+        token_row.updated_at = datetime.utcnow()
+    else:
+        db.add(models.UserTokenBalance(
+            user_id=user_id,
+            tokens_remaining=tokens_remaining,
+            last_gross_usd_used=gross,
+        ))
+    db.commit()
+    return result, False, records
+
+
 @app.get("/stats/{user_id}/lending", response_model=LendingStatsResponse)
 async def get_lending_stats(
     user_id: int,
@@ -814,7 +1234,7 @@ async def get_lending_stats(
     db: Session = Depends(database.get_db),
 ):
     """
-    Gross profit = total interest from Bitfinex lending since connection.
+    Gross profit = sum of interest from Bitfinex funding trades between registration date and latest.
     Net = Gross × (1 - 15%). Cached to respect Bitfinex rate limits.
     """
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -837,13 +1257,12 @@ async def get_lending_stats(
         response.headers["Retry-After"] = "60"
         return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
 
-    keys = user.vault.get_keys()
-    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
-    start_ms = None
-    if getattr(user.vault, "created_at", None) and user.vault.created_at:
-        start_ms = int(user.vault.created_at.timestamp() * 1000)
-    trades, err = await mgr.funding_trades_hist(start_ms=start_ms, limit=1000)
-    if bitfinex_cache.is_rate_limit_error(err):
+    try:
+        result, rate_limited, _ = await _refresh_user_lending_snapshot(user_id, db)
+    except Exception:
+        result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+        rate_limited = False
+    if rate_limited:
         await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_LENDING)
         cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_LENDING)
         if cached is not None:
@@ -855,22 +1274,154 @@ async def get_lending_stats(
                 return LendingStatsResponse(**data)
         response.headers["X-Rate-Limited"] = "true"
         response.headers["Retry-After"] = "60"
-        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
-    if err or not trades:
-        result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
-        await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, result.model_dump())
-        return result
-    ticker_prices = _ticker_prices_from_trades(trades)
-    gross = _interest_usd_from_trades(trades, ticker_prices)
-    fee = gross * BITFINEX_LENDER_FEE_PCT
-    net = gross - fee
-    result = LendingStatsResponse(gross_profit=round(gross, 2), bitfinex_fee=round(fee, 2), net_profit=round(net, 2))
-    await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, result.model_dump())
+    cache_data = result.model_dump()
+    cache_data.pop("trades", None)
+    cache_data.pop("calculation_breakdown", None)
+    await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
     response.headers["X-Data-Source"] = "live"
     exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_LENDING)
     if exp is not None:
         response.headers["X-Cache-Expires-At"] = str(int(exp))
     return result
+
+
+@app.get("/api/funding-trades", response_model=FundingTradesResponse)
+async def get_funding_trades(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Fetch all repaid lending trades from Bitfinex between registration (vault.created_at) and latest.
+    Uses POST /v2/auth/r/funding/trades/all/hist. Returns trade records so UI can show trading record extracted.
+    """
+    if not current_user.vault:
+        return FundingTradesResponse(trades=[], gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+    keys = current_user.vault.get_keys()
+    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+    start_ms = None
+    if getattr(current_user.vault, "created_at", None) and current_user.vault.created_at:
+        start_ms = int(current_user.vault.created_at.timestamp() * 1000)
+    trades, err = await _fetch_all_funding_trades(mgr, start_ms)
+    if err or not trades:
+        return FundingTradesResponse(trades=[], gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+    ticker_prices = _ticker_prices_from_trades(trades)
+    gross, per_currency_breakdown = _interest_usd_from_trades_with_breakdown(trades, ticker_prices)
+    fee = gross * BITFINEX_LENDER_FEE_PCT
+    net = gross - fee
+    records = _trades_with_interest_usd(trades, ticker_prices)
+    breakdown = CalculationBreakdown(
+        trades_count=len(trades),
+        per_currency=per_currency_breakdown,
+        total_gross_usd=round(gross, 6),
+        formula_note="Interest per trade = |AMOUNT| * RATE * (PERIOD/365 days). USD/USDt/USDT/UST use 1:1; others use Bitfinex t{CCY}USD price.",
+    )
+    return FundingTradesResponse(
+        trades=records,
+        gross_profit=round(gross, 2),
+        bitfinex_fee=round(fee, 2),
+        net_profit=round(net, 2),
+        calculation_breakdown=breakdown,
+    )
+
+
+@app.post("/api/refresh-lending-stats", response_model=LendingStatsResponse)
+async def refresh_lending_stats(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Force refresh gross profit from Bitfinex for the current user (e.g. on login/dashboard load).
+    Invalidates lending cache then recomputes from funding trades since registration.
+    """
+    await bitfinex_cache.invalidate(current_user.id, bitfinex_cache.KEY_LENDING)
+    try:
+        result, rate_limited, records = await _refresh_user_lending_snapshot(current_user.id, db)
+    except Exception:
+        result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+        rate_limited = False
+        records = []
+    if rate_limited:
+        await bitfinex_cache.set_rate_limit_cooldown(current_user.id, bitfinex_cache.KEY_LENDING)
+    else:
+        cache_data = result.model_dump()
+        cache_data.pop("trades", None)
+        await bitfinex_cache.set_cached(current_user.id, bitfinex_cache.KEY_LENDING, cache_data)
+    return LendingStatsResponse(
+        gross_profit=result.gross_profit,
+        bitfinex_fee=result.bitfinex_fee,
+        net_profit=result.net_profit,
+        trades=records,
+        calculation_breakdown=result.calculation_breakdown,
+    )
+
+
+class CronRefreshBody(BaseModel):
+    user_id: int
+
+
+@app.post("/api/cron/refresh-lending-stats", response_model=LendingStatsResponse)
+async def cron_refresh_lending_stats(
+    body: CronRefreshBody,
+    x_cron_secret: Optional[str] = Header(None, alias="X-Cron-Secret"),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Internal cron: refresh gross profit for a given user_id. Requires X-Cron-Secret header.
+    Used by hourly script to update all users with vaults (staggered).
+    """
+    secret = os.getenv("CRON_SECRET")
+    if not secret or x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        result, rate_limited, _ = await _refresh_user_lending_snapshot(body.user_id, db)
+    except Exception:
+        result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+    if not rate_limited:
+        cache_data = result.model_dump()
+        cache_data.pop("trades", None)
+        await bitfinex_cache.set_cached(body.user_id, bitfinex_cache.KEY_LENDING, cache_data)
+    return result
+
+
+@app.get("/user-token-balance/{user_id}", response_model=TokenBalanceResponse)
+def get_user_token_balance(user_id: int, db: Session = Depends(database.get_db)):
+    """
+    Token balance from stored profit snapshot (no Bitfinex call). 1 USDT gross = 10 tokens used.
+    Checked on login and optionally daily; prefer snapshot to minimize API.
+    """
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    tier = (user.plan_tier or "trial").lower()
+    if tier not in PLAN_TOKEN_CREDITS:
+        tier = "trial"
+    initial_credit = PLAN_TOKEN_CREDITS[tier]
+    row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    purchased = float(row.purchased_tokens) if row and row.purchased_tokens is not None else 0.0
+
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    gross = float(snap.gross_profit_usd) if snap and snap.gross_profit_usd is not None else 0.0
+    tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
+    tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
+
+    if row:
+        row.tokens_remaining = tokens_remaining
+        row.last_gross_usd_used = gross
+        row.updated_at = datetime.utcnow()
+    else:
+        db.add(models.UserTokenBalance(
+            user_id=user_id,
+            tokens_remaining=tokens_remaining,
+            last_gross_usd_used=gross,
+        ))
+    db.commit()
+
+    return TokenBalanceResponse(
+        tokens_remaining=tokens_remaining,
+        tokens_used=tokens_used,
+        initial_credit=int(initial_credit) + int(purchased),
+        gross_profit_usd=round(gross, 2),
+    )
 
 
 # --- Bitfinex Public Funding Ledger (no auth) ---
@@ -901,6 +1452,39 @@ def _parse_funding_stats_row(row: Any) -> Optional[Dict[str, Any]]:
         "count": 1,
         "total": funding_amount,
     }
+
+
+# In-memory cache for funding symbols list (Bitfinex conf); refresh occasionally
+_funding_symbols_cache: Optional[list] = None
+_funding_symbols_cache_time: float = 0
+FUNDING_SYMBOLS_CACHE_TTL = 300  # 5 min
+
+
+@app.get("/api/funding-symbols")
+async def get_funding_symbols():
+    """
+    Returns all Bitfinex lending (funding) currencies as { value: "fUSD", label: "USD" } for dropdown.
+    Uses Bitfinex public conf pub:list:currency; funding symbol is "f" + currency code.
+    """
+    import time as _time
+    from services.bitfinex_service import _get_currency_list_sync
+    global _funding_symbols_cache, _funding_symbols_cache_time
+    now = _time.monotonic()
+    if _funding_symbols_cache is not None and (now - _funding_symbols_cache_time) < FUNDING_SYMBOLS_CACHE_TTL:
+        return _funding_symbols_cache
+    loop = asyncio.get_event_loop()
+    currencies, err = await loop.run_in_executor(None, _get_currency_list_sync)
+    if err or not currencies:
+        return [{"value": "fUSD", "label": "USD"}, {"value": "fUST", "label": "USDt"}, {"value": "fBTC", "label": "BTC"}, {"value": "fETH", "label": "ETH"}, {"value": "fXRP", "label": "XRP"}]
+    priority = ("USD", "UST", "USDt", "USDT", "BTC", "ETH", "XRP", "LTC", "EOS", "XLM")
+    def sort_key(item: dict) -> tuple:
+        label = item["label"]
+        return (0, priority.index(label)) if label in priority else (1, label)
+    symbols = [{"value": f"f{c}", "label": c} for c in currencies if isinstance(c, str) and c]
+    symbols.sort(key=sort_key)
+    _funding_symbols_cache = symbols
+    _funding_symbols_cache_time = now
+    return symbols
 
 
 @app.get("/api/funding-ledger")
@@ -940,26 +1524,30 @@ async def get_funding_ledger(symbol: str = Query("fUSD", description="Funding sy
 
 
 @app.get("/user-status/{user_id}", response_model=UserStatusResponse)
-def get_user_status(user_id: int, db: Session = Depends(database.get_db)):
+def get_user_status(
+    user_id: int,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(get_current_user),
+):
     """
     Lightweight status snapshot for the Settings page and header banner.
-    Trial: 7 days from first connection (vault.created_at) or pro_expiry if set.
+    User end only: caller must be the same user.
     """
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    now = datetime.utcnow()
-    days_remaining: Optional[int] = None
-    if user.pro_expiry:
-        delta = (user.pro_expiry - now).days
-        days_remaining = max(delta, 0)
-    else:
-        # Trial users: 7 days from first API key connection
-        vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
-        if vault and getattr(vault, "created_at", None) and vault.created_at:
-            trial_end = vault.created_at + timedelta(days=7)
-            days_remaining = max((trial_end - now).days, 0)
+    # Token balance (from stored snapshot, no Bitfinex call). Include purchased_tokens.
+    tier = (user.plan_tier or "trial").lower()
+    initial_credit = PLAN_TOKEN_CREDITS.get(tier, FREE_TIER_TOKENS)
+    token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    gross = float(snap.gross_profit_usd) if snap and snap.gross_profit_usd is not None else 0.0
+    tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
+    tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
 
     # Utilization from latest PerformanceLog, if available.
     log = (
@@ -976,9 +1564,13 @@ def get_user_status(user_id: int, db: Session = Depends(database.get_db)):
         plan_tier=user.plan_tier or "trial",
         lending_limit=float(user.lending_limit or 0.0),
         rebalance_interval=int(user.rebalance_interval or 0),
-        trial_remaining_days=days_remaining,
+        trial_remaining_days=None,
         utilization_pct=utilization_pct,
         used_amount=used_amount,
+        tokens_remaining=tokens_remaining,
+        tokens_used=tokens_used,
+        initial_token_credit=int(initial_credit) + int(purchased),
+        gross_profit_usd=gross,
     )
 
 
@@ -1073,6 +1665,70 @@ def _aggregate_lent_per_currency(credits_data: Any) -> dict:
     return result
 
 
+def _parse_credits_detail(credits_data: Any, prices: Dict[str, float], stablecoins: tuple = ("USD", "USDt", "USDT", "UST")) -> list:
+    """Parse credits into list of { id, symbol, amount, rate, period, amount_usd }. Rate at idx 11, period at 12."""
+    out: list = []
+    if not isinstance(credits_data, list):
+        return out
+    for row in credits_data:
+        try:
+            if not isinstance(row, (list, tuple)) or len(row) < 12:
+                continue
+            sym = (row[1] or "").strip().upper()
+            if sym.startswith("F"):
+                sym = sym[1:]
+            amount = float(row[5]) if row[5] is not None else 0.0
+            rate = float(row[11]) if row[11] is not None else 0.0
+            period = int(row[12]) if row[12] is not None else 0
+            if sym in stablecoins:
+                amount_usd = amount
+            else:
+                amount_usd = amount * prices.get(f"t{sym}USD", 0.0)
+            out.append({
+                "id": row[0],
+                "symbol": sym,
+                "amount": round(amount, 8),
+                "rate": rate,
+                "period": period,
+                "amount_usd": round(amount_usd, 2),
+            })
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _parse_offers_detail(offers_data: Any, prices: Dict[str, float], stablecoins: tuple = ("USD", "USDt", "USDT", "UST")) -> list:
+    """Parse offers into list of { id, symbol, amount, rate, period, amount_usd }. Amount idx 4, rate idx 14, period idx 15."""
+    out: list = []
+    if not isinstance(offers_data, list):
+        return out
+    for row in offers_data:
+        try:
+            if not isinstance(row, (list, tuple)) or len(row) < 16:
+                continue
+            sym = (row[1] or "").strip().upper()
+            if sym.startswith("F"):
+                sym = sym[1:]
+            amount = float(row[4]) if row[4] is not None else 0.0
+            rate = float(row[14]) if row[14] is not None else 0.0
+            period = int(row[15]) if row[15] is not None else 0
+            if sym in stablecoins:
+                amount_usd = amount
+            else:
+                amount_usd = amount * prices.get(f"t{sym}USD", 0.0)
+            out.append({
+                "id": row[0],
+                "symbol": sym,
+                "amount": round(amount, 8),
+                "rate": rate,
+                "period": period,
+                "amount_usd": round(amount_usd, 2),
+            })
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
 def _aggregate_offers_per_currency(offers_data: Any) -> dict:
     """Aggregate Bitfinex funding offers into amount per currency.
     offers_data is list of arrays: [ID, SYMBOL, MTS_CREATED, MTS_UPDATED, AMOUNT, ...]. AMOUNT at idx 4.
@@ -1105,6 +1761,19 @@ def _per_currency_to_usd(per_currency: dict, prices: Dict[str, float], stablecoi
     return total
 
 
+def _per_currency_usd_dict(
+    per_currency: dict, prices: Dict[str, float], stablecoins: tuple = ("USD", "USDt", "USDT", "UST")
+) -> Dict[str, float]:
+    """Convert per-currency amounts to per-currency USD (for bar breakdown)."""
+    out: Dict[str, float] = {}
+    for currency, amount in (per_currency or {}).items():
+        if currency in stablecoins:
+            out[currency] = amount
+        else:
+            out[currency] = amount * prices.get(f"t{currency}USD", 0.0)
+    return out
+
+
 def _total_lent_usd(lent_per_currency: dict, ticker_prices: Optional[Dict[str, float]] = None) -> float:
     """Convert lent_per_currency to total USD. USD/USDt/USDT/UST = 1:1; others use ticker_prices (tCCYUSD)."""
     stablecoins = ("USD", "USDt", "USDT", "UST")
@@ -1112,14 +1781,55 @@ def _total_lent_usd(lent_per_currency: dict, ticker_prices: Optional[Dict[str, f
     return _per_currency_to_usd(lent_per_currency, prices, stablecoins)
 
 
+# Minimum native amount to request ticker for (avoid API abuse for dust; ~$150 equiv).
+MIN_NATIVE_FOR_TICKER: Dict[str, float] = {
+    "BTC": 0.002,
+    "ETH": 0.05,
+    "XRP": 50.0,
+}
+DEFAULT_MIN_NATIVE_FOR_TICKER = 0.0001
+
+
+def _currencies_above_ticker_threshold(
+    all_currencies: set,
+    funding_balances: Dict[str, float],
+    credits_per_currency: Dict[str, float],
+    offers_per_currency: Dict[str, float],
+) -> set:
+    """Return subset of currencies we should request ticker for (above min native amount)."""
+    stablecoins = {"USD", "USDt", "USDT", "UST"}
+    out: set = set()
+    for c in all_currencies:
+        if c in stablecoins:
+            continue
+        total_native = (funding_balances.get(c, 0.0) or 0) + (credits_per_currency.get(c, 0.0) or 0) + (offers_per_currency.get(c, 0.0) or 0)
+        min_native = MIN_NATIVE_FOR_TICKER.get(c, DEFAULT_MIN_NATIVE_FOR_TICKER)
+        if total_native >= min_native:
+            out.add(c)
+    return out
+
+
+import time
+
+_ticker_cache: Dict[tuple, tuple] = {}  # (symbols_tuple) -> (prices_dict, cached_at)
+TICKER_CACHE_TTL_SEC = 60
+
+
 def _fetch_ticker_prices(currencies: set) -> Dict[str, float]:
-    """Fetch tCCYUSD prices for all non-stablecoins. Returns dict keyed by tCCYUSD."""
+    """Fetch tCCYUSD prices for all non-stablecoins. Returns dict keyed by tCCYUSD. Cached 60s to reduce API calls."""
     from services.bitfinex_service import _get_tickers_sync
     stablecoins = {"USD", "USDt", "USDT", "UST"}
-    need = [c for c in currencies if c and c not in stablecoins]
+    need = sorted([c for c in currencies if c and c not in stablecoins])
     if not need:
         return {}
     symbols = [f"t{c}USD" for c in need]
+    cache_key = tuple(symbols)
+    now = time.monotonic()
+    if cache_key in _ticker_cache:
+        out, cached_at = _ticker_cache[cache_key]
+        if now - cached_at < TICKER_CACHE_TTL_SEC:
+            return dict(out)
+        del _ticker_cache[cache_key]
     tickers, _ = _get_tickers_sync(symbols)
     out: Dict[str, float] = {}
     if tickers:
@@ -1131,6 +1841,7 @@ def _fetch_ticker_prices(currencies: set) -> Dict[str, float]:
                         out[sym] = float(row[7]) if row[7] is not None else 0.0
             except (TypeError, ValueError, IndexError):
                 continue
+    _ticker_cache[cache_key] = (out, now)
     return out
 
 
@@ -1141,7 +1852,9 @@ def _funding_balances_from_wallets(wallets: Any) -> Dict[str, float]:
         return result
     for w in wallets:
         try:
-            w_type, currency, balance = w[0], w[1], float(w[2])
+            w_type = (w[0] or "").strip().lower()
+            currency = w[1]
+            balance = float(w[2])
         except (IndexError, TypeError, ValueError):
             continue
         if w_type != "funding":
@@ -1155,15 +1868,28 @@ def _funding_balances_from_wallets(wallets: Any) -> Dict[str, float]:
 async def _portfolio_allocation_snapshot(mgr: BitfinexManager) -> tuple:
     """
     Wallets, credits, offers in rapid succession; one ticker fetch.
+    Retries up to 3 times with backoff on transient failures (stable logic like other platforms).
     Returns (summary_dict, log_str, rate_limited: bool).
-    Actively Earning = credits USD; Pending = offers USD; Idle = Total Wallet USD - credits - offers.
+    Actively Earning = credits USD (from offers API); Pending = offers USD (from credits API); Idle = Total - credits - offers.
     """
-    # Snapshot: three calls in quick succession
-    wallets, credits, offers = await asyncio.gather(
-        mgr.wallets(),
-        mgr.funding_credits(),
-        mgr.funding_offers(),
-    )
+    max_attempts = 3
+    wallets, credits, offers = None, None, None
+    for attempt in range(max_attempts):
+        wallets, credits, offers = await asyncio.gather(
+            mgr.wallets(),
+            mgr.funding_credits(),
+            mgr.funding_offers(),
+        )
+        w_err = wallets[1] if isinstance(wallets, tuple) else None
+        c_err = credits[1] if isinstance(credits, tuple) else None
+        o_err = offers[1] if isinstance(offers, tuple) else None
+        if bitfinex_cache.is_rate_limit_error(w_err) or bitfinex_cache.is_rate_limit_error(c_err) or bitfinex_cache.is_rate_limit_error(o_err):
+            break
+        if w_err or c_err or o_err:
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(1.0 * (attempt + 1))
+                continue
+        break
     w_err = wallets[1] if isinstance(wallets, tuple) else None
     c_err = credits[1] if isinstance(credits, tuple) else None
     o_err = offers[1] if isinstance(offers, tuple) else None
@@ -1172,12 +1898,25 @@ async def _portfolio_allocation_snapshot(mgr: BitfinexManager) -> tuple:
     credits_data = credits[0] if isinstance(credits, tuple) else None
     offers_data = offers[0] if isinstance(offers, tuple) else None
 
+    # Only compute when we have all three; otherwise return None so caller can serve cache or 503.
+    if wallets_data is None or credits_data is None or offers_data is None:
+        log_incomplete = (
+            f"Portfolio Allocation: incomplete (wallets={wallets_data is not None}, "
+            f"credits={credits_data is not None}, offers={offers_data is not None})"
+        )
+        return None, log_incomplete, rate_limited
+
     funding_balances = _funding_balances_from_wallets(wallets_data) if wallets_data else {}
+    # Actively Earning = /funding/credits (funds lent out); Pending = /funding/offers (in order book).
     credits_per_currency = _aggregate_lent_per_currency(credits_data) if credits_data else {}
     offers_per_currency = _aggregate_offers_per_currency(offers_data) if offers_data else {}
 
     all_currencies = set(funding_balances) | set(credits_per_currency) | set(offers_per_currency)
-    prices = _fetch_ticker_prices(all_currencies)
+    # Only request ticker for currencies above min native amount (~$150 equiv) to reduce API usage.
+    currencies_for_ticker = _currencies_above_ticker_threshold(
+        all_currencies, funding_balances, credits_per_currency, offers_per_currency
+    )
+    prices = _fetch_ticker_prices(currencies_for_ticker)
     stablecoins = ("USD", "USDt", "USDT", "UST")
 
     total_wallet_usd = _per_currency_to_usd(funding_balances, prices, stablecoins)
@@ -1194,16 +1933,63 @@ async def _portfolio_allocation_snapshot(mgr: BitfinexManager) -> tuple:
         else:
             per_currency_usd[c] = amt * prices.get(f"t{c}USD", 0.0)
 
+    lent_per_currency_usd = _per_currency_usd_dict(credits_per_currency, prices, stablecoins)
+    offers_per_currency_usd = _per_currency_usd_dict(offers_per_currency, prices, stablecoins)
+    idle_per_currency_usd: Dict[str, float] = {}
+    for c in all_currencies:
+        w = per_currency_usd.get(c, 0.0)
+        l = lent_per_currency_usd.get(c, 0.0)
+        o = offers_per_currency_usd.get(c, 0.0)
+        idle_per_currency_usd[c] = round(max(0.0, w - l - o), 2)
+    lent_per_currency_usd = {c: round(v, 2) for c, v in lent_per_currency_usd.items()}
+    offers_per_currency_usd = {c: round(v, 2) for c, v in offers_per_currency_usd.items()}
+
+    # Performance metrics: weighted avg APR and est. daily from credits (Actively Earning).
+    credits_detail = _parse_credits_detail(credits_data, prices, stablecoins)
+    offers_detail = _parse_offers_detail(offers_data, prices, stablecoins)
+    sum_amount_usd = sum(c["amount_usd"] for c in credits_detail)
+    sum_rate_weighted = sum(c["amount_usd"] * c["rate"] for c in credits_detail)
+    # Bitfinex rate is daily (FRR); APR % = rate * 365 * 100.
+    if sum_amount_usd > 0:
+        weighted_avg_apr_pct = round((sum_rate_weighted / sum_amount_usd) * 365 * 100, 4)
+        est_daily_earnings_usd = round(sum_rate_weighted, 2)
+    else:
+        weighted_avg_apr_pct = 0.0
+        est_daily_earnings_usd = 0.0
+    # Yield / Total Wallet % = weighted_avg_apr * (credits_usd / total_wallet_usd)
+    yield_over_total_pct = round(weighted_avg_apr_pct * (credits_usd / total_wallet_usd), 4) if total_wallet_usd > 0 else 0.0
+    credits_count = len(credits_data) if isinstance(credits_data, list) else 0
+    offers_count = len(offers_data) if isinstance(offers_data, list) else 0
+
+    # Include a currency in per-currency breakdown only if total value > $150 (same logic as ticker threshold).
+    MIN_DISPLAY_USD = 150.0
+    allowed_currencies = {
+        c for c in all_currencies
+        if (per_currency_usd.get(c, 0.0) + lent_per_currency_usd.get(c, 0.0) + offers_per_currency_usd.get(c, 0.0)) > MIN_DISPLAY_USD
+    }
+    def _filter_per_currency(d: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in (d or {}).items() if k in allowed_currencies}
+
     summary = {
         "total_usd_all": round(total_wallet_usd, 2),
         "usd_only": funding_balances.get("USD", 0.0) + funding_balances.get("USDt", 0.0) + funding_balances.get("USDT", 0.0),
-        "per_currency": funding_balances,
-        "per_currency_usd": per_currency_usd,
-        "lent_per_currency": credits_per_currency,
-        "offers_per_currency": offers_per_currency,
+        "per_currency": _filter_per_currency(funding_balances),
+        "per_currency_usd": _filter_per_currency(per_currency_usd),
+        "lent_per_currency": _filter_per_currency(credits_per_currency),
+        "offers_per_currency": _filter_per_currency(offers_per_currency),
+        "lent_per_currency_usd": _filter_per_currency(lent_per_currency_usd),
+        "offers_per_currency_usd": _filter_per_currency(offers_per_currency_usd),
+        "idle_per_currency_usd": _filter_per_currency(idle_per_currency_usd),
         "total_lent_usd": round(credits_usd, 2),       # Actively Earning
         "total_offers_usd": round(offers_usd, 2),      # Pending Deployment (In Order Book)
         "idle_usd": round(idle_usd, 2),               # Idle Funds (Cash Drag)
+        "weighted_avg_apr_pct": weighted_avg_apr_pct,
+        "est_daily_earnings_usd": est_daily_earnings_usd,
+        "yield_over_total_pct": yield_over_total_pct,
+        "credits_count": credits_count,
+        "offers_count": offers_count,
+        "credits_detail": credits_detail,
+        "offers_detail": offers_detail,
     }
     log_str = (
         f"Portfolio Allocation: Total Wallet USD: ${total_wallet_usd:,.2f} | "
@@ -1218,11 +2004,14 @@ async def wallet_summary(
     user_id: int,
     response: Response,
     db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
     """
     Returns Bitfinex wallet USD totals and currently lent out per currency.
-    Cached to respect Bitfinex rate limits (10–90 req/min). Use X-Data-Source and X-Cache-Expires-At headers.
+    User end only: caller must be the same user. Cached to respect Bitfinex rate limits.
     """
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user or not user.vault:
         raise HTTPException(status_code=404, detail="API keys not found.")
@@ -1248,9 +2037,19 @@ async def wallet_summary(
             "per_currency_usd": {},
             "lent_per_currency": {},
             "offers_per_currency": {},
+            "lent_per_currency_usd": {},
+            "offers_per_currency_usd": {},
+            "idle_per_currency_usd": {},
             "total_lent_usd": 0.0,
             "total_offers_usd": 0.0,
             "idle_usd": 0.0,
+            "weighted_avg_apr_pct": 0.0,
+            "est_daily_earnings_usd": 0.0,
+            "yield_over_total_pct": 0.0,
+            "credits_count": 0,
+            "offers_count": 0,
+            "credits_detail": [],
+            "offers_detail": [],
             "_rate_limited": True,
         }
 
@@ -1262,6 +2061,18 @@ async def wallet_summary(
             print(f"[user_id={user_id}] {log_str}")
         if rate_limited:
             await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
+        if summary is None:
+            # Incomplete data: do not cache; return cached if available, else 503.
+            cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
+            if cached is not None:
+                data, _ = cached
+                if data is not None:
+                    response.headers["X-Data-Source"] = "cache"
+                    response.headers["X-Data-Incomplete"] = "true"
+                    return data
+            raise HTTPException(status_code=503, detail="Wallet data incomplete; try again shortly.")
+    except HTTPException:
+        raise
     except Exception as e:
         if bitfinex_cache.is_rate_limit_error(str(e)):
             await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
@@ -1277,16 +2088,58 @@ async def wallet_summary(
 # --- Stripe Webhook (referrals + subscription) ---
 stripe.api_key = os.getenv("STRIPE_API_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-# Price IDs for checkout (create in Stripe Dashboard; yearly = 10% off)
+# Price IDs: Pro 20 USDT/mo, AI Ultra 60 USDT/mo, Whales 200 USDT/mo (create in Stripe Dashboard)
 STRIPE_PRICE_PRO_MONTHLY = os.getenv("STRIPE_PRICE_PRO_MONTHLY", "")
-STRIPE_PRICE_PRO_YEARLY = os.getenv("STRIPE_PRICE_PRO_YEARLY", "")
-STRIPE_PRICE_EXPERT_MONTHLY = os.getenv("STRIPE_PRICE_EXPERT_MONTHLY", "")
-STRIPE_PRICE_EXPERT_YEARLY = os.getenv("STRIPE_PRICE_EXPERT_YEARLY", "")
+STRIPE_PRICE_AI_ULTRA_MONTHLY = os.getenv("STRIPE_PRICE_AI_ULTRA_MONTHLY", "")
+STRIPE_PRICE_WHALES_MONTHLY = os.getenv("STRIPE_PRICE_WHALES_MONTHLY", "")
+
+# Plan limits and rebalance (minutes) for webhook
+PLAN_REBALANCE_MIN = {"pro": 30, "ai_ultra": 3, "whales": 1}
+PLAN_LENDING_LIMIT = {"pro": 250_000.0, "ai_ultra": 250_000.0, "whales": 1_500_000.0}
 
 
 class CreateCheckoutPayload(BaseModel):
-    plan: str  # "pro" | "expert"
-    interval: str  # "monthly" | "yearly"
+    plan: str  # "pro" | "ai_ultra" | "whales"
+    interval: str  # "monthly" (only monthly for new plans)
+
+
+class CreateCheckoutTokensPayload(BaseModel):
+    amount_usd: float  # e.g. 10 → user gets 1000 tokens (1 USD = 100 tokens)
+
+
+@app.post("/api/create-checkout-session-tokens")
+async def create_checkout_session_tokens(
+    payload: CreateCheckoutTokensPayload,
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    One-time payment to add tokens. 1 USD = 100 tokens.
+    """
+    amount_usd = max(0.5, min(1000.0, float(payload.amount_usd)))
+    amount_cents = int(round(amount_usd * 100))
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Payments not configured.")
+    origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+    tokens = int(amount_usd * 100)
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            customer_email=current_user.email,
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": f"Token pack ({tokens} tokens)", "description": "1 USD = 100 tokens"},
+                    "unit_amount": amount_cents,
+                },
+                "quantity": 1,
+            }],
+            success_url=origin + "/dashboard?tokens=success",
+            cancel_url=origin + "/dashboard?subscription=cancel",
+            metadata={"type": "tokens", "user_id": str(current_user.id), "amount_usd": str(amount_usd), "tokens": str(tokens)},
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/create-checkout-session")
@@ -1295,22 +2148,19 @@ async def create_checkout_session(
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Create a Stripe Checkout Session for the chosen plan/interval. Returns { url } to redirect the user.
-    Yearly prices should be configured in Stripe with 10% off (e.g. $15/mo -> $162/year).
+    Create a Stripe Checkout Session. Plans: pro 20 USDT, ai_ultra 60 USDT, whales 200 USDT per month.
     """
     plan = (payload.plan or "").lower()
     interval = (payload.interval or "monthly").lower()
-    if plan not in ("pro", "expert") or interval not in ("monthly", "yearly"):
-        raise HTTPException(status_code=400, detail="Invalid plan or interval.")
+    if plan not in ("pro", "ai_ultra", "whales") or interval != "monthly":
+        raise HTTPException(status_code=400, detail="Invalid plan or interval. Only monthly is supported.")
     price_id = None
-    if plan == "pro" and interval == "monthly":
+    if plan == "pro":
         price_id = STRIPE_PRICE_PRO_MONTHLY
-    elif plan == "pro" and interval == "yearly":
-        price_id = STRIPE_PRICE_PRO_YEARLY
-    elif plan == "expert" and interval == "monthly":
-        price_id = STRIPE_PRICE_EXPERT_MONTHLY
-    elif plan == "expert" and interval == "yearly":
-        price_id = STRIPE_PRICE_EXPERT_YEARLY
+    elif plan == "ai_ultra":
+        price_id = STRIPE_PRICE_AI_ULTRA_MONTHLY
+    elif plan == "whales":
+        price_id = STRIPE_PRICE_WHALES_MONTHLY
     if not price_id or not stripe.api_key:
         raise HTTPException(
             status_code=503,
@@ -1325,6 +2175,7 @@ async def create_checkout_session(
             success_url=origin + "/dashboard?subscription=success",
             cancel_url=origin + "/dashboard?subscription=cancel",
             metadata={"user_id": str(current_user.id), "plan": plan, "interval": interval},
+            subscription_data={"metadata": {"plan": plan, "user_id": str(current_user.id)}},
         )
         return {"url": session.url}
     except Exception as e:
@@ -1345,10 +2196,28 @@ async def stripe_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid Stripe webhook signature.")
 
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        meta = session.get("metadata") or {}
+        if meta.get("type") == "tokens":
+            user_id = int(meta.get("user_id") or 0)
+            tokens = int(meta.get("tokens") or 0)
+            if user_id and tokens > 0:
+                db = next(database.get_db())
+                try:
+                    row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+                    if row:
+                        row.purchased_tokens = (row.purchased_tokens or 0) + tokens
+                        row.updated_at = datetime.utcnow()
+                    else:
+                        db.add(models.UserTokenBalance(user_id=user_id, purchased_tokens=float(tokens)))
+                    db.commit()
+                finally:
+                    db.close()
+            return {"received": True}
+
     if event["type"] == "invoice.payment_succeeded":
         data = event["data"]["object"]
-        customer_id = data.get("customer")
-        # We assume you store a mapping from Stripe customer -> user email in metadata
         email = data.get("customer_email") or (data.get("customer_details") or {}).get("email")
 
         db: Session = next(database.get_db())
@@ -1357,21 +2226,25 @@ async def stripe_webhook(request: Request):
             if not user:
                 return {"received": True}
 
-            # Decide whether it's monthly or annual from the invoice/price metadata.
-            # Default: monthly 30 days.
             interval_days = 30
-            lines = data.get("lines", {}).get("data", [])
-            if lines:
-                price = (lines[0].get("price") or {})
-                recurring = price.get("recurring") or {}
-                if recurring.get("interval") == "year":
-                    interval_days = 365
+            plan = "pro"
+            sub_id = data.get("subscription")
+            if sub_id:
+                try:
+                    sub = stripe.Subscription.retrieve(sub_id)
+                    plan = (sub.metadata or {}).get("plan") or "pro"
+                except Exception:
+                    pass
+
+            if plan in PLAN_REBALANCE_MIN:
+                user.plan_tier = plan
+                user.rebalance_interval = PLAN_REBALANCE_MIN[plan]
+                user.lending_limit = PLAN_LENDING_LIMIT.get(plan, 250_000.0)
 
             now = datetime.utcnow()
             base = user.pro_expiry if user.pro_expiry and user.pro_expiry > now else now
             user.pro_expiry = base + timedelta(days=interval_days)
 
-            # Referral bonus
             if user.referred_by:
                 referrer = db.query(models.User).filter(models.User.id == user.referred_by).first()
                 if referrer:

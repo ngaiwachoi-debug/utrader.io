@@ -4,7 +4,7 @@ import { useState, useEffect } from "react"
 import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
 import { signOut } from "next-auth/react"
-import { clearBackendTokenCache } from "@/lib/auth"
+import { clearBackendTokenCache, getBackendToken } from "@/lib/auth"
 import { Star, Clock, Search, Bell, HelpCircle, User, Globe, Calendar, LogOut } from "lucide-react"
 import { useLanguage } from "@/lib/i18n"
 import { useSession } from "next-auth/react"
@@ -40,7 +40,7 @@ export function Header({ onUpgradeClick }: HeaderProps) {
   const [usdOnly, setUsdOnly] = useState<number | null>(null)
   const [walletsLoading, setWalletsLoading] = useState(true)
   const [dateOpen, setDateOpen] = useState(false)
-  const [trialDaysRemaining, setTrialDaysRemaining] = useState<number | null>(null)
+  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
   const [lendingLimit, setLendingLimit] = useState<number>(250_000)
   const [walletDataSource, setWalletDataSource] = useState<"live" | "cache" | null>(null)
   const [walletRateLimited, setWalletRateLimited] = useState(false)
@@ -49,7 +49,6 @@ export function Header({ onUpgradeClick }: HeaderProps) {
     if (userId == null) {
       setTotalUsdAll(null)
       setUsdOnly(null)
-      setTrialDaysRemaining(null)
       setLendingLimit(250_000)
       setWalletDataSource(null)
       setWalletRateLimited(false)
@@ -60,9 +59,11 @@ export function Header({ onUpgradeClick }: HeaderProps) {
     const run = async () => {
       setWalletsLoading(true)
       try {
+        const token = await getBackendToken()
+        const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
         const [walletRes, statusRes] = await Promise.all([
-          fetch(`${API_BASE}/wallets/${userId}`),
-          fetch(`${API_BASE}/user-status/${userId}`),
+          fetch(`${API_BASE}/wallets/${userId}`, { credentials: "include", headers }),
+          fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers }),
         ])
         if (cancelled) return
         if (walletRes.ok) {
@@ -80,7 +81,8 @@ export function Header({ onUpgradeClick }: HeaderProps) {
         }
         if (statusRes.ok) {
           const statusData = await statusRes.json()
-          setTrialDaysRemaining(typeof statusData.trial_remaining_days === "number" ? statusData.trial_remaining_days : null)
+          const tr = statusData.tokens_remaining
+          setTokensRemaining(typeof tr === "number" ? tr : null)
           setLendingLimit(Number(statusData.lending_limit) ?? 250_000)
         }
       } catch {
@@ -89,7 +91,7 @@ export function Header({ onUpgradeClick }: HeaderProps) {
           setUsdOnly(null)
           setWalletDataSource(null)
           setWalletRateLimited(false)
-          setTrialDaysRemaining(null)
+          setTokensRemaining(null)
         }
       } finally {
         if (!cancelled) setWalletsLoading(false)
@@ -229,21 +231,17 @@ export function Header({ onUpgradeClick }: HeaderProps) {
         </div>
       </div>
 
-      {/* Trial Banner */}
+      {/* Token / Plan Banner */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border bg-card px-4 py-2 lg:px-6">
         <div className="flex flex-wrap items-center gap-3 text-xs">
           <div className="flex items-center gap-1.5">
             <Star className="h-3.5 w-3.5 text-yellow-400" />
             <span className="rounded-full bg-[#10b981] px-2.5 py-0.5 text-xs font-semibold text-primary-foreground">
-              {t("header.proTrial")}
+              {tokensRemaining !== null ? `${Math.round(tokensRemaining)} tokens` : "—"}
             </span>
           </div>
           <div className="flex items-center gap-1.5 text-muted-foreground">
             <Clock className="h-3.5 w-3.5" />
-            <span className="font-medium text-foreground">
-              {trialDaysRemaining !== null ? `${trialDaysRemaining} ` : "— "}{t("header.daysRemaining")}
-            </span>
-            <span className="text-muted-foreground">{"·"}</span>
             <span>{t("header.lendingLimit")}: ${(lendingLimit ?? 0).toLocaleString()}</span>
           </div>
         </div>

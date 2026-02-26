@@ -45,7 +45,7 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body className={`${_inter.variable} ${_geistMono.variable} font-sans antialiased`} suppressHydrationWarning>
         <Providers>
-          {children}
+          <div suppressHydrationWarning>{children}</div>
         </Providers>
         <Toaster theme="dark" richColors position="top-center" toastOptions={{ style: { background: '#0f172a', border: '1px solid #1e293b', color: '#e2e8f0' } }} />
         <Analytics />

@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { useSearchParams } from "next/navigation"
-import { DollarSign, Activity, TrendingUp, Settings, BarChart3, CreditCard } from "lucide-react"
+import { DollarSign, Activity, TrendingUp, Settings, BarChart3, CreditCard, Terminal } from "lucide-react"
 import { Sidebar } from "@/components/dashboard/sidebar"
 import { Header } from "@/components/dashboard/header"
 import { ProfitCenter } from "@/components/dashboard/profit-center"
@@ -10,6 +10,7 @@ import { LiveStatus } from "@/components/dashboard/live-status"
 import { MarketStatus } from "@/components/dashboard/market-status"
 import { TrueROI } from "@/components/dashboard/true-roi"
 import { Subscription } from "@/components/dashboard/subscription"
+import { TerminalView } from "@/components/dashboard/terminal-view"
 import { SettingsPage } from "@/components/dashboard/settings"
 import { useT } from "@/lib/i18n"
 import { DateRangeProvider } from "@/lib/date-range-context"
@@ -56,6 +57,7 @@ export default function DashboardPage() {
           {activePage === "market-status" && <MarketStatus />}
           {activePage === "true-roi" && <TrueROI />}
           {activePage === "subscription" && <Subscription />}
+          {activePage === "terminal" && <TerminalView />}
           {activePage === "settings" && <SettingsPage />}
         </main>
       </div>
@@ -82,6 +84,7 @@ function MobileNav({
     { id: "market-status", labelKey: "sidebar.marketStatus", Icon: BarChart3 },
     { id: "true-roi", labelKey: "nav.roi", Icon: TrendingUp },
     { id: "subscription", labelKey: "sidebar.subscription", Icon: CreditCard },
+    { id: "terminal", labelKey: "sidebar.terminal", Icon: Terminal },
     { id: "settings", labelKey: "nav.settings", Icon: Settings },
   ]
 

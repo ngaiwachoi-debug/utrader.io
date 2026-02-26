@@ -11,6 +11,7 @@ import {
 import { useDateRange } from "@/lib/date-range-context"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
+import { getBackendToken } from "@/lib/auth"
 import {
   AreaChart,
   Area,
@@ -110,20 +111,32 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const [chartHistory, setChartHistory] = useState<{ date: string; volume: number; interest: number }[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [trialDaysRemaining, setTrialDaysRemaining] = useState<number | null>(null)
+  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
   const [lendingLimit, setLendingLimit] = useState<number>(250_000)
   const [lendingDataSource, setLendingDataSource] = useState<"live" | "cache" | null>(null)
   const [lendingRateLimited, setLendingRateLimited] = useState(false)
+  const [tradesCount, setTradesCount] = useState<number | null>(null)
+  const [fundingTrades, setFundingTrades] = useState<Array<{ id: number; currency: string; mts_create: number; amount: number; rate: number; period: number; interest_usd: number }>>([])
+  const [calculationBreakdown, setCalculationBreakdown] = useState<{
+    trades_count: number
+    per_currency: Array<{ currency: string; interest_ccy: number; ticker_price_usd: number; interest_usd: number }>
+    total_gross_usd: number
+    formula_note?: string
+  } | null>(null)
+  const [showBreakdown, setShowBreakdown] = useState(false)
 
   useEffect(() => {
     if (userId == null) {
       setGrossProfit(null)
       setNetProfit(null)
       setChartHistory([])
-      setTrialDaysRemaining(null)
+      setTokensRemaining(null)
       setLendingLimit(250_000)
       setLendingDataSource(null)
       setLendingRateLimited(false)
+      setTradesCount(null)
+      setFundingTrades([])
+      setCalculationBreakdown(null)
       setLoading(false)
       return
     }
@@ -131,6 +144,26 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
       try {
         setLoading(true)
         setError(null)
+        const token = await getBackendToken()
+        const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+        // On dashboard load: force refresh gross profit from Bitfinex (returns repaid lending trades), then fetch stats
+        try {
+          const refreshRes = await fetch(`${API_BASE}/api/refresh-lending-stats`, { method: "POST", credentials: "include", headers })
+          if (refreshRes.ok) {
+            const refreshData = await refreshRes.json()
+            const trades = refreshData.trades
+            const arr = Array.isArray(trades) ? trades : []
+            setTradesCount(arr.length)
+            setFundingTrades(arr)
+            if (refreshData.calculation_breakdown) {
+              setCalculationBreakdown(refreshData.calculation_breakdown)
+            } else {
+              setCalculationBreakdown(null)
+            }
+          }
+        } catch {
+          // ignore refresh failure; we still load from cache/GET below
+        }
         const start = range.start.toISOString().slice(0, 10)
         const end = range.end.toISOString().slice(0, 10)
         // Prefer lending stats (Bitfinex since registration); fallback to /stats
@@ -156,8 +189,8 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         setNetProfit(net)
 
         const [historyRes, statusRes] = await Promise.all([
-          fetch(`${API_BASE}/stats/${userId}/history?start=${start}&end=${end}`),
-          fetch(`${API_BASE}/user-status/${userId}`),
+          fetch(`${API_BASE}/stats/${userId}/history?start=${start}&end=${end}`, { credentials: "include", headers }),
+          fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers }),
         ])
         if (historyRes.ok) {
           const history = await historyRes.json()
@@ -167,7 +200,8 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         }
         if (statusRes.ok) {
           const statusData = await statusRes.json()
-          setTrialDaysRemaining(typeof statusData.trial_remaining_days === "number" ? statusData.trial_remaining_days : null)
+          const tr = statusData.tokens_remaining
+          setTokensRemaining(typeof tr === "number" ? tr : null)
           setLendingLimit(Number(statusData.lending_limit) ?? 250_000)
         }
       } catch (e) {
@@ -229,6 +263,9 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             {!loading && !error && (grossProfit ?? 0) === 0 ? t("dashboard.noDataYet") : t("dashboard.grossProfitSinceRegistration")}
+            {tradesCount != null && tradesCount > 0 && (
+              <span className="ml-1"> · {tradesCount} repaid lending trade{tradesCount !== 1 ? "s" : ""} extracted</span>
+            )}
             {lendingDataSource === "cache" && (
               <span className="ml-1 text-muted-foreground"> · {t("dashboard.dataCached")}</span>
             )}
@@ -236,6 +273,45 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
               <span className="ml-1 text-amber-600 dark:text-amber-400" title={t("dashboard.rateLimited")}> · ⚠</span>
             )}
           </p>
+          {calculationBreakdown && calculationBreakdown.per_currency.length > 0 && (
+            <div className="mt-2">
+              <button
+                type="button"
+                onClick={() => setShowBreakdown(!showBreakdown)}
+                className="text-xs font-medium text-emerald hover:underline"
+              >
+                {showBreakdown ? "Hide" : "Show"} calculation breakdown
+              </button>
+              {showBreakdown && (
+                <div className="mt-2 rounded border border-border bg-muted/30 p-3 text-xs">
+                  <p className="text-muted-foreground mb-2">{calculationBreakdown.formula_note}</p>
+                  <table className="w-full table-fixed">
+                    <thead>
+                      <tr className="text-muted-foreground">
+                        <th className="text-left font-medium">Currency</th>
+                        <th className="text-right font-medium">Interest (ccy)</th>
+                        <th className="text-right font-medium">Price (USD)</th>
+                        <th className="text-right font-medium">Interest (USD)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {calculationBreakdown.per_currency.map((row) => (
+                        <tr key={row.currency} className="border-t border-border/50">
+                          <td className="py-1 font-medium">{row.currency}</td>
+                          <td className="py-1 text-right font-mono">{row.interest_ccy.toFixed(6)}</td>
+                          <td className="py-1 text-right font-mono">{row.ticker_price_usd.toFixed(4)}</td>
+                          <td className="py-1 text-right font-mono text-emerald">${row.interest_usd.toFixed(4)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <p className="mt-2 border-t border-border pt-2 font-medium text-foreground">
+                    Total gross USD: ${calculationBreakdown.total_gross_usd.toFixed(4)} ({calculationBreakdown.trades_count} trades)
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Net Earnings */}
@@ -262,6 +338,51 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         </p>
       )}
 
+      {/* Trading record (repaid funding trades from Bitfinex) */}
+      {fundingTrades.length > 0 && (
+        <div className="rounded-xl border border-border bg-card">
+          <div className="border-b border-border p-5">
+            <h3 className="text-sm font-semibold text-foreground">Trading record</h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Repaid lending trades between registration and latest (Bitfinex funding trades). Sum of interest = Gross Profit above.
+            </p>
+          </div>
+          <div className="overflow-x-auto max-h-[320px] overflow-y-auto">
+            <table className="w-full text-left text-sm" role="table">
+              <thead className="sticky top-0 bg-card border-b border-border z-10">
+                <tr className="text-xs uppercase text-muted-foreground">
+                  <th className="px-5 py-2.5 font-medium">Date</th>
+                  <th className="px-5 py-2.5 font-medium">Currency</th>
+                  <th className="px-5 py-2.5 font-medium text-right">Amount</th>
+                  <th className="px-5 py-2.5 font-medium text-right">Rate</th>
+                  <th className="px-5 py-2.5 font-medium text-right">Period (d)</th>
+                  <th className="px-5 py-2.5 font-medium text-right">Interest (USD)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fundingTrades.slice(0, 100).map((t) => (
+                  <tr key={t.id} className="border-b border-border/50 hover:bg-secondary/20">
+                    <td className="px-5 py-2.5 text-muted-foreground">
+                      {new Date(t.mts_create).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })}
+                    </td>
+                    <td className="px-5 py-2.5 font-medium text-foreground">{t.currency}</td>
+                    <td className="px-5 py-2.5 text-right font-mono">{t.amount.toFixed(4)}</td>
+                    <td className="px-5 py-2.5 text-right font-mono">{(t.rate * 100).toFixed(2)}%</td>
+                    <td className="px-5 py-2.5 text-right font-mono">{t.period}</td>
+                    <td className="px-5 py-2.5 text-right font-mono text-emerald">${t.interest_usd.toFixed(4)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {fundingTrades.length > 100 && (
+            <p className="px-5 py-2 text-xs text-muted-foreground border-t border-border">
+              Showing first 100 of {fundingTrades.length} trades.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Trial Countdown Bar */}
       <div className="rounded-xl border border-emerald/20 bg-card p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -270,13 +391,13 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
               <Clock className="h-5 w-5 text-emerald" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-foreground">{t("dashboard.proTrialCard")}</p>
-              <p className="text-xs text-muted-foreground">{t("dashboard.expertPlanFeatures")}</p>
+              <p className="text-sm font-semibold text-foreground">Token credit</p>
+              <p className="text-xs text-muted-foreground">0.1 USD gross profit = 1 token used</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
             <span className="text-sm font-bold text-emerald">
-              {trialDaysRemaining !== null ? `${trialDaysRemaining} ` : "— "}{t("dashboard.daysRemainingShort")}
+              {tokensRemaining !== null ? `${Math.round(tokensRemaining)} tokens remaining` : "—"}
             </span>
             <span className="text-xs text-muted-foreground">{t("header.lendingLimit")}: ${(lendingLimit ?? 0).toLocaleString()}</span>
             <button
@@ -285,18 +406,6 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
             >
               {t("dashboard.upgradeToPro")}
             </button>
-          </div>
-        </div>
-        <div className="mt-4">
-          <div className="flex items-center justify-between text-xs text-muted-foreground mb-2">
-            <span>{t("dashboard.trialProgress")}</span>
-            <span>{t("dashboard.dayXofY", { n: trialDaysRemaining !== null ? Math.max(0, 7 - trialDaysRemaining) : 0, total: 7 })}</span>
-          </div>
-          <div className="h-2 w-full rounded-full bg-secondary">
-            <div
-              className="h-2 rounded-full bg-gradient-to-r from-emerald to-emerald/80 transition-all duration-500"
-              style={{ width: trialDaysRemaining !== null ? `${Math.min(100, ((7 - trialDaysRemaining) / 7) * 100)}%` : "0%" }}
-            />
           </div>
         </div>
       </div>

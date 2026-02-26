@@ -14,7 +14,8 @@ import {
   Moon,
 } from "lucide-react"
 import { useT } from "@/lib/i18n"
-import { useCurrentUserId } from "@/lib/current-user-context"
+import { useCurrentUserId, useCurrentUser } from "@/lib/current-user-context"
+import { getBackendToken } from "@/lib/auth"
 import {
   LineChart,
   Line,
@@ -57,16 +58,7 @@ const marketData = [
   { currency: "SUSHI", rate: "22.63%", dailyChange: "+106.67%", volume: "$3,015" },
 ]
 
-type LendingLedgerRow = {
-  time: string
-  rateRange: string
-  maxDays: number
-  cumulative: string
-  rate: string
-  amount: string
-  count: number
-  total: string
-}
+type CreditDetail = { id: number; symbol: string; amount: number; rate: number; period: number; amount_usd: number }
 
 type WalletSummary = {
   total_usd_all: number
@@ -75,14 +67,25 @@ type WalletSummary = {
   per_currency_usd: Record<string, number>
   lent_per_currency?: Record<string, number>
   offers_per_currency?: Record<string, number>
+  lent_per_currency_usd?: Record<string, number>
+  offers_per_currency_usd?: Record<string, number>
+  idle_per_currency_usd?: Record<string, number>
   total_lent_usd?: number
   total_offers_usd?: number
   idle_usd?: number
+  weighted_avg_apr_pct?: number
+  est_daily_earnings_usd?: number
+  yield_over_total_pct?: number
+  credits_count?: number
+  offers_count?: number
+  credits_detail?: CreditDetail[]
+  offers_detail?: CreditDetail[]
 }
 
 export function LiveStatus() {
   const t = useT()
   const userId = useCurrentUserId()
+  const { apiError } = useCurrentUser()
   const [activeTab, setActiveTab] = useState("total")
   const [totalAssets, setTotalAssets] = useState<number | null>(null)
   const [walletSummary, setWalletSummary] = useState<WalletSummary | null>(null)
@@ -97,11 +100,7 @@ export function LiveStatus() {
   const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
   const REFRESH_COOLDOWN_SEC = 15
-  const [ledgerCurrentRate, setLedgerCurrentRate] = useState<string | null>(null)
-  const [ledgerDailyRate, setLedgerDailyRate] = useState<number | null>(null)
-  const [ledgerRows, setLedgerRows] = useState<LendingLedgerRow[]>([])
-  const [ledgerLoading, setLedgerLoading] = useState(false)
-  const [ledgerError, setLedgerError] = useState<string | null>(null)
+  const [ledgerPage, setLedgerPage] = useState(1)
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -111,31 +110,10 @@ export function LiveStatus() {
     return () => clearInterval(interval)
   }, [refreshCooldownUntil])
 
-  const fetchLedger = async () => {
-    try {
-      setLedgerLoading(true)
-      setLedgerError(null)
-      const res = await fetch(`${API_BASE}/api/funding-ledger?symbol=fUSD`)
-      const data = await res.json().catch(() => ({}))
-      if (res.ok && data.rows) {
-        setLedgerCurrentRate(data.currentRate ?? null)
-        setLedgerDailyRate(typeof data.dailyRate === "number" ? data.dailyRate : null)
-        setLedgerRows(Array.isArray(data.rows) ? data.rows : [])
-      } else {
-        setLedgerCurrentRate(null)
-        setLedgerDailyRate(null)
-        setLedgerRows([])
-        setLedgerError(data.error || "Failed to load ledger")
-      }
-    } catch (e) {
-      setLedgerError("Failed to load ledger")
-      setLedgerRows([])
-      setLedgerCurrentRate(null)
-      setLedgerDailyRate(null)
-    } finally {
-      setLedgerLoading(false)
-    }
-  }
+  useEffect(() => {
+    const len = walletSummary?.credits_detail?.length ?? 0
+    if (len > 0) setLedgerPage(1)
+  }, [walletSummary?.credits_detail?.length])
 
   const refreshStatus = async () => {
     if (userId == null) return
@@ -143,9 +121,11 @@ export function LiveStatus() {
       setLoading(true)
       setError(null)
       setWalletError(null)
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
       const [botRes, walletsRes] = await Promise.all([
-        fetch(`${API_BASE}/bot-stats/${userId}`),
-        fetch(`${API_BASE}/wallets/${userId}`),
+        fetch(`${API_BASE}/bot-stats/${userId}`, { credentials: "include", headers }),
+        fetch(`${API_BASE}/wallets/${userId}`, { credentials: "include", headers }),
       ])
       if (botRes.ok) {
         const data = await botRes.json()
@@ -162,19 +142,34 @@ export function LiveStatus() {
           per_currency_usd: wallets.per_currency_usd || {},
           lent_per_currency: wallets.lent_per_currency || {},
           offers_per_currency: wallets.offers_per_currency || {},
+          lent_per_currency_usd: wallets.lent_per_currency_usd || {},
+          offers_per_currency_usd: wallets.offers_per_currency_usd || {},
+          idle_per_currency_usd: wallets.idle_per_currency_usd || {},
           total_lent_usd: Number(wallets.total_lent_usd) ?? 0,
           total_offers_usd: Number(wallets.total_offers_usd) ?? 0,
           idle_usd: Number(wallets.idle_usd) ?? 0,
+          weighted_avg_apr_pct: Number(wallets.weighted_avg_apr_pct) ?? 0,
+          est_daily_earnings_usd: Number(wallets.est_daily_earnings_usd) ?? 0,
+          yield_over_total_pct: Number(wallets.yield_over_total_pct) ?? 0,
+          credits_count: Number(wallets.credits_count) ?? 0,
+          offers_count: Number(wallets.offers_count) ?? 0,
+          credits_detail: Array.isArray(wallets.credits_detail) ? wallets.credits_detail : [],
+          offers_detail: Array.isArray(wallets.offers_detail) ? wallets.offers_detail : [],
         })
         const src = walletsRes.headers.get("X-Data-Source")
         setWalletDataSource(src === "cache" ? "cache" : "live")
         setWalletRateLimited(walletsRes.headers.get("X-Rate-Limited") === "true")
         setWalletError(null)
       } else {
-        setWalletError(t("liveStatus.connectApiKeys"))
+        const incomplete = walletsRes.headers.get("X-Data-Incomplete") === "true"
+        const msg =
+          walletsRes.status === 503 || incomplete
+            ? t("liveStatus.dataIncomplete")
+            : t("liveStatus.connectApiKeys")
+        setWalletError(msg)
+        // Keep previous walletSummary so we don't flash wrong numbers
       }
       setRefreshCooldownUntil(Date.now() + REFRESH_COOLDOWN_SEC * 1000)
-      await fetchLedger()
     } catch (e) {
       console.error("Failed to fetch live status", e)
       setError(t("liveStatus.unableToLoad"))
@@ -194,19 +189,35 @@ export function LiveStatus() {
     refreshStatus()
   }, [userId])
 
-  useEffect(() => {
-    fetchLedger()
-  }, [])
 
   const handleStart = async () => {
     if (userId == null) return
     try {
       setIsStarting(true)
-      const res = await fetch(`${API_BASE}/start-bot/${userId}`, { method: "POST" })
+      setError(null)
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      const res = await fetch(`${API_BASE}/start-bot`, {
+        method: "POST",
+        credentials: "include",
+        headers,
+      })
       if (!res.ok) {
-        console.error("Start bot failed", await res.text())
+        const text = await res.text()
+        let msg: string
+        try {
+          const j = JSON.parse(text)
+          msg = j.detail || text
+        } catch {
+          msg = text || t("liveStatus.startFailed")
+        }
+        setError(msg || t("liveStatus.startFailed"))
       }
       await refreshStatus()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")
+      setError(isNetworkError ? t("dashboard.apiUnreachable") : msg)
     } finally {
       setIsStarting(false)
     }
@@ -216,11 +227,28 @@ export function LiveStatus() {
     if (userId == null) return
     try {
       setIsStopping(true)
-      const res = await fetch(`${API_BASE}/stop-bot/${userId}`, { method: "POST" })
+      setError(null)
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      const res = await fetch(`${API_BASE}/stop-bot`, {
+        method: "POST",
+        credentials: "include",
+        headers,
+      })
       if (!res.ok) {
-        console.error("Stop bot failed", await res.text())
+        const text = await res.text()
+        try {
+          const j = JSON.parse(text)
+          setError(j.detail || text)
+        } catch {
+          setError(text || "Stop failed")
+        }
       }
       await refreshStatus()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")
+      setError(isNetworkError ? t("dashboard.apiUnreachable") : msg)
     } finally {
       setIsStopping(false)
     }
@@ -231,8 +259,19 @@ export function LiveStatus() {
       <div className="flex flex-col gap-6">
         <h1 className="text-2xl font-bold text-foreground">{t("liveStatus.title")}</h1>
         <div className="rounded-xl border border-border bg-card p-8 text-center">
-          <p className="text-muted-foreground">{t("liveStatus.connectApiKeys")}</p>
-          <p className="mt-2 text-sm text-muted-foreground">Sign in to see your lending data.</p>
+          {apiError ? (
+            <>
+              <p className="text-muted-foreground">{t("dashboard.apiUnreachable")}</p>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Check NEXT_PUBLIC_API_BASE and ensure the backend is running, then refresh.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-muted-foreground">{t("liveStatus.connectApiKeys")}</p>
+              <p className="mt-2 text-sm text-muted-foreground">Sign in to see your lending data.</p>
+            </>
+          )}
         </div>
       </div>
     )
@@ -263,22 +302,32 @@ export function LiveStatus() {
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
             {refreshCooldownSec > 0 ? t("liveStatus.refreshIn", { n: refreshCooldownSec }) : t("liveStatus.refresh")}
           </button>
-          <button
-            onClick={handleStart}
-            disabled={isStarting}
-            className="rounded-lg bg-emerald px-3 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald-dark disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-          >
-            {isStarting ? t("liveStatus.starting") : t("liveStatus.startBot")}
-          </button>
-          <button
-            onClick={handleStop}
-            disabled={isStopping}
-            className="rounded-lg bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground hover:bg-destructive/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-          >
-            {isStopping ? t("liveStatus.stopping") : t("liveStatus.stopBot")}
-          </button>
+          {!botActive && (
+            <button
+              onClick={handleStart}
+              disabled={isStarting}
+              className="rounded-lg bg-emerald px-3 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+            >
+              {isStarting ? t("liveStatus.starting") : t("liveStatus.startBot")}
+            </button>
+          )}
+          {botActive && (
+            <button
+              onClick={handleStop}
+              disabled={isStopping}
+              className="rounded-lg bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground hover:bg-destructive/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+            >
+              {isStopping ? t("liveStatus.stopping") : t("liveStatus.stopBot")}
+            </button>
+          )}
         </div>
       </div>
+
+      {error && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {error}
+        </div>
+      )}
 
       {/* Tab */}
       <div>
@@ -302,11 +351,11 @@ export function LiveStatus() {
           </div>
           <div className="mt-3">
             <span className="text-3xl font-bold text-foreground">
-              {loading && walletSummary === null && !walletError ? "…" : walletError ? "—" : `$${(walletSummary?.total_usd_all ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_usd_all ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
             </span>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            {walletError ?? (walletSummary ? t("liveStatus.totalUsdValue") : t("liveStatus.loading"))}
+            {walletError ?? (walletSummary ? t("liveStatus.totalUsdValue") : loading ? t("liveStatus.loading") : "—")}
             {walletDataSource === "cache" && !walletError && (
               <span className="ml-1 text-muted-foreground"> · {t("liveStatus.dataCached")}</span>
             )}
@@ -327,7 +376,7 @@ export function LiveStatus() {
           </div>
           <div className="mt-3">
             <span className="text-3xl font-bold text-foreground">
-              {loading && walletSummary == null && totalAssets === null ? "…" : `$${(walletSummary?.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
             </span>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
@@ -336,34 +385,80 @@ export function LiveStatus() {
         </div>
       </div>
 
-      {/* Currently Lent Out per currency (from Bitfinex) */}
-      {walletSummary?.lent_per_currency && Object.keys(walletSummary.lent_per_currency).length > 0 && (
-        <div className="rounded-xl border border-border bg-card p-5">
-          <h3 className="text-sm font-semibold text-foreground mb-3">{t("liveStatus.currentlyLentOut")}</h3>
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs" role="table">
-              <thead>
-                <tr className="border-b border-border text-muted-foreground">
-                  <th className="py-2 pr-4 font-medium">Currency</th>
-                  <th className="py-2 text-right font-medium">Amount lent</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(walletSummary.lent_per_currency)
-                  .filter(([, amount]) => Number(amount) !== 0)
-                  .map(([currency, amount]) => (
-                    <tr key={currency} className="border-b border-border/50">
-                      <td className="py-2.5 pr-4 font-medium text-foreground">{currency}</td>
-                      <td className="py-2.5 text-right font-mono text-foreground">
-                        {Number(amount).toLocaleString(undefined, { maximumFractionDigits: 4 })}
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
+      {/* Currently Lent Out: bar per currency (Amount lent | Pending | Idle); hide if total USD < 1 (incl. BTC, ETH, XRP) */}
+      {walletSummary && (() => {
+        const lentUsd = walletSummary.lent_per_currency_usd ?? {}
+        const offersUsd = walletSummary.offers_per_currency_usd ?? {}
+        const idleUsd = walletSummary.idle_per_currency_usd ?? {}
+        const MIN_DISPLAY_USD = 1
+        const currencies = Array.from(new Set([
+          ...Object.keys(walletSummary.per_currency_usd ?? {}),
+          ...Object.keys(lentUsd),
+          ...Object.keys(offersUsd),
+        ]))
+          .filter((c) => {
+            const total = (lentUsd[c] ?? 0) + (offersUsd[c] ?? 0) + (idleUsd[c] ?? 0)
+            return total >= MIN_DISPLAY_USD
+          })
+          .sort()
+        if (currencies.length === 0) return null
+        return (
+          <div className="rounded-xl border border-border bg-card p-5">
+            <h3 className="text-sm font-semibold text-foreground mb-3">{t("liveStatus.currentlyLentOut")}</h3>
+            <p className="text-xs text-muted-foreground mb-4">{t("liveStatus.capitalDeploymentOverview")}</p>
+            <div className="space-y-4">
+              {currencies.map((currency) => {
+                const lent = lentUsd[currency] ?? 0
+                const offers = offersUsd[currency] ?? 0
+                const idle = idleUsd[currency] ?? 0
+                const total = lent + offers + idle
+                const pct = (v: number) => (total > 0 ? (100 * v) / total : 0)
+                return (
+                  <div key={currency} className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-medium text-foreground">{currency}</span>
+                      <span className="text-muted-foreground">
+                        ${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} total
+                      </span>
+                    </div>
+                    <div className="h-3 w-full rounded-full bg-secondary overflow-hidden flex">
+                      <div
+                        className="h-full bg-emerald transition-all"
+                        style={{ width: `${Math.min(100, pct(lent))}%` }}
+                        title={`Amount lent: $${lent.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
+                      />
+                      <div
+                        className="h-full bg-amber-500/80 transition-all"
+                        style={{ width: `${Math.min(100, pct(offers))}%` }}
+                        title={`Pending: $${offers.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
+                      />
+                      <div
+                        className="h-full bg-muted-foreground/50 transition-all"
+                        style={{ width: `${Math.min(100, pct(idle))}%` }}
+                        title={`Idle: $${idle.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted-foreground">
+                      <span className="flex items-center gap-1.5">
+                        <span className="h-1.5 w-3 rounded-full bg-emerald" />
+                        {t("liveStatus.earning")}: ${lent.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="h-1.5 w-3 rounded-full bg-amber-500/80" />
+                        {t("liveStatus.inOrderBook")}: ${offers.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="h-1.5 w-3 rounded-full bg-muted-foreground/50" />
+                        {t("liveStatus.idleFunds")}: ${idle.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* Portfolio Allocation (after currency lend out) */}
       <div className="rounded-xl border border-border bg-card p-5">
@@ -374,10 +469,10 @@ export function LiveStatus() {
         <p className="text-xs text-muted-foreground mb-4">{t("liveStatus.capitalDeploymentOverview")}</p>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <span className="text-xl font-bold text-emerald">
-            ${(walletSummary?.total_usd_all ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_usd_all ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
           </span>
-          <span className="text-xs text-muted-foreground">100.0% Active</span>
-          <span className="text-xs text-muted-foreground">100.0% deployed</span>
+          <span className="text-xs text-muted-foreground">{walletSummary ? "100.0% Active" : "—"}</span>
+          <span className="text-xs text-muted-foreground">{walletSummary ? "100.0% deployed" : "—"}</span>
         </div>
         <div className="mb-4">
           <div className="flex justify-between text-xs text-muted-foreground mb-1.5">
@@ -387,9 +482,9 @@ export function LiveStatus() {
             <div
               className="h-full bg-emerald transition-all"
               style={{
-                width: `${(() => {
-                  const lent = walletSummary?.total_lent_usd ?? totalAssets ?? 0
-                  const total = walletSummary?.total_usd_all ?? 0
+                width: `${!walletSummary ? 0 : (() => {
+                  const lent = walletSummary.total_lent_usd ?? totalAssets ?? 0
+                  const total = walletSummary.total_usd_all ?? 0
                   return total > 0 ? Math.min(100, (100 * lent) / total) : 0
                 })()}%`,
               }}
@@ -397,9 +492,9 @@ export function LiveStatus() {
             <div
               className="h-full bg-amber-500/80 transition-all"
               style={{
-                width: `${(() => {
-                  const offers = walletSummary?.total_offers_usd ?? 0
-                  const total = walletSummary?.total_usd_all ?? 0
+                width: `${!walletSummary ? 0 : (() => {
+                  const offers = walletSummary.total_offers_usd ?? 0
+                  const total = walletSummary.total_usd_all ?? 0
                   return total > 0 ? Math.min(100, (100 * offers) / total) : 0
                 })()}%`,
               }}
@@ -407,9 +502,9 @@ export function LiveStatus() {
             <div
               className="h-full bg-muted-foreground/50 transition-all"
               style={{
-                width: `${(() => {
-                  const idle = walletSummary?.idle_usd ?? 0
-                  const total = walletSummary?.total_usd_all ?? 0
+                width: `${!walletSummary ? 0 : (() => {
+                  const idle = walletSummary.idle_usd ?? 0
+                  const total = walletSummary.total_usd_all ?? 0
                   return total > 0 ? Math.min(100, (100 * idle) / total) : 0
                 })()}%`,
               }}
@@ -437,12 +532,12 @@ export function LiveStatus() {
               <Activity className="h-4 w-4 text-emerald" />
             </div>
             <p className="mt-2 text-xl font-bold text-foreground">
-              ${(walletSummary?.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
             </p>
             <p className="text-xs text-emerald">
               {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
-                ? `${(((walletSummary?.total_lent_usd ?? totalAssets ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : "0.0%"}
+                ? `${(((walletSummary.total_lent_usd ?? totalAssets ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : walletSummary ? "0.0%" : "—"}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.returnGenerating")}</p>
           </div>
@@ -452,12 +547,12 @@ export function LiveStatus() {
               <Clock className="h-4 w-4 text-amber-500" />
             </div>
             <p className="mt-2 text-xl font-bold text-foreground">
-              ${(walletSummary?.total_offers_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_offers_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
             </p>
             <p className="text-xs text-amber-500">
               {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
-                ? `${(((walletSummary?.total_offers_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : "0.0%"}
+                ? `${(((walletSummary.total_offers_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : walletSummary ? "0.0%" : "—"}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.inOrderBook")}</p>
           </div>
@@ -467,48 +562,131 @@ export function LiveStatus() {
               <Moon className="h-4 w-4 text-muted-foreground" />
             </div>
             <p className="mt-2 text-xl font-bold text-foreground">
-              ${(walletSummary?.idle_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.idle_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
             </p>
             <p className="text-xs text-muted-foreground">
               {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
-                ? `${(((walletSummary?.idle_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : "0.0%"}
+                ? `${(((walletSummary.idle_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : walletSummary ? "0.0%" : "—"}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.cashDrag")}</p>
           </div>
         </div>
       </div>
 
-      {/* Performance (key metrics) */}
+      {/* Performance (key metrics) — only when we have full wallet data */}
+      {walletSummary && (
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="flex items-center gap-2 mb-4">
           <TrendingUp className="h-5 w-5 text-amber-500" />
           <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.performance")}</h3>
         </div>
         <p className="text-xs text-muted-foreground mb-4">{t("liveStatus.keyMetrics")}</p>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="rounded-xl border border-border bg-secondary/20 p-4">
             <p className="text-xs font-medium text-muted-foreground">{t("liveStatus.estDailyEarnings")}</p>
-            <p className="mt-2 text-xl font-bold text-emerald">$44.03</p>
+            <p className="mt-2 text-xl font-bold text-emerald">
+              {!walletSummary ? "—" : `$${(walletSummary.est_daily_earnings_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            </p>
             <p className="text-xs text-muted-foreground">{t("liveStatus.basedOnCurrentRates")}</p>
           </div>
           <div className="rounded-xl border border-border bg-secondary/20 p-4">
             <p className="text-xs font-medium text-muted-foreground">{t("liveStatus.weightedAvgApr")}</p>
-            <p className="mt-2 text-xl font-bold text-blue-400">14.34%</p>
+            <p className="mt-2 text-xl font-bold text-blue-400">
+              {!walletSummary ? "—" : `${(walletSummary.weighted_avg_apr_pct ?? 0).toFixed(2)}%`}
+            </p>
             <p className="text-xs text-muted-foreground">{t("liveStatus.acrossAllActiveLending")}</p>
+          </div>
+          <div className="rounded-xl border border-border bg-secondary/20 p-4">
+            <p className="text-xs font-medium text-muted-foreground">{t("liveStatus.yieldOverTotal")}</p>
+            <p className="mt-2 text-xl font-bold text-foreground">
+              {!walletSummary ? "—" : `${(walletSummary.yield_over_total_pct ?? 0).toFixed(2)}%`}
+            </p>
+            <p className="text-xs text-muted-foreground">{t("liveStatus.yieldOverTotalDesc")}</p>
           </div>
           <div className="rounded-xl border border-border bg-secondary/20 p-4">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.activeOrders")}</span>
               <Clock className="h-4 w-4 text-muted-foreground" />
             </div>
-            <p className="mt-2 text-xl font-bold text-foreground">54</p>
-            <p className="text-xs text-muted-foreground">{t("liveStatus.pendingExecution")}</p>
+            <p className="mt-2 text-xl font-bold text-foreground">
+              {!walletSummary ? "—" : String(walletSummary.credits_count ?? 0)}
+            </p>
+            <p className="text-xs text-muted-foreground">{t("liveStatus.activeLendingPositions")}</p>
           </div>
         </div>
       </div>
+      )}
 
-      {/* 24h Lending Chart */}
+      {/* Personal Lending Ledger (active positions, 10 per page) — same wallet data, no extra API */}
+      {walletSummary && (walletSummary.credits_detail?.length ?? 0) > 0 && (() => {
+        const PER_PAGE = 10
+        const list = walletSummary.credits_detail ?? []
+        const totalPages = Math.max(1, Math.ceil(list.length / PER_PAGE))
+        const page = Math.min(ledgerPage, totalPages)
+        const start = (page - 1) * PER_PAGE
+        const slice = list.slice(start, start + PER_PAGE)
+        return (
+          <div className="rounded-xl border border-border bg-card p-5">
+            <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.personalLendingLedger")}</h3>
+            <p className="text-xs text-muted-foreground mt-1">{t("liveStatus.personalLendingLedgerDesc")}</p>
+            <div className="overflow-x-auto mt-4">
+              <table className="w-full text-left text-xs" role="table">
+                <thead>
+                  <tr className="border-b border-border text-muted-foreground">
+                    <th className="py-2 pr-2 font-medium">#</th>
+                    <th className="py-2 font-medium">Symbol</th>
+                    <th className="py-2 font-medium text-right">Amount</th>
+                    <th className="py-2 font-medium text-right">Amount (USD)</th>
+                    <th className="py-2 font-medium text-right">Rate (APR %)</th>
+                    <th className="py-2 font-medium text-right">Period (d)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {slice.map((row, i) => (
+                    <tr key={row.id} className="border-b border-border/50">
+                      <td className="py-2 pr-2 font-mono text-muted-foreground">{start + i + 1}</td>
+                      <td className="py-2 font-medium text-foreground">{row.symbol}</td>
+                      <td className="py-2 text-right font-mono text-foreground">{row.amount.toLocaleString(undefined, { maximumFractionDigits: 6 })}</td>
+                      <td className="py-2 text-right font-mono text-foreground">${row.amount_usd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                      <td className="py-2 text-right font-mono text-emerald">{((row.rate * 365) * 100).toFixed(2)}%</td>
+                      <td className="py-2 text-right font-mono text-muted-foreground">{row.period}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between mt-3 text-xs text-muted-foreground">
+                <span>
+                  {start + 1}–{Math.min(start + PER_PAGE, list.length)} of {list.length}
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setLedgerPage((p) => Math.max(1, p - 1))}
+                    disabled={page <= 1}
+                    className="rounded border border-border px-2 py-1 hover:bg-secondary/50 disabled:opacity-50"
+                  >
+                    Previous
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLedgerPage((p) => Math.min(totalPages, p + 1))}
+                    disabled={page >= totalPages}
+                    className="rounded border border-border px-2 py-1 hover:bg-secondary/50 disabled:opacity-50"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })()}
+
+      {/* 24h Lending Record: hide when user has no meaningful exposure (< $1 total) */}
+      {walletSummary && (walletSummary.total_usd_all ?? 0) >= 1 && (
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-4">
           <h3 className="text-sm font-semibold text-foreground">24h Lending Record</h3>
@@ -556,67 +734,7 @@ export function LiveStatus() {
           </span>
         </div>
       </div>
-
-      {/* Lending Ledger Table */}
-      <div className="rounded-xl border border-border bg-card">
-        <div className="border-b border-border p-5">
-          <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.bitfinexLendingLedger")}</h3>
-          <p className="text-xs text-muted-foreground">{t("liveStatus.lendingLedgerDesc")}</p>
-        </div>
-
-        {/* Current Rate Card — from Bitfinex funding stats */}
-        <div className="m-5 rounded-xl bg-emerald/10 border border-emerald/20 p-5">
-          <p className="text-xs text-muted-foreground">{t("liveStatus.currentAnnualRate")}</p>
-          <p className="text-3xl font-bold text-emerald mt-1">
-            {ledgerLoading ? "…" : ledgerCurrentRate ?? "—"}
-          </p>
-          <p className="text-xs text-muted-foreground mt-1">
-            {t("liveStatus.dailyRate")} {ledgerLoading ? "…" : ledgerDailyRate != null ? ledgerDailyRate.toFixed(6) : "—"}
-          </p>
-        </div>
-
-        {ledgerError && (
-          <p className="mx-5 mb-2 text-xs text-amber-600 dark:text-amber-400">{ledgerError}</p>
-        )}
-
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs" role="table">
-            <thead>
-              <tr className="border-b border-border text-xs uppercase text-muted-foreground">
-                <th className="px-5 py-3 font-medium">{t("liveStatus.time")}</th>
-                <th className="px-5 py-3 font-medium">{t("liveStatus.rateRange")}</th>
-                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">{t("liveStatus.maxDays")}</th>
-                <th className="hidden px-5 py-3 font-medium text-right md:table-cell">{t("liveStatus.cumulative")}</th>
-                <th className="px-5 py-3 font-medium text-right">{t("liveStatus.rate")}</th>
-                <th className="hidden px-5 py-3 font-medium text-right lg:table-cell">{t("liveStatus.amount")}</th>
-                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">{t("liveStatus.count")}</th>
-                <th className="px-5 py-3 font-medium text-right">{t("liveStatus.totalCol")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {ledgerRows.length === 0 && !ledgerLoading && (
-                <tr>
-                  <td colSpan={8} className="px-5 py-6 text-center text-muted-foreground">
-                    {ledgerError ? ledgerError : t("dashboard.noDataYet")}
-                  </td>
-                </tr>
-              )}
-              {ledgerRows.map((row, i) => (
-                <tr key={i} className="border-b border-border/50 transition-colors hover:bg-secondary/30">
-                  <td className="px-5 py-3 font-mono text-foreground">{row.time}</td>
-                  <td className="px-5 py-3 font-mono text-muted-foreground">{row.rateRange}</td>
-                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground sm:table-cell">{row.maxDays}</td>
-                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground md:table-cell">{row.cumulative}</td>
-                  <td className="px-5 py-3 text-right font-bold font-mono text-emerald">{row.rate}</td>
-                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground lg:table-cell">{row.amount}</td>
-                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground sm:table-cell">{row.count}</td>
-                  <td className="px-5 py-3 text-right font-mono text-foreground">{row.total}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      )}
     </div>
   )
 }

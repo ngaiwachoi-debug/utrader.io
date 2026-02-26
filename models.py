@@ -95,3 +95,34 @@ class PerformanceLog(Base):
     total_assets = Column(Float)
 
     user = relationship("User", back_populates="logs")
+
+
+class UserProfitSnapshot(Base):
+    """
+    Last computed Gross Profit / Net Earnings from lending trade history (since registration).
+    Updated when /stats/{user_id}/lending is computed; used for token balance without extra API.
+    """
+
+    __tablename__ = "user_profit_snapshot"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    gross_profit_usd = Column(Float, default=0.0)
+    net_profit_usd = Column(Float, default=0.0)
+    bitfinex_fee_usd = Column(Float, default=0.0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserTokenBalance(Base):
+    """
+    Token credit balance (Cursor-style). 0.1 USD gross profit = 1 token used.
+    Initial credit: 100 (free), 1500 (Pro), 9000 (AI Ultra), 40000 (Whales).
+    purchased_tokens: extra tokens from custom USD purchase (1 USD = 100 tokens).
+    """
+
+    __tablename__ = "user_token_balance"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    tokens_remaining = Column(Float, default=0.0)
+    last_gross_usd_used = Column(Float, default=0.0)  # gross_profit_usd at last token calc
+    purchased_tokens = Column(Float, default=0.0)  # tokens bought via Add tokens (1 USD = 100)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

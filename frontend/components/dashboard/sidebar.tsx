@@ -14,6 +14,7 @@ import {
   User,
   BarChart3,
   CreditCard,
+  Terminal,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useT } from "@/lib/i18n"
@@ -34,6 +35,7 @@ const navItems = [
   { id: "market-status", labelKey: "sidebar.marketStatus", icon: BarChart3 },
   { id: "true-roi", labelKey: "sidebar.trueRoi", icon: TrendingUp },
   { id: "subscription", labelKey: "sidebar.subscription", icon: CreditCard },
+  { id: "terminal", labelKey: "sidebar.terminal", icon: Terminal },
   { id: "settings", labelKey: "sidebar.settings", icon: Settings },
 ]
 

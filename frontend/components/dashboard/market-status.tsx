@@ -1,7 +1,23 @@
 "use client"
 
+import { useEffect, useState } from "react"
 import { useT } from "@/lib/i18n"
-import { BarChart3, TrendingUp, DollarSign, PieChart, Activity } from "lucide-react"
+import { BarChart3, TrendingUp, DollarSign, PieChart, Activity, BookOpen } from "lucide-react"
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+
+type FundingSymbolOption = { value: string; label: string }
+
+type LendingLedgerRow = {
+  time: string
+  rateRange: string
+  maxDays: number
+  cumulative: string
+  rate: string
+  amount: string
+  count: number
+  total: string
+}
 
 const marketData = [
   { currency: "USD", rate: "2.63%", dailyChange: "-84.14%", volume: "$701,154,043" },
@@ -18,6 +34,53 @@ const marketData = [
 
 export function MarketStatus() {
   const t = useT()
+  const [ledgerSymbols, setLedgerSymbols] = useState<FundingSymbolOption[]>([])
+  const [ledgerSymbol, setLedgerSymbol] = useState<string>("fUSD")
+  const [ledgerCurrentRate, setLedgerCurrentRate] = useState<string | null>(null)
+  const [ledgerDailyRate, setLedgerDailyRate] = useState<number | null>(null)
+  const [ledgerRows, setLedgerRows] = useState<LendingLedgerRow[]>([])
+  const [ledgerLoading, setLedgerLoading] = useState(false)
+  const [ledgerError, setLedgerError] = useState<string | null>(null)
+
+  const fetchLedger = async (symbol: string) => {
+    try {
+      setLedgerLoading(true)
+      setLedgerError(null)
+      const res = await fetch(`${API_BASE}/api/funding-ledger?symbol=${encodeURIComponent(symbol)}`)
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.rows) {
+        setLedgerCurrentRate(data.currentRate ?? null)
+        setLedgerDailyRate(typeof data.dailyRate === "number" ? data.dailyRate : null)
+        setLedgerRows(Array.isArray(data.rows) ? data.rows : [])
+      } else {
+        setLedgerCurrentRate(null)
+        setLedgerDailyRate(null)
+        setLedgerRows([])
+        setLedgerError(data.error || "Failed to load ledger")
+      }
+    } catch {
+      setLedgerError("Failed to load ledger")
+      setLedgerRows([])
+      setLedgerCurrentRate(null)
+      setLedgerDailyRate(null)
+    } finally {
+      setLedgerLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/funding-symbols`)
+      .then((res) => res.json())
+      .then((data: FundingSymbolOption[]) => {
+        if (Array.isArray(data) && data.length > 0) setLedgerSymbols(data)
+        else setLedgerSymbols([{ value: "fUSD", label: "USD" }, { value: "fUST", label: "USDt" }, { value: "fBTC", label: "BTC" }, { value: "fETH", label: "ETH" }, { value: "fXRP", label: "XRP" }])
+      })
+      .catch(() => setLedgerSymbols([{ value: "fUSD", label: "USD" }, { value: "fUST", label: "USDt" }, { value: "fBTC", label: "BTC" }, { value: "fETH", label: "ETH" }, { value: "fXRP", label: "XRP" }]))
+  }, [])
+
+  useEffect(() => {
+    fetchLedger(ledgerSymbol)
+  }, [ledgerSymbol])
 
   return (
     <div className="flex flex-col gap-6">
@@ -101,6 +164,80 @@ export function MarketStatus() {
               <span className="text-right font-mono text-muted-foreground">{item.volume}</span>
             </div>
           ))}
+        </div>
+      </div>
+
+      {/* Lending Ledger (market data): symbol selector + rate + 24h history */}
+      <div className="rounded-xl border border-border bg-card">
+        <div className="border-b border-border p-4">
+          <div className="flex items-center gap-2">
+            <BookOpen className="h-4 w-4 text-emerald" />
+            <h3 className="text-sm font-semibold text-foreground">{t("marketStatus.lendingLedger")}</h3>
+          </div>
+          <p className="text-xs text-muted-foreground mt-1">{t("liveStatus.lendingLedgerDesc")}</p>
+          <div className="mt-3">
+            <label htmlFor="ledger-currency" className="sr-only">{t("marketStatus.selectCurrency")}</label>
+            <select
+              id="ledger-currency"
+              value={ledgerSymbol}
+              onChange={(e) => setLedgerSymbol(e.target.value)}
+              className="rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground focus:outline-none focus:ring-2 focus:ring-emerald/50"
+            >
+              {ledgerSymbols.length === 0 && <option value="fUSD">USD</option>}
+              {ledgerSymbols.map(({ value, label }) => (
+                <option key={value} value={value}>{label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className="m-5 rounded-xl bg-emerald/10 border border-emerald/20 p-5">
+          <p className="text-xs text-muted-foreground">{t("liveStatus.currentAnnualRate")}</p>
+          <p className="text-3xl font-bold text-emerald mt-1">
+            {ledgerLoading ? "…" : ledgerCurrentRate ?? "—"}
+          </p>
+          <p className="text-xs text-muted-foreground mt-1">
+            {t("liveStatus.dailyRate")} {ledgerLoading ? "…" : ledgerDailyRate != null ? ledgerDailyRate.toFixed(6) : "—"}
+          </p>
+        </div>
+        {ledgerError && (
+          <p className="mx-5 mb-2 text-xs text-amber-600 dark:text-amber-400">{ledgerError}</p>
+        )}
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs" role="table">
+            <thead>
+              <tr className="border-b border-border text-xs uppercase text-muted-foreground">
+                <th className="px-5 py-3 font-medium">{t("liveStatus.time")}</th>
+                <th className="px-5 py-3 font-medium">{t("liveStatus.rateRange")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">{t("liveStatus.maxDays")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right md:table-cell">{t("liveStatus.cumulative")}</th>
+                <th className="px-5 py-3 font-medium text-right">{t("liveStatus.rate")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right lg:table-cell">{t("liveStatus.amount")}</th>
+                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">{t("liveStatus.count")}</th>
+                <th className="px-5 py-3 font-medium text-right">{t("liveStatus.totalCol")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {ledgerRows.length === 0 && !ledgerLoading && (
+                <tr>
+                  <td colSpan={8} className="px-5 py-6 text-center text-muted-foreground">
+                    {ledgerError ? ledgerError : t("dashboard.noDataYet")}
+                  </td>
+                </tr>
+              )}
+              {ledgerRows.map((row, i) => (
+                <tr key={i} className="border-b border-border/50 transition-colors hover:bg-secondary/30">
+                  <td className="px-5 py-3 font-mono text-foreground">{row.time}</td>
+                  <td className="px-5 py-3 font-mono text-muted-foreground">{row.rateRange}</td>
+                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground sm:table-cell">{row.maxDays}</td>
+                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground md:table-cell">{row.cumulative}</td>
+                  <td className="px-5 py-3 text-right font-bold font-mono text-emerald">{row.rate}</td>
+                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground lg:table-cell">{row.amount}</td>
+                  <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground sm:table-cell">{row.count}</td>
+                  <td className="px-5 py-3 text-right font-mono text-foreground">{row.total}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>

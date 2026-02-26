@@ -16,6 +16,25 @@ import requests
 BASE_URL = "https://api.bitfinex.com"
 TICKERS_URL = "https://api.bitfinex.com/v2/tickers"
 FUNDING_STATS_URL = "https://api-pub.bitfinex.com/v2/funding/stats"
+CONF_URL = "https://api-pub.bitfinex.com/v2/conf"
+
+
+def _get_currency_list_sync() -> Tuple[Optional[list], Optional[str]]:
+    """Public GET conf/pub:list:currency. Returns (list of currency codes e.g. ['USD','BTC'], error)."""
+    url = f"{CONF_URL}/pub:list:currency"
+    try:
+        response = requests.get(url, timeout=15)
+        if response.status_code != 200:
+            return None, f"HTTP {response.status_code}"
+        data = response.json()
+        if not isinstance(data, list) or not data:
+            return None, "Invalid currency list response"
+        inner = data[0] if isinstance(data[0], list) else data
+        if not isinstance(inner, list):
+            return None, "Invalid currency list format"
+        return inner, None
+    except Exception as e:
+        return None, str(e)
 
 
 def _get_funding_stats_sync(symbol: str = "fUSD", limit: int = 24) -> Tuple[Optional[list], Optional[str]]:
@@ -128,7 +147,7 @@ class BitfinexManager:
         end_ms: Optional[int] = None,
         limit: int = 500,
     ) -> Tuple[Optional[Any], Optional[str]]:
-        """POST v2/auth/r/funding/trades/hist. Optional start/end (ms), limit."""
+        """POST v2/auth/r/funding/trades/hist — repaid lending trades (all symbols). Same as GET funding trades data. Optional start/end (ms), limit."""
         payload: Dict[str, Any] = {"limit": limit}
         if start_ms is not None:
             payload["start"] = start_ms

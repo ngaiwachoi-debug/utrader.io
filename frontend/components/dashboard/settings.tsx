@@ -29,6 +29,7 @@ import {
   CheckCircle,
 } from "lucide-react"
 import { useCurrentUserId } from "@/lib/current-user-context"
+import { getBackendToken } from "@/lib/auth"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 
@@ -50,7 +51,9 @@ export function SettingsPage() {
   const [planName, setPlanName] = useState<string>("Expert Plan")
   const [lendingLimit, setLendingLimit] = useState<number>(250000)
   const [rebalanceMinutes, setRebalanceMinutes] = useState<number>(3)
-  const [trialRemainingDays, setTrialRemainingDays] = useState<number | null>(null)
+  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
+  const [tokensUsed, setTokensUsed] = useState<number | null>(null)
+  const [initialTokenCredit, setInitialTokenCredit] = useState<number | null>(null)
   const [usedAmount, setUsedAmount] = useState<number>(0)
 
   useEffect(() => {
@@ -64,7 +67,9 @@ export function SettingsPage() {
     }
     const fetchUserStatus = async () => {
       try {
-        const res = await fetch(`${API_BASE}/user-status/${userId}`)
+        const token = await getBackendToken()
+        const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+        const res = await fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers })
         if (!res.ok) return
         const data = await res.json()
 
@@ -77,7 +82,12 @@ export function SettingsPage() {
 
         setLendingLimit(Number(data.lending_limit) ?? 0)
         setRebalanceMinutes(Number(data.rebalance_interval) ?? 0)
-        setTrialRemainingDays(typeof data.trial_remaining_days === "number" ? data.trial_remaining_days : null)
+        const tr = data.tokens_remaining
+        setTokensRemaining(typeof tr === "number" ? tr : tr != null ? Number(tr) : null)
+        const tu = data.tokens_used
+        setTokensUsed(typeof tu === "number" ? tu : tu != null ? Number(tu) : null)
+        const itc = data.initial_token_credit
+        setInitialTokenCredit(typeof itc === "number" ? itc : itc != null ? Number(itc) : null)
         setUsedAmount(Number(data.used_amount) ?? 0)
       } catch (e) {
         console.error("Failed to fetch user status", e)
@@ -126,7 +136,7 @@ export function SettingsPage() {
         )}
 
         {/* Plan Details */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3 mb-6">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 mb-6">
           <div className="flex items-center gap-3">
             <DollarSign className="h-4 w-4 text-muted-foreground" />
             <div>
@@ -144,15 +154,28 @@ export function SettingsPage() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <BarChart3 className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs font-semibold text-foreground">{t("settings.tokenUsage")}</p>
+              <p className="text-xs text-muted-foreground">
+                {tokensUsed != null ? `${tokensUsed} tokens used` : "—"}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
             <Calendar className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-xs font-semibold text-foreground">{t("settings.trialRemaining")}</p>
+              <p className="text-xs font-semibold text-foreground">{t("settings.tokensRemaining")}</p>
               <p className="text-xs text-muted-foreground">
-                {trialRemainingDays !== null ? `${trialRemainingDays} ${t("settings.days")}` : "—"}
+                {tokensRemaining != null ? `${Math.round(tokensRemaining)} tokens` : "—"}
               </p>
             </div>
           </div>
         </div>
+
+        <p className="text-xs text-muted-foreground mb-4 max-w-xl">
+          {t("settings.tokenUsageExplanation")}
+        </p>
 
         {/* Lending Usage */}
         <div>
@@ -463,6 +486,26 @@ function ApiKeysTab({
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
+        // Auto-start bot after connecting API keys so Terminal shows output
+        if (userId != null) {
+          try {
+            const startRes = await fetch(`${API_BASE}/start-bot`, {
+              method: "POST",
+              credentials: "include",
+              headers: { Authorization: `Bearer ${token}` },
+            })
+            if (startRes.ok) {
+              toast.info("Bot is starting", { description: "Open the Terminal tab to see live output (updates every 10s)." })
+            } else {
+              const errData = await startRes.json().catch(() => ({}))
+              const msg = errData.detail || "Could not start bot."
+              if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
+              else if (startRes.status === 402) toast.warning("Bot not started", { description: msg })
+            }
+          } catch {
+            // ignore network errors for start-bot; user can start from Live Status
+          }
+        }
       } else if (allowDev && userId != null) {
         const res = await fetch(`${API_BASE}/connect-exchange/by-user`, {
           method: "POST",
@@ -493,6 +536,20 @@ function ApiKeysTab({
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
+        // Auto-start bot after connecting API keys (dev path) so Terminal shows output
+        try {
+          const startRes = await fetch(`${API_BASE}/start-bot/${userId}`, { method: "POST", credentials: "include" })
+          if (startRes.ok) {
+            toast.info("Bot is starting", { description: "Open the Terminal tab to see live output (updates every 10s)." })
+          } else {
+            const errData = await startRes.json().catch(() => ({}))
+            const msg = errData.detail || "Could not start bot."
+            if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
+            else if (startRes.status === 402) toast.warning("Bot not started", { description: msg })
+          }
+        } catch {
+          // ignore; user can start from Live Status
+        }
       } else {
         setMessage({
           type: "error",
