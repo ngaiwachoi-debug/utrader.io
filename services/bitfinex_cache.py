@@ -79,6 +79,14 @@ async def set_cached(user_id: int, endpoint: str, data: Any) -> None:
         }
 
 
+async def invalidate(user_id: int, endpoint: str) -> None:
+    """Remove cached data for this user/endpoint so the next request hits Bitfinex."""
+    async with _lock:
+        key = _cache_key(user_id, endpoint)
+        if key in _cache:
+            del _cache[key]
+
+
 async def set_rate_limit_cooldown(user_id: int, endpoint: str) -> None:
     """Call when Bitfinex returns ERR_RATE_LIMIT; keep existing cache and set cooldown."""
     async with _lock:
