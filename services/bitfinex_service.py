@@ -15,6 +15,22 @@ import requests
 
 BASE_URL = "https://api.bitfinex.com"
 TICKERS_URL = "https://api.bitfinex.com/v2/tickers"
+FUNDING_STATS_URL = "https://api-pub.bitfinex.com/v2/funding/stats"
+
+
+def _get_funding_stats_sync(symbol: str = "fUSD", limit: int = 24) -> Tuple[Optional[list], Optional[str]]:
+    """Public GET funding/stats/{symbol}/hist. Returns (list of rows, error). No auth."""
+    url = f"{FUNDING_STATS_URL}/{symbol}/hist?limit={limit}"
+    try:
+        response = requests.get(url, timeout=15)
+        if response.status_code != 200:
+            return None, f"HTTP {response.status_code}"
+        data = response.json()
+        if not isinstance(data, list):
+            return None, "Invalid funding stats response"
+        return data, None
+    except Exception as e:
+        return None, str(e)
 
 
 def _get_tickers_sync(symbols: list[str]) -> Tuple[Optional[list], Optional[str]]:

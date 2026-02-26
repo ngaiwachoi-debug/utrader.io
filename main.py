@@ -872,6 +872,72 @@ async def get_lending_stats(
     return result
 
 
+# --- Bitfinex Public Funding Ledger (no auth) ---
+def _parse_funding_stats_row(row: Any) -> Optional[Dict[str, Any]]:
+    """Parse one row from Bitfinex funding/stats/hist. [MTS, _, _, FRR, AVG_PERIOD, _, _, FUNDING_AMOUNT, FUNDING_AMOUNT_USED, ...]"""
+    if not isinstance(row, (list, tuple)) or len(row) < 9:
+        return None
+    try:
+        mts = int(row[0]) if row[0] is not None else 0
+        frr = float(row[3]) if row[3] is not None else 0.0
+        avg_period = float(row[4]) if row[4] is not None else 0.0
+        funding_amount = float(row[7]) if row[7] is not None else 0.0
+        funding_used = float(row[8]) if row[8] is not None else 0.0
+    except (TypeError, ValueError, IndexError):
+        return None
+    # FRR is 1/365th of annual rate; APR % = FRR * 365 * 100, daily = FRR * 365
+    apr_pct = round(frr * 365 * 100, 4)
+    from datetime import datetime as dt
+    d = dt.utcfromtimestamp(mts / 1000.0)
+    time_str = d.strftime("%m-%d %H:%M")
+    return {
+        "time": time_str,
+        "rateRange": f"{apr_pct}%",
+        "maxDays": round(avg_period),
+        "cumulative": funding_amount,
+        "rate": f"{apr_pct}%",
+        "amount": funding_used,
+        "count": 1,
+        "total": funding_amount,
+    }
+
+
+@app.get("/api/funding-ledger")
+async def get_funding_ledger(symbol: str = Query("fUSD", description="Funding symbol (fUSD, fUST, etc.)")):
+    """
+    Returns Bitfinex lending ledger from public funding stats: current rate and hourly history.
+    No auth required (Bitfinex public API).
+    """
+    from services.bitfinex_service import _get_funding_stats_sync
+    import asyncio
+    loop = asyncio.get_event_loop()
+    raw, err = await loop.run_in_executor(None, lambda: _get_funding_stats_sync(symbol=symbol, limit=24))
+    if err or not raw:
+        return {"currentRate": None, "dailyRate": None, "rows": [], "error": err or "No data"}
+    rows_parsed = []
+    for r in raw:
+        p = _parse_funding_stats_row(r)
+        if p:
+            rows_parsed.append(p)
+    current = rows_parsed[0] if rows_parsed else None
+    current_rate = current.get("rate") if current else None
+    daily_rate = None
+    if raw and isinstance(raw[0], (list, tuple)) and len(raw[0]) > 3 and raw[0][3] is not None:
+        try:
+            daily_rate = round(float(raw[0][3]) * 365, 6)
+        except (TypeError, ValueError):
+            pass
+    for p in rows_parsed:
+        p["cumulative"] = f"${p['cumulative']:,.2f}"
+        p["amount"] = f"${p['amount']:,.0f}" if p.get("amount") else "—"
+        p["total"] = f"${p['total']:,.2f}"
+    return {
+        "currentRate": current_rate,
+        "dailyRate": daily_rate,
+        "rows": rows_parsed,
+    }
+
+
 @app.get("/user-status/{user_id}", response_model=UserStatusResponse)
 def get_user_status(user_id: int, db: Session = Depends(database.get_db)):
     """

@@ -57,13 +57,16 @@ const marketData = [
   { currency: "SUSHI", rate: "22.63%", dailyChange: "+106.67%", volume: "$3,015" },
 ]
 
-const lendingLedger = [
-  { time: "02-25 16:00", range: "2.12 - 6.5%", maxDays: 4, cumulative: "$6,901,678.00", rate: "2.6363%", amount: "$794", count: 1, total: "$794" },
-  { time: "02-25 15:00", range: "1.89 - 8.87%", maxDays: 7, cumulative: "$7,228,365.00", rate: "2.6364%", amount: "$212", count: 1, total: "$506" },
-  { time: "02-25 14:00", range: "2.22 - 20.26%", maxDays: 120, cumulative: "$122,469,866.00", rate: "2.6382%", amount: "$1,500", count: 2, total: "$2,006" },
-  { time: "02-25 13:00", range: "2.17 - 16.73%", maxDays: 120, cumulative: "$30,744,745.00", rate: "2.6386%", amount: "$7,065", count: 7, total: "$9,072" },
-  { time: "02-25 12:00", range: "0.05 - 16.73%", maxDays: 30, cumulative: "$25,530,513.00", rate: "2.6390%", amount: "$1,936,323", count: 1, total: "$1,945,395" },
-]
+type LendingLedgerRow = {
+  time: string
+  rateRange: string
+  maxDays: number
+  cumulative: string
+  rate: string
+  amount: string
+  count: number
+  total: string
+}
 
 type WalletSummary = {
   total_usd_all: number
@@ -90,6 +93,11 @@ export function LiveStatus() {
   const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
   const REFRESH_COOLDOWN_SEC = 15
+  const [ledgerCurrentRate, setLedgerCurrentRate] = useState<string | null>(null)
+  const [ledgerDailyRate, setLedgerDailyRate] = useState<number | null>(null)
+  const [ledgerRows, setLedgerRows] = useState<LendingLedgerRow[]>([])
+  const [ledgerLoading, setLedgerLoading] = useState(false)
+  const [ledgerError, setLedgerError] = useState<string | null>(null)
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -98,6 +106,32 @@ export function LiveStatus() {
     }, 1000)
     return () => clearInterval(interval)
   }, [refreshCooldownUntil])
+
+  const fetchLedger = async () => {
+    try {
+      setLedgerLoading(true)
+      setLedgerError(null)
+      const res = await fetch(`${API_BASE}/api/funding-ledger?symbol=fUSD`)
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.rows) {
+        setLedgerCurrentRate(data.currentRate ?? null)
+        setLedgerDailyRate(typeof data.dailyRate === "number" ? data.dailyRate : null)
+        setLedgerRows(Array.isArray(data.rows) ? data.rows : [])
+      } else {
+        setLedgerCurrentRate(null)
+        setLedgerDailyRate(null)
+        setLedgerRows([])
+        setLedgerError(data.error || "Failed to load ledger")
+      }
+    } catch (e) {
+      setLedgerError("Failed to load ledger")
+      setLedgerRows([])
+      setLedgerCurrentRate(null)
+      setLedgerDailyRate(null)
+    } finally {
+      setLedgerLoading(false)
+    }
+  }
 
   const refreshStatus = async () => {
     if (userId == null) return
@@ -137,6 +171,7 @@ export function LiveStatus() {
         setWalletRateLimited(false)
       }
       setRefreshCooldownUntil(Date.now() + REFRESH_COOLDOWN_SEC * 1000)
+      await fetchLedger()
     } catch (e) {
       console.error("Failed to fetch live status", e)
       setError(t("liveStatus.unableToLoad"))
@@ -161,6 +196,10 @@ export function LiveStatus() {
     }
     refreshStatus()
   }, [userId])
+
+  useEffect(() => {
+    fetchLedger()
+  }, [])
 
   const handleStart = async () => {
     if (userId == null) return
@@ -506,12 +545,20 @@ export function LiveStatus() {
           <p className="text-xs text-muted-foreground">{t("liveStatus.lendingLedgerDesc")}</p>
         </div>
 
-        {/* Current Rate Card */}
+        {/* Current Rate Card — from Bitfinex funding stats */}
         <div className="m-5 rounded-xl bg-emerald/10 border border-emerald/20 p-5">
           <p className="text-xs text-muted-foreground">{t("liveStatus.currentAnnualRate")}</p>
-          <p className="text-3xl font-bold text-emerald mt-1">$2.64%</p>
-          <p className="text-xs text-muted-foreground mt-1">{t("liveStatus.dailyRate")} 0.007229</p>
+          <p className="text-3xl font-bold text-emerald mt-1">
+            {ledgerLoading ? "…" : ledgerCurrentRate ?? "—"}
+          </p>
+          <p className="text-xs text-muted-foreground mt-1">
+            {t("liveStatus.dailyRate")} {ledgerLoading ? "…" : ledgerDailyRate != null ? ledgerDailyRate.toFixed(6) : "—"}
+          </p>
         </div>
+
+        {ledgerError && (
+          <p className="mx-5 mb-2 text-xs text-amber-600 dark:text-amber-400">{ledgerError}</p>
+        )}
 
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs" role="table">
@@ -528,10 +575,17 @@ export function LiveStatus() {
               </tr>
             </thead>
             <tbody>
-              {lendingLedger.map((row, i) => (
+              {ledgerRows.length === 0 && !ledgerLoading && (
+                <tr>
+                  <td colSpan={8} className="px-5 py-6 text-center text-muted-foreground">
+                    {ledgerError ? ledgerError : t("dashboard.noDataYet")}
+                  </td>
+                </tr>
+              )}
+              {ledgerRows.map((row, i) => (
                 <tr key={i} className="border-b border-border/50 transition-colors hover:bg-secondary/30">
                   <td className="px-5 py-3 font-mono text-foreground">{row.time}</td>
-                  <td className="px-5 py-3 font-mono text-muted-foreground">{row.range}</td>
+                  <td className="px-5 py-3 font-mono text-muted-foreground">{row.rateRange}</td>
                   <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground sm:table-cell">{row.maxDays}</td>
                   <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground md:table-cell">{row.cumulative}</td>
                   <td className="px-5 py-3 text-right font-bold font-mono text-emerald">{row.rate}</td>
