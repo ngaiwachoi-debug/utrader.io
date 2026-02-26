@@ -489,7 +489,7 @@ function ApiKeysTab({
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
-        // Auto-start bot after connecting API keys so Terminal shows output
+        // User-end: start bot on server (same as Live Status "Start Bot"). Bot runs on server.
         if (userId != null) {
           try {
             const startRes = await fetch(`${API_BASE}/start-bot`, {
@@ -510,6 +510,7 @@ function ApiKeysTab({
           }
         }
       } else if (allowDev && userId != null) {
+        // Dev-only: connect keys by user_id (no login). Do not use in production.
         const res = await fetch(`${API_BASE}/connect-exchange/by-user`, {
           method: "POST",
           credentials: "include",
@@ -539,7 +540,7 @@ function ApiKeysTab({
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
-        // Auto-start bot after connecting API keys (dev path) so Terminal shows output
+        // Dev-only: start bot by user_id (no auth). Product uses POST /start-bot with token only.
         try {
           const startRes = await fetch(`${API_BASE}/start-bot/${userId}`, { method: "POST", credentials: "include" })
           if (startRes.ok) {

@@ -75,6 +75,16 @@ class WallStreet_Omni_FullEngine:
         signature_payload = f"/api/v2{path}{nonce}{json_body}"
         return hmac.new(self.api_secret.encode(), signature_payload.encode(), hashlib.sha384).hexdigest()
 
+    def _is_balance_error(self, response_text: str) -> bool:
+        """Bitfinex returns [code, msg]. Treat balance/insufficient/minimum as bypassable."""
+        if not response_text:
+            return False
+        t = response_text.lower()
+        return (
+            "balance" in t or "insufficient" in t or "below the minimum" in t
+            or "amount is" in t and "minimum" in t
+        )
+
     async def _api_request(self, path: str, body: dict = None) -> dict | list | None:
         body = body if body is not None else {}
         json_body = json.dumps(body, separators=(",", ":"))
@@ -90,9 +100,11 @@ class WallStreet_Omni_FullEngine:
                 async with session.post(
                     f"{self.rest_url}{path}", headers=headers, data=json_body, timeout=10
                 ) as resp:
-                    if resp.status != 200:
-                        return None
                     text = await resp.text()
+                    if resp.status != 200:
+                        if self._is_balance_error(text):
+                            print(f"[User {self.user_id}] Balance-related API response (bypassing): {path} -> {text[:200]}")
+                        return None
                     return json.loads(text) if text else None
         except Exception as e:
             print(f"[User {self.user_id}] API Error ({path}): {e}")
@@ -289,6 +301,15 @@ class PortfolioManager:
         self.redis_pool = redis_pool
         self._nonce = int(time.time() * 1000000)
 
+    def _is_balance_error(self, response_text: str) -> bool:
+        if not response_text:
+            return False
+        t = response_text.lower()
+        return (
+            "balance" in t or "insufficient" in t or "below the minimum" in t
+            or ("amount is" in t and "minimum" in t)
+        )
+
     async def _api_request(self, path: str, body: dict = None):
         body = body if body is not None else {}
         json_body = json.dumps(body, separators=(",", ":"))
@@ -306,9 +327,11 @@ class PortfolioManager:
             async with s.post(
                 f"https://api.bitfinex.com/v2{path}", headers=headers, data=json_body, timeout=10
             ) as r:
-                if r.status != 200:
-                    return None
                 text = await r.text()
+                if r.status != 200:
+                    if self._is_balance_error(text):
+                        print(f"[User {self.user_id}] Balance-related API response (bypassing): {path} -> {text[:200]}")
+                    return None
                 return json.loads(text) if text else None
 
     async def scan_and_launch(self):

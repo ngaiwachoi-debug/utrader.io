@@ -830,12 +830,15 @@ async def connect_exchange_by_user(
     }
 
 
-# --- Start / Stop Bot ---
+# --- Start / Stop Bot (user-end: only the logged-in user can start/stop their own bot) ---
+# Status is user-end: GET /bot-stats/{user_id} and GET /terminal-logs/{user_id} require auth and user_id == current_user.id.
+# The bot runs on the server (ARQ worker). User turns it on/off only via Live Status (Start Bot / Stop Bot) or after saving API keys.
 @app.post("/start-bot")
 async def start_bot(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
+    """User-end: start the lending bot for the currently logged-in user. Bot runs on server."""
     if not current_user.vault:
         raise HTTPException(status_code=404, detail="API keys not found.")
 
@@ -862,6 +865,7 @@ async def start_bot(
 
 @app.post("/stop-bot")
 async def stop_bot(current_user: models.User = Depends(get_current_user)):
+    """User-end: stop the lending bot for the currently logged-in user."""
     from arq.jobs import Job
     redis = await get_redis_or_raise()
     job_id = f"bot_user_{current_user.id}"
@@ -875,8 +879,7 @@ async def stop_bot(current_user: models.User = Depends(get_current_user)):
     return {"status": "error", "message": "No active bot found"}
 
 
-# Legacy-style control endpoints that address bots by numeric user_id directly.
-# Useful for simple frontends or internal tools without Google auth wiring yet.
+# Dev/admin only: start/stop bot by user_id (no auth). Do not use from the product frontend.
 @app.post("/start-bot/{user_id}")
 async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
     try:
@@ -910,6 +913,7 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
 
 @app.post("/stop-bot/{user_id}")
 async def stop_bot_for_user(user_id: int):
+    """Dev/admin only: stop bot by user_id. Do not use from the product frontend."""
     from arq.jobs import Job
     redis = await get_redis_or_raise()
     job_id = f"bot_user_{user_id}"

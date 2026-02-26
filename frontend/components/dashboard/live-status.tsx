@@ -117,6 +117,7 @@ export function LiveStatus() {
     if (len > 0) setLedgerPage(1)
   }, [walletSummary?.credits_detail?.length])
 
+  // User-end: status and start/stop use auth; only the logged-in user's bot. Bot runs on server.
   const refreshStatus = async () => {
     if (userId == null) return
     try {
