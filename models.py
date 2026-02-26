@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import BigInteger, Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -101,6 +101,7 @@ class UserProfitSnapshot(Base):
     """
     Last computed Gross Profit / Net Earnings from lending trade history (since registration).
     Updated when /stats/{user_id}/lending is computed; used for token balance without extra API.
+    last_trade_mts: max MTS_CREATE we have synced; next refresh only fetches trades after this (incremental).
     """
 
     __tablename__ = "user_profit_snapshot"
@@ -109,6 +110,8 @@ class UserProfitSnapshot(Base):
     gross_profit_usd = Column(Float, default=0.0)
     net_profit_usd = Column(Float, default=0.0)
     bitfinex_fee_usd = Column(Float, default=0.0)
+    last_trade_mts = Column(BigInteger, nullable=True)  # incremental: only fetch trades after this
+    total_trades_count = Column(Integer, nullable=True)  # cumulative count of trades synced (for display)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

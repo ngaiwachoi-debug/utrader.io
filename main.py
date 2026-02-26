@@ -208,6 +208,7 @@ class LendingStatsResponse(BaseModel):
     bitfinex_fee: float
     net_profit: float
     trades: Optional[List["FundingTradeRecord"]] = None
+    total_trades_count: Optional[int] = None  # cumulative trades synced (for display when trades list not full)
     calculation_breakdown: Optional["CalculationBreakdown"] = None
 
 
@@ -1149,11 +1150,22 @@ def _ticker_prices_from_trades(trades: Any) -> Dict[str, float]:
     return out
 
 
+def _max_mts_from_trades(trades: list) -> Optional[int]:
+    """Return max MTS_CREATE (index 2) from trade rows, or None if empty."""
+    if not trades:
+        return None
+    mts_list = [
+        row[2] for row in trades
+        if isinstance(row, (list, tuple)) and len(row) > 2 and row[2] is not None
+    ]
+    return max(mts_list) if mts_list else None
+
+
 async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[LendingStatsResponse, bool, List[FundingTradeRecord]]:
     """
-    Fetch all repaid lending trades from Bitfinex between vault.created_at and now
-    (Bitfinex: POST /v2/auth/r/funding/trades/hist — same data as "GET funding trades").
-    Sum interest (gross), update UserProfitSnapshot and token balance. No cache read/write.
+    Fetch repaid lending trades from Bitfinex and update stored gross profit (stack on server).
+    First time or no last_trade_mts: full fetch from vault.created_at to now. Later: only fetch
+    new trades since last_trade_mts (fewer API calls). Bitfinex: POST /v2/auth/r/funding/trades/hist.
     Returns (result, rate_limited, trade_records). When rate_limited True, caller should set cooldown and use cache.
     """
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -1164,48 +1176,117 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
     start_ms = None
     if getattr(user.vault, "created_at", None) and user.vault.created_at:
         start_ms = int(user.vault.created_at.timestamp() * 1000)
-    trades, err = await _fetch_all_funding_trades(mgr, start_ms)
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    last_mts = getattr(snap, "last_trade_mts", None) if snap else None
+    incremental = last_mts is not None
+
+    if incremental:
+        # Only fetch new trades since last sync (one small batch → fewer API calls)
+        fetch_start = last_mts + 1
+        trades, err = await _fetch_all_funding_trades(mgr, fetch_start, end_ms=None, limit_per_request=500)
+    else:
+        # Full backfill from registration
+        trades, err = await _fetch_all_funding_trades(mgr, start_ms)
+
     if bitfinex_cache.is_rate_limit_error(err):
-        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
         if snap and snap.gross_profit_usd is not None:
             gross = float(snap.gross_profit_usd)
-            return LendingStatsResponse(gross_profit=gross, bitfinex_fee=round(gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(gross * (1 - BITFINEX_LENDER_FEE_PCT), 2)), True, []
+            return LendingStatsResponse(
+                gross_profit=gross, bitfinex_fee=round(gross * BITFINEX_LENDER_FEE_PCT, 2),
+                net_profit=round(gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                total_trades_count=getattr(snap, "total_trades_count", None),
+            ), True, []
         return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0), True, []
     records: List[FundingTradeRecord] = []
     breakdown_obj: Optional[CalculationBreakdown] = None
-    if err or not trades:
+    if err:
         result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+        if snap:
+            result = LendingStatsResponse(
+                gross_profit=float(snap.gross_profit_usd or 0),
+                bitfinex_fee=float(snap.bitfinex_fee_usd or 0),
+                net_profit=float(snap.net_profit_usd or 0),
+                total_trades_count=getattr(snap, "total_trades_count", None),
+            )
+    elif incremental and (not trades or len(trades) == 0):
+        # No new trades; return current snapshot
+        existing_gross = float(snap.gross_profit_usd or 0) if snap else 0.0
+        result = LendingStatsResponse(
+            gross_profit=round(existing_gross, 2),
+            bitfinex_fee=round(existing_gross * BITFINEX_LENDER_FEE_PCT, 2),
+            net_profit=round(existing_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+            total_trades_count=getattr(snap, "total_trades_count", None) if snap else None,
+        )
     else:
         ticker_prices = _ticker_prices_from_trades(trades)
-        gross, per_currency_breakdown = _interest_usd_from_trades_with_breakdown(trades, ticker_prices)
-        fee = gross * BITFINEX_LENDER_FEE_PCT
-        net = gross - fee
-        breakdown_obj = CalculationBreakdown(
-            trades_count=len(trades),
-            per_currency=per_currency_breakdown,
-            total_gross_usd=round(gross, 6),
-            formula_note="Interest per trade = |AMOUNT| * RATE * (PERIOD/365 days). USD/USDt/USDT/UST use 1:1; others use Bitfinex t{CCY}USD price.",
-        )
-        result = LendingStatsResponse(
-            gross_profit=round(gross, 2),
-            bitfinex_fee=round(fee, 2),
-            net_profit=round(net, 2),
-            calculation_breakdown=breakdown_obj,
-        )
-        records = _trades_with_interest_usd(trades, ticker_prices)
-    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+        gross_delta, per_currency_breakdown = _interest_usd_from_trades_with_breakdown(trades, ticker_prices)
+        fee_delta = gross_delta * BITFINEX_LENDER_FEE_PCT
+        net_delta = gross_delta - fee_delta
+        if incremental and snap:
+            existing_gross = float(snap.gross_profit_usd or 0)
+            existing_net = float(snap.net_profit_usd or 0)
+            existing_fee = float(snap.bitfinex_fee_usd or 0)
+            gross = existing_gross + gross_delta
+            net = existing_net + net_delta
+            fee = existing_fee + fee_delta
+            total_count = (getattr(snap, "total_trades_count", None) or 0) + len(trades)
+            breakdown_obj = CalculationBreakdown(
+                trades_count=len(trades),
+                per_currency=per_currency_breakdown,
+                total_gross_usd=round(gross_delta, 6),
+                formula_note="Incremental: new interest added to stored gross. Interest per trade = |AMOUNT| * RATE * (PERIOD/365).",
+            )
+            result = LendingStatsResponse(
+                gross_profit=round(gross, 2),
+                bitfinex_fee=round(fee, 2),
+                net_profit=round(net, 2),
+                total_trades_count=total_count,
+                calculation_breakdown=breakdown_obj,
+            )
+            records = _trades_with_interest_usd(trades, ticker_prices)
+        else:
+            gross = gross_delta
+            fee = gross * BITFINEX_LENDER_FEE_PCT
+            net = gross - fee
+            breakdown_obj = CalculationBreakdown(
+                trades_count=len(trades),
+                per_currency=per_currency_breakdown,
+                total_gross_usd=round(gross, 6),
+                formula_note="Interest per trade = |AMOUNT| * RATE * (PERIOD/365 days). USD/USDt/USDT/UST use 1:1; others use Bitfinex t{CCY}USD price.",
+            )
+            result = LendingStatsResponse(
+                gross_profit=round(gross, 2),
+                bitfinex_fee=round(fee, 2),
+                net_profit=round(net, 2),
+                total_trades_count=len(trades),
+                calculation_breakdown=breakdown_obj,
+            )
+            records = _trades_with_interest_usd(trades, ticker_prices)
+
+    # Persist snapshot
     if snap:
         snap.gross_profit_usd = result.gross_profit
         snap.net_profit_usd = result.net_profit
         snap.bitfinex_fee_usd = result.bitfinex_fee
         snap.updated_at = datetime.utcnow()
+        if hasattr(snap, "last_trade_mts"):
+            new_max = _max_mts_from_trades(trades) if trades else None
+            if new_max is not None:
+                snap.last_trade_mts = new_max
+        if hasattr(snap, "total_trades_count"):
+            snap.total_trades_count = result.total_trades_count
     else:
-        db.add(models.UserProfitSnapshot(
+        new_row = models.UserProfitSnapshot(
             user_id=user_id,
             gross_profit_usd=result.gross_profit,
             net_profit_usd=result.net_profit,
             bitfinex_fee_usd=result.bitfinex_fee,
-        ))
+            total_trades_count=result.total_trades_count,
+        )
+        new_max = _max_mts_from_trades(trades) if trades else None
+        if new_max is not None and hasattr(models.UserProfitSnapshot, "last_trade_mts"):
+            new_row.last_trade_mts = new_max
+        db.add(new_row)
     tier = (user.plan_tier or "trial").lower()
     initial_credit = PLAN_TOKEN_CREDITS.get(tier, FREE_TIER_TOKENS)
     token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
