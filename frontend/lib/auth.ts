@@ -1,15 +1,24 @@
 /**
  * Auth helpers for NextAuth session.
  * Backend token: fetch from /api/auth/token and send as Authorization: Bearer <token>
+ * Dev: optional sessionStorage token (set by "Dev: Login as ...") when bypassing Google.
  */
+
+const DEV_BACKEND_TOKEN_KEY = "utrader_dev_backend_token"
 
 let cachedBackendToken: string | null = null
 let cacheExpiry = 0
 const CACHE_MS = 5 * 60 * 1000 // 5 min
 
-/** Get a JWT to send to the FastAPI backend (from NextAuth session). */
+/** Get a JWT to send to the FastAPI backend (from NextAuth session or dev token). */
 export async function getBackendToken(): Promise<string | null> {
   if (typeof window === "undefined") return null
+  const devToken = sessionStorage.getItem(DEV_BACKEND_TOKEN_KEY)
+  if (devToken) {
+    cachedBackendToken = devToken
+    cacheExpiry = Date.now() + CACHE_MS
+    return devToken
+  }
   if (cachedBackendToken && Date.now() < cacheExpiry) {
     return cachedBackendToken
   }
@@ -30,10 +39,26 @@ export async function getBackendToken(): Promise<string | null> {
   }
 }
 
+/** Set dev backend token (e.g. after "Dev: Login as choiwangai"). */
+export function setDevBackendToken(token: string): void {
+  if (typeof window === "undefined") return
+  sessionStorage.setItem(DEV_BACKEND_TOKEN_KEY, token)
+  cachedBackendToken = token
+  cacheExpiry = Date.now() + CACHE_MS
+}
+
+/** Clear dev backend token. */
+export function clearDevBackendToken(): void {
+  if (typeof window === "undefined") return
+  sessionStorage.removeItem(DEV_BACKEND_TOKEN_KEY)
+  clearBackendTokenCache()
+}
+
 /** Clear cached backend token (e.g. after sign out). */
 export function clearBackendTokenCache(): void {
   cachedBackendToken = null
   cacheExpiry = 0
+  if (typeof window !== "undefined") sessionStorage.removeItem(DEV_BACKEND_TOKEN_KEY)
 }
 
 // Legacy keys for backward compat (NextAuth replaces these)

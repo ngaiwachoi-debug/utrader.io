@@ -1,13 +1,17 @@
 import hashlib
 import hmac
 import json
+import os
 import time
 import requests
 import sys
 
-# --- CONFIGURATION (Cursor will fill this) ---
-API_KEY = "6088a8f93d6d811585827c8639e3541ff8cfd29589f"
-API_SECRET = "7207e9ece87ac7550040c6d4a9446760484b71547ca"
+# --- CONFIGURATION: set via env to avoid committing secrets ---
+API_KEY = os.getenv("BFX_KEY", "")
+API_SECRET = os.getenv("BFX_SECRET", "")
+if not API_KEY or not API_SECRET:
+    print("Set BFX_KEY and BFX_SECRET in the environment (e.g. in .env). Do not commit real keys.")
+    sys.exit(1)
 # -------------------------------------------
 
 BASE_URL = "https://api.bitfinex.com"

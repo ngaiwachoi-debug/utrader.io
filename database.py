@@ -11,12 +11,11 @@ load_dotenv(dotenv_path=_env_path)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Safety check: If the URL is missing, print a clear error
+# Do not hardcode DATABASE_URL; use .env only to avoid exposing credentials in git.
 if not DATABASE_URL:
-    print("❌ ERROR: DATABASE_URL is missing! Check your .env file.")
-    # If the .env file isn't working, you can temporarily paste your 
-    # postgresql:// string directly here as a string.
-    DATABASE_URL = "postgresql://neondb_owner:npg_pyaiQAxCnP84@ep-dawn-hall-aik0s1zx-pooler.c-4.us-east-1.aws.neon.tech/neondb?sslmode=require"
+    raise RuntimeError(
+        "DATABASE_URL is missing. Set it in .env (e.g. postgresql://user:password@host/dbname?sslmode=require)."
+    )
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

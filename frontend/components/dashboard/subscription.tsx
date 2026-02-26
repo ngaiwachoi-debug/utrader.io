@@ -9,22 +9,27 @@ import { getBackendToken } from "@/lib/auth"
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 
 type Plan = "pro" | "ai_ultra" | "whales"
+type Interval = "monthly" | "yearly"
 
 const PRO_USDT = 20
 const AI_ULTRA_USDT = 60
 const WHALES_USDT = 200
-const PRO_TOKENS = 1500
+const PRO_YEARLY_USDT = 192
+const AI_ULTRA_YEARLY_USDT = 576
+const WHALES_YEARLY_USDT = 1920
+const PRO_TOKENS = 2000
 const AI_ULTRA_TOKENS = 9000
 const WHALES_TOKENS = 40000
 
 export function Subscription() {
   const t = useT()
   const userId = useCurrentUserId()
-  const [loading, setLoading] = useState<string | null>(null)
+  const [loading, setLoading] = useState<string | null>(null) // plan key e.g. "pro" or "pro_yearly"
   const [planTier, setPlanTier] = useState<string>("trial")
   const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
   const [addTokensUsd, setAddTokensUsd] = useState<string>("")
   const [loadingTokens, setLoadingTokens] = useState(false)
+  const [depositMessage, setDepositMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
 
   useEffect(() => {
     if (userId == null) return
@@ -47,20 +52,21 @@ export function Subscription() {
     return () => { cancelled = true }
   }, [userId])
 
-  const handleSubscribe = async (plan: Plan) => {
+  const handleSubscribe = async (plan: Plan, interval: Interval) => {
     const { getBackendToken } = await import("@/lib/auth")
     const token = typeof window !== "undefined" ? await getBackendToken() : null
     if (!token) {
       window.location.href = "/login"
       return
     }
-    setLoading(plan)
+    const loadingKey = interval === "yearly" ? `${plan}_yearly` : plan
+    setLoading(loadingKey)
     try {
       const res = await fetch(`${API_BASE}/api/create-checkout-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         credentials: "include",
-        body: JSON.stringify({ plan, interval: "monthly" }),
+        body: JSON.stringify({ plan, interval }),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.url) {
@@ -78,9 +84,18 @@ export function Subscription() {
   const isSubscribed = planTier !== "trial" && planTier !== "free"
 
   const handlePurchaseTokens = async () => {
-    const amount = parseFloat(addTokensUsd)
-    if (!Number.isFinite(amount) || amount < 0.5) {
-      alert("Enter at least 0.5 USD")
+    const raw = addTokensUsd.trim()
+    if (raw === "" || !/^-?\d*\.?\d+$/.test(raw)) {
+      setDepositMessage({ type: "error", text: "Please enter a valid USD amount" })
+      return
+    }
+    const amount = parseFloat(raw)
+    if (!Number.isFinite(amount)) {
+      setDepositMessage({ type: "error", text: "Please enter a valid USD amount" })
+      return
+    }
+    if (amount < 1) {
+      setDepositMessage({ type: "error", text: "Minimum deposit is $1" })
       return
     }
     const { getBackendToken } = await import("@/lib/auth")
@@ -89,22 +104,32 @@ export function Subscription() {
       window.location.href = "/login"
       return
     }
+    setDepositMessage(null)
     setLoadingTokens(true)
     try {
-      const res = await fetch(`${API_BASE}/api/create-checkout-session-tokens`, {
+      const res = await fetch(`${API_BASE}/api/v1/tokens/deposit`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         credentials: "include",
-        body: JSON.stringify({ amount_usd: amount }),
+        body: JSON.stringify({ usd_amount: amount }),
       })
       const data = await res.json().catch(() => ({}))
-      if (res.ok && data.url) {
-        window.location.href = data.url
-        return
+      if (res.ok && data.status === "success" && data.tokens_to_award != null) {
+        setDepositMessage({
+          type: "success",
+          text: `${data.tokens_to_award} tokens will be added after payment`,
+        })
+        setAddTokensUsd("")
+      } else {
+        setDepositMessage({
+          type: "error",
+          text: (data.message as string) || "Validation failed",
+        })
       }
-      alert(data.detail || "Unable to start checkout.")
+      // TODO: Add Stripe checkout flow here (redirect to data.url when implemented)
+      // if (res.ok && data.url) { window.location.href = data.url; return }
     } catch (e) {
-      alert("Network error. Please try again.")
+      setDepositMessage({ type: "error", text: "Network error. Please try again." })
     } finally {
       setLoadingTokens(false)
     }
@@ -180,13 +205,22 @@ export function Subscription() {
               </li>
             ))}
           </ul>
-          <button
-            onClick={() => handleSubscribe("pro")}
-            disabled={!!loading}
-            className="mt-6 w-full rounded-xl bg-emerald py-3 text-sm font-semibold text-primary-foreground hover:bg-emerald/90 disabled:opacity-50"
-          >
-            {loading === "pro" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribePro")}
-          </button>
+          <div className="mt-6 flex flex-col gap-2">
+            <button
+              onClick={() => handleSubscribe("pro", "monthly")}
+              disabled={!!loading}
+              className="w-full rounded-xl bg-emerald py-3 text-sm font-semibold text-primary-foreground hover:bg-emerald/90 disabled:opacity-50"
+            >
+              {loading === "pro" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribePro") + " (" + t("subscription.monthly") + ")"}
+            </button>
+            <button
+              onClick={() => handleSubscribe("pro", "yearly")}
+              disabled={!!loading}
+              className="w-full rounded-xl border-2 border-emerald bg-transparent py-2.5 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
+            >
+              {loading === "pro_yearly" ? <Loader2 className="mx-auto h-4 w-4 animate-spin" /> : `$${PRO_YEARLY_USDT}/year ${t("subscription.save10")}`}
+            </button>
+          </div>
         </div>
 
         {/* AI Ultra — 60 USDT */}
@@ -215,13 +249,22 @@ export function Subscription() {
               </li>
             ))}
           </ul>
-          <button
-            onClick={() => handleSubscribe("ai_ultra")}
-            disabled={!!loading}
-            className="mt-6 w-full rounded-xl border-2 border-emerald bg-transparent py-3 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
-          >
-            {loading === "ai_ultra" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribeAiUltra")}
-          </button>
+          <div className="mt-6 flex flex-col gap-2">
+            <button
+              onClick={() => handleSubscribe("ai_ultra", "monthly")}
+              disabled={!!loading}
+              className="w-full rounded-xl border-2 border-emerald bg-transparent py-3 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
+            >
+              {loading === "ai_ultra" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribeAiUltra") + " (" + t("subscription.monthly") + ")"}
+            </button>
+            <button
+              onClick={() => handleSubscribe("ai_ultra", "yearly")}
+              disabled={!!loading}
+              className="w-full rounded-xl border border-border py-2.5 text-sm font-semibold text-muted-foreground hover:bg-muted/50 disabled:opacity-50"
+            >
+              {loading === "ai_ultra_yearly" ? <Loader2 className="mx-auto h-4 w-4 animate-spin" /> : `$${AI_ULTRA_YEARLY_USDT}/year ${t("subscription.save10")}`}
+            </button>
+          </div>
         </div>
 
         {/* Whales AI — 200 USDT */}
@@ -251,17 +294,26 @@ export function Subscription() {
               </li>
             ))}
           </ul>
-          <button
-            onClick={() => handleSubscribe("whales")}
-            disabled={!!loading}
-            className="mt-6 w-full rounded-xl border-2 border-emerald bg-transparent py-3 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
-          >
-            {loading === "whales" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribeWhales")}
-          </button>
+          <div className="mt-6 flex flex-col gap-2">
+            <button
+              onClick={() => handleSubscribe("whales", "monthly")}
+              disabled={!!loading}
+              className="w-full rounded-xl border-2 border-emerald bg-transparent py-3 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
+            >
+              {loading === "whales" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribeWhales") + " (" + t("subscription.monthly") + ")"}
+            </button>
+            <button
+              onClick={() => handleSubscribe("whales", "yearly")}
+              disabled={!!loading}
+              className="w-full rounded-xl border border-border py-2.5 text-sm font-semibold text-muted-foreground hover:bg-muted/50 disabled:opacity-50"
+            >
+              {loading === "whales_yearly" ? <Loader2 className="mx-auto h-4 w-4 animate-spin" /> : `$${WHALES_YEARLY_USDT}/year ${t("subscription.save10")}`}
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Add tokens: custom USD → tokens (1 USD = 100) */}
+      {/* Add tokens: custom USD → tokens (1 USD = 10 tokens), min $1 */}
       <div className="rounded-xl border border-border bg-card p-5">
         <h3 className="text-sm font-semibold text-foreground">{t("subscription.addTokens")}</h3>
         <p className="mt-1 text-xs text-muted-foreground">{t("subscription.addTokensDesc")}</p>
@@ -270,10 +322,13 @@ export function Subscription() {
             <label className="mb-1 block text-xs text-muted-foreground">{t("subscription.amountUsd")}</label>
             <input
               type="number"
-              min={0.5}
-              step={1}
+              min={1}
+              step={0.01}
               value={addTokensUsd}
-              onChange={(e) => setAddTokensUsd(e.target.value)}
+              onChange={(e) => {
+                setAddTokensUsd(e.target.value)
+                setDepositMessage(null)
+              }}
               className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
               placeholder="10"
             />
@@ -283,12 +338,26 @@ export function Subscription() {
             disabled={loadingTokens}
             className="rounded-lg bg-emerald px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-emerald/90 disabled:opacity-50"
           >
-            {loadingTokens ? <Loader2 className="h-4 w-4 animate-spin" /> : t("subscription.purchaseTokens")}
+            {loadingTokens ? (
+              <>
+                <Loader2 className="mr-1.5 inline h-4 w-4 animate-spin" />
+                Calculating tokens...
+              </>
+            ) : (
+              t("subscription.purchaseTokens")
+            )}
           </button>
         </div>
-        {addTokensUsd && Number(addTokensUsd) >= 0.5 && (
+        {addTokensUsd && Number(addTokensUsd) >= 1 && !loadingTokens && (
           <p className="mt-2 text-xs text-muted-foreground">
-            You get {Math.floor(Number(addTokensUsd) * 100)} tokens
+            You get {Math.floor(Number(addTokensUsd) * 10)} tokens
+          </p>
+        )}
+        {depositMessage && (
+          <p
+            className={`mt-2 text-sm ${depositMessage.type === "success" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}`}
+          >
+            {depositMessage.text}
           </p>
         )}
       </div>

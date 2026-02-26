@@ -1,12 +1,48 @@
 "use client"
 
+import { useState } from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { signIn } from "next-auth/react"
 import { useT } from "@/lib/i18n"
+import { setDevBackendToken } from "@/lib/auth"
 import { TrendingUp, Zap, Shield, BarChart3 } from "lucide-react"
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 
 export default function LandingPage() {
   const t = useT()
+  const router = useRouter()
+  const [devLoginLoading, setDevLoginLoading] = useState(false)
+  const [devLoginError, setDevLoginError] = useState<string | null>(null)
+
+  async function handleDevLoginAsChoiwangai() {
+    setDevLoginError(null)
+    setDevLoginLoading(true)
+    try {
+      const res = await fetch(`${API_BASE}/dev/login-as`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "choiwangai@gmail.com" }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setDevLoginError(data.detail ?? `HTTP ${res.status}`)
+        return
+      }
+      const token = data.token
+      if (!token) {
+        setDevLoginError("No token in response")
+        return
+      }
+      setDevBackendToken(token)
+      router.push("/dashboard")
+    } catch (e) {
+      setDevLoginError(e instanceof Error ? e.message : "Request failed")
+    } finally {
+      setDevLoginLoading(false)
+    }
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -63,7 +99,18 @@ export default function LandingPage() {
             <BarChart3 className="h-5 w-5" />
             {t("header.dashboard")}
           </Link>
+          <button
+            type="button"
+            onClick={handleDevLoginAsChoiwangai}
+            disabled={devLoginLoading}
+            className="inline-flex items-center gap-2 rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-600 dark:text-amber-400 hover:bg-amber-500/20 transition-colors"
+          >
+            {devLoginLoading ? "…" : "Dev: Login as choiwangai@gmail.com"}
+          </button>
         </div>
+        {devLoginError && (
+          <p className="mt-3 text-sm text-red-500">{devLoginError}</p>
+        )}
       </section>
 
       {/* Features */}

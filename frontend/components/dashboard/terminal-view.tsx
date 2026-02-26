@@ -7,11 +7,12 @@ import { getBackendToken } from "@/lib/auth"
 import { Terminal } from "lucide-react"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
-const TERMINAL_POLL_MS = 10_000
+const TERMINAL_POLL_MS = 2_000
 
 /**
- * Terminal tab: shows trading box terminal output for all signed-in users.
- * Logs are cached; frontend polls every 10s.
+ * Terminal tab: shows trading box terminal output for the signed-in user.
+ * Logs are served from GET /terminal-logs/{user_id} (Redis-backed); frontend polls every 2s.
+ * Compatible with future SSE: same endpoint can add Accept: text/event-stream for streaming.
  */
 export function TerminalView() {
   const t = useT()

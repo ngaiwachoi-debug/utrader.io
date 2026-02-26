@@ -1,16 +1,20 @@
 """
-Hourly job: refresh gross profit from Bitfinex for all users that have a vault.
-Calls POST /api/cron/refresh-lending-stats per user with requests spread over the hour.
+Standalone daily job: refresh gross profit from Bitfinex once per day at 09:40 UTC.
+Gross profit is stored and updated only on the backend (user_profit_snapshot).
 
-Preferred: use daily_refresh_gross_profit_0940utc.py once at 09:40 UTC (see docs).
-This hourly script is optional if you need more frequent snapshot updates.
+When the API server (uvicorn main:app) is running, the daily job runs automatically
+at 09:40 UTC—no cron or Task Scheduler needed. Use this script only if you do not
+run the API server (e.g. separate cron host).
 
-Setup:
-  - Set CRON_SECRET in .env (same value as used by the server).
-  - Run every hour via cron: 0 * * * * cd /path/to/buildnew && python scripts/hourly_refresh_gross_profit.py
+Bitfinex limit: ~10 req/s per IP. Each user refresh does 3 ledger calls (USD, USDT, USDt).
+We space users by DELAY_BETWEEN_USERS_SEC to stay under the limit and keep bot priority.
 
-Example (Windows Task Scheduler or cron):
-  0 * * * * cd /path/to/buildnew && python scripts/hourly_refresh_gross_profit.py
+Cron (Linux/macOS), if not using the in-process scheduler:
+  40 9 * * * cd /path/to/buildnew && python scripts/daily_refresh_gross_profit_0940utc.py
+
+Windows Task Scheduler: create a daily task at 09:40 UTC only if the API is not running.
+
+Env: CRON_SECRET (same as server), NEXT_PUBLIC_API_BASE (optional, default http://127.0.0.1:8000).
 """
 import os
 import sys
@@ -34,16 +38,17 @@ except ImportError:
 
 API_BASE = os.getenv("NEXT_PUBLIC_API_BASE", "http://127.0.0.1:8000").rstrip("/")
 CRON_SECRET = os.getenv("CRON_SECRET", "")
+# Bitfinex ~10 req/s; each user = 3 ledger calls. Space users to avoid burst and leave headroom for bot.
+DELAY_BETWEEN_USERS_SEC = 3.0
 
 
 def main():
     if not CRON_SECRET:
-        print("CRON_SECRET not set in .env. Skipping hourly refresh.")
+        print("CRON_SECRET not set in .env. Skipping daily refresh.")
         return 0
 
     db = SessionLocal()
     try:
-        # All user IDs that have an API vault (Bitfinex keys)
         user_ids = [
             row[0]
             for row in db.query(models.User.id)
@@ -59,12 +64,11 @@ def main():
         return 0
 
     n = len(user_ids)
-    stagger_sec = 3600.0 / max(n, 1)  # spread over one hour
-    print(f"Refreshing gross profit for {n} user(s), ~{stagger_sec:.1f}s apart")
+    print(f"Daily gross profit refresh at 09:40 UTC: {n} user(s), {DELAY_BETWEEN_USERS_SEC}s between calls")
 
     for i, uid in enumerate(user_ids):
         if i > 0:
-            time.sleep(stagger_sec)
+            time.sleep(DELAY_BETWEEN_USERS_SEC)
         try:
             r = requests.post(
                 f"{API_BASE}/api/cron/refresh-lending-stats",

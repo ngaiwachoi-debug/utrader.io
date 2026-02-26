@@ -9,8 +9,10 @@ Refined workflow for Profit Center, credits, plans, Terminal, and 1000+ user sca
 1. **Data & definitions (done)**
    - **Gross Profit** = total USD earned from lending trade history since user registration, *before* Bitfinex fee.
    - **Net Earnings** = same history, *after* Bitfinex fee (15%), *before* platform charge.
+   - **Server-side only**: Gross profit is stored in the backend (`user_profit_snapshot.gross_profit_usd`) and updated only by the server (on-demand refresh or daily cron). The frontend always reads from the API; the source of truth is the DB.
    - Both computed in `/stats/{user_id}/lending` and persisted to `user_profit_snapshot`.
    - **Token rule**: 1 USDT gross profit = 10 tokens used; stored in `user_token_balance` and recalculated from snapshot (no extra Bitfinex call).
+   - **Daily update**: The API server runs the gross profit refresh **automatically at 09:40 UTC** every day (in-process scheduler; no cron or Task Scheduler needed). When you start the backend with `uvicorn main:app`, the job is scheduled. Optional: run `scripts/daily_refresh_gross_profit_0940utc.py` via cron only if the API is not running (e.g. separate cron host). Requests are spaced to respect Bitfinex API limits.
 
 2. **Token balance storage and refresh**
    - When lending stats are computed, persist snapshot *and* update `user_token_balance` (tokens_remaining, last_gross_usd_used).

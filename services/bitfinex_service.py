@@ -155,6 +155,18 @@ class BitfinexManager:
             payload["end"] = end_ms
         return await self._post("v2/auth/r/funding/trades/hist", payload)
 
+    async def ledgers_hist(
+        self,
+        currency: str,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        limit: int = 100,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """POST v2/auth/r/ledgers/{currency}/hist — same as user script: body {"limit": limit} only (no start/end).
+        Caller should filter entries by timestamp client-side for registration window."""
+        payload: Dict[str, Any] = {"limit": limit}
+        return await self._post(f"v2/auth/r/ledgers/{currency}/hist", payload)
+
     async def funding_credits(self, symbol: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
         """POST v2/auth/r/funding/credits[/{symbol}]. Funds currently lent out (active funding).
         Symbol can be omitted (pass empty string) to get all currencies.

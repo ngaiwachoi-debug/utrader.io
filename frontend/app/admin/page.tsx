@@ -1,7 +1,8 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, useCallback } from "react"
 import DashboardPage from "@/app/[locale]/dashboard/page"
+import { AlertCircle, RefreshCw } from "lucide-react"
 
 type AdminUser = {
   id: number
@@ -13,6 +14,14 @@ type AdminUser = {
   status: string
 }
 
+type ApiFailure = {
+  id: string
+  ts: string
+  context: string
+  user_id: number | null
+  error: string
+}
+
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 
 export default function AdminPage() {
@@ -20,6 +29,10 @@ export default function AdminPage() {
   const [users, setUsers] = useState<AdminUser[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [failures, setFailures] = useState<ApiFailure[]>([])
+  const [failuresLoading, setFailuresLoading] = useState(false)
+  const [retryingId, setRetryingId] = useState<string | null>(null)
+  const [retryError, setRetryError] = useState<string | null>(null)
 
   const fetchUsers = async (token: string) => {
     try {
@@ -46,6 +59,57 @@ export default function AdminPage() {
     if (!token) return
     setIdToken(token)
     void fetchUsers(token)
+  }
+
+  const fetchFailures = useCallback(
+    async (token: string) => {
+      try {
+        setFailuresLoading(true)
+        const res = await fetch(`${API_BASE}/admin/api-failures?limit=50`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (!res.ok) return
+        const data = await res.json()
+        setFailures(Array.isArray(data) ? data : [])
+      } catch {
+        // ignore
+      } finally {
+        setFailuresLoading(false)
+      }
+    },
+    []
+  )
+
+  useEffect(() => {
+    if (!idToken) return
+    void fetchFailures(idToken)
+    const interval = setInterval(() => fetchFailures(idToken), 30_000)
+    return () => clearInterval(interval)
+  }, [idToken, fetchFailures])
+
+  const retryFailure = async (failureId: string, userId: number | null) => {
+    if (!idToken) return
+    setRetryError(null)
+    setRetryingId(failureId)
+    try {
+      const res = await fetch(`${API_BASE}/admin/api-failures/retry`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify(userId != null ? { user_id: userId } : { failure_id: failureId }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.ok) {
+        setFailures((prev) => prev.filter((f) => f.id !== failureId))
+        void fetchFailures(idToken)
+      } else {
+        setRetryError(typeof data.detail === "string" ? data.detail : "Retry failed")
+      }
+    } finally {
+      setRetryingId(null)
+    }
   }
 
   const handleUpdate = async (user: AdminUser, updates: Partial<AdminUser>) => {
@@ -104,7 +168,59 @@ export default function AdminPage() {
         >
           Refresh Users
         </button>
-        <div className="space-y-3">
+
+        <h3 className="text-xs font-semibold text-foreground mt-4 mb-2 flex items-center gap-1.5">
+          <AlertCircle className="h-3.5 w-3.5" />
+          API Failures
+        </h3>
+        {failuresLoading && <p className="text-[11px] text-muted-foreground mb-1">Loading…</p>}
+        <button
+          type="button"
+          onClick={() => idToken && fetchFailures(idToken)}
+          className="mb-2 flex items-center gap-1 rounded bg-secondary px-2 py-1 text-[10px] text-foreground hover:bg-secondary/80"
+        >
+          <RefreshCw className="h-3 w-3" />
+          Refresh
+        </button>
+        {retryError && (
+          <p className="mb-2 text-[11px] text-red-500">{retryError}</p>
+        )}
+        <div className="space-y-2 max-h-48 overflow-y-auto">
+          {failures.length === 0 && !failuresLoading && (
+            <p className="text-[11px] text-muted-foreground">No recent failures.</p>
+          )}
+          {failures.map((f) => (
+            <div
+              key={f.id}
+              className="rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[11px]"
+            >
+              <div className="flex items-start justify-between gap-1">
+                <span className="text-muted-foreground shrink-0">
+                  {new Date(f.ts).toLocaleString()}
+                </span>
+                {f.user_id != null && (
+                  <button
+                    type="button"
+                    disabled={retryingId === f.id}
+                    onClick={() => retryFailure(f.id, f.user_id)}
+                    className="shrink-0 rounded bg-amber-600 px-1.5 py-0.5 text-[10px] font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+                  >
+                    {retryingId === f.id ? "…" : "Retry"}
+                  </button>
+                )}
+              </div>
+              <p className="mt-0.5 font-medium text-foreground">
+                {f.context}
+                {f.user_id != null && ` · user ${f.user_id}`}
+              </p>
+              <p className="mt-0.5 truncate text-muted-foreground" title={f.error}>
+                {f.error}
+              </p>
+            </div>
+          ))}
+        </div>
+
+        <div className="space-y-3 mt-4">
           {users.map((u) => (
             <div key={u.id} className="rounded-lg border border-border bg-background/60 p-3 text-xs">
               <div className="flex items-center justify-between mb-1">

@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import BigInteger, Column, Date, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -24,6 +24,9 @@ class User(Base):
 
     # Lifecycle status – used by the kill switch
     status = Column(String, default="active")  # active / expired
+
+    # Bot process state (updated by API on start/stop and by worker on run/exit)
+    bot_status = Column(String, default="stopped")  # stopped | running | starting
 
     # Relationships
     vault = relationship("APIVault", back_populates="user", uselist=False)
@@ -113,6 +116,10 @@ class UserProfitSnapshot(Base):
     last_trade_mts = Column(BigInteger, nullable=True)  # incremental: only fetch trades after this
     total_trades_count = Column(Integer, nullable=True)  # cumulative count of trades synced (for display)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Daily gross for token deduction (set at 09:40 UTC; read at 10:15 UTC)
+    daily_gross_profit_usd = Column(Float, default=0.0)  # gross profit for that UTC day
+    last_daily_cumulative_gross = Column(Float, nullable=True)  # cumulative gross at last daily snapshot
+    last_daily_snapshot_date = Column(Date, nullable=True)  # UTC date of that snapshot
 
 
 class UserTokenBalance(Base):

@@ -17,11 +17,14 @@ except ImportError:
     print("Install requests: pip install requests")
     sys.exit(1)
 
-EMAIL = "choiwangai@gmail.com"
-# Use these or set env BFX_KEY, BFX_SECRET, GEMINI_KEY
-API_KEY = os.getenv("BFX_KEY", "96d1aea643c91ba4a7260702692e6e31d65bb69486f")
-API_SECRET = os.getenv("BFX_SECRET", "e5f04a8af4f1a553b9f0cffaafd51f80b2cff9998c1")
-GEMINI_KEY = os.getenv("GEMINI_KEY", "AIzaSyAm0fmzCZPlFrHBej4CVDoPKZNXQ11BijU")
+EMAIL = os.getenv("CONNECT_EMAIL", "choiwangai@gmail.com")
+# Require env vars; do not put real keys in this file (they would be committed to git).
+API_KEY = os.getenv("BFX_KEY", "")
+API_SECRET = os.getenv("BFX_SECRET", "")
+GEMINI_KEY = os.getenv("GEMINI_KEY", "")
+if not API_KEY or not API_SECRET:
+    print("Set BFX_KEY and BFX_SECRET in the environment. Do not commit real keys to the repo.")
+    sys.exit(1)
 
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 URL_UPDATE = f"{API_BASE}/connect-exchange/update-by-email"

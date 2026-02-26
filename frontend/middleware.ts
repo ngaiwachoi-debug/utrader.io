@@ -3,7 +3,7 @@ import { withAuth } from "next-auth/middleware";
 import { NextRequest } from "next/request";
 
 const locales = ['en', 'zh'];
-const publicPages = ['/', '/login']; // Pages that don't need login
+const publicPages = ['/', '/login', '/dashboard']; // Dashboard is public so "Dev: Login as" (token-only) can open it
 
 const intlMiddleware = createMiddleware({
   locales,

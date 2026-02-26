@@ -1,13 +1,19 @@
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from arq import create_pool
@@ -21,9 +27,247 @@ import models
 import security
 from services.bitfinex_service import BitfinexManager, hash_bitfinex_id
 from services import bitfinex_cache
+from services.daily_token_deduction import run_daily_token_deduction
+
+# Daily gross profit refresh: run at 09:40 UTC (in-process; no cron needed)
+DAILY_GROSS_REFRESH_UTC_HOUR = 9
+DAILY_GROSS_REFRESH_UTC_MINUTE = 40
+DELAY_BETWEEN_USERS_SEC = 3.0
+
+# Daily token deduction: 10:15 UTC (15-min buffer after Bitfinex refresh at 10:00; gross stored at 09:40)
+DAILY_DEDUCTION_UTC_HOUR = 10
+DAILY_DEDUCTION_UTC_MINUTE = 15
+DEDUCTION_RETRY_INTERVAL_SEC = 300  # 5 minutes
+DEDUCTION_MAX_RETRIES = 3
+
+# API failure log for admin panel (in-memory, last N entries)
+API_FAILURES_MAX = 200
+_api_failures: List[Dict[str, Any]] = []
+_api_failures_lock = asyncio.Lock()
 
 
-app = FastAPI(title="utrader.io API")
+async def _record_api_failure(context: str, user_id: Optional[int], error: str) -> str:
+    """Record an API failure; returns failure id."""
+    from uuid import uuid4
+    entry = {
+        "id": str(uuid4()),
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "context": context,
+        "user_id": user_id,
+        "error": error[:500] if error else "Unknown error",
+    }
+    async with _api_failures_lock:
+        _api_failures.append(entry)
+        while len(_api_failures) > API_FAILURES_MAX:
+            _api_failures.pop(0)
+    return entry["id"]
+
+
+async def _get_api_failures(limit: int = 100) -> List[Dict[str, Any]]:
+    """Return recent failures (newest first)."""
+    async with _api_failures_lock:
+        copy = list(_api_failures)
+    copy.reverse()
+    return copy[:limit]
+
+
+def _get_scheduler_first_wait_sec() -> Optional[float]:
+    """If TEST_SCHEDULER_SECONDS is set (e.g. 30), first run is in that many seconds for testing."""
+    raw = os.getenv("TEST_SCHEDULER_SECONDS")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _get_scheduler_test_user_id() -> Optional[int]:
+    """If TEST_SCHEDULER_USER_ID is set, only run refresh for that user (for tests)."""
+    raw = os.getenv("TEST_SCHEDULER_USER_ID")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def _run_daily_gross_profit_scheduler() -> None:
+    """Background task: at 09:40 UTC every day, refresh gross profit for all users with vaults."""
+    first_wait = _get_scheduler_first_wait_sec()
+    while True:
+        if first_wait is not None:
+            wait_sec = first_wait
+            first_wait = None
+            print(f"[scheduler] TEST_SCHEDULER_SECONDS: first run in {wait_sec:.0f}s")
+        else:
+            now = datetime.utcnow()
+            next_run = now.replace(
+                hour=DAILY_GROSS_REFRESH_UTC_HOUR,
+                minute=DAILY_GROSS_REFRESH_UTC_MINUTE,
+                second=0,
+                microsecond=0,
+            )
+            if next_run <= now:
+                next_run += timedelta(days=1)
+            wait_sec = (next_run - now).total_seconds()
+            print(f"[scheduler] Next daily gross profit refresh at {next_run.isoformat()}Z (in {wait_sec:.0f}s)")
+        await asyncio.sleep(wait_sec)
+        db = database.SessionLocal()
+        try:
+            user_ids = [
+                row[0]
+                for row in db.query(models.User.id)
+                .join(models.APIVault, models.User.id == models.APIVault.user_id)
+                .distinct()
+                .all()
+            ]
+            test_uid = _get_scheduler_test_user_id()
+            if test_uid is not None:
+                user_ids = [u for u in user_ids if u == test_uid]
+        finally:
+            db.close()
+        if not user_ids:
+            continue
+        print(f"[scheduler] Daily gross profit refresh: {len(user_ids)} user(s)")
+        for i, uid in enumerate(user_ids):
+            if i > 0:
+                await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
+            db = database.SessionLocal()
+            try:
+                err_msg: Optional[str] = None
+                for attempt in range(3):
+                    try:
+                        result, rate_limited, _ = await _refresh_user_lending_snapshot(uid, db)
+                        if not rate_limited:
+                            cache_data = result.model_dump()
+                            cache_data.pop("trades", None)
+                            await bitfinex_cache.set_cached(uid, bitfinex_cache.KEY_LENDING, cache_data)
+                            # Store daily_gross_profit_usd for 10:15 token deduction (same UTC day)
+                            snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                            if snap and hasattr(snap, "daily_gross_profit_usd"):
+                                today_utc = datetime.utcnow().date()
+                                yesterday_utc = today_utc - timedelta(days=1)
+                                current = float(result.gross_profit)
+                                last_cum = getattr(snap, "last_daily_cumulative_gross", None)
+                                last_date = getattr(snap, "last_daily_snapshot_date", None)
+                                if last_date == yesterday_utc and last_cum is not None:
+                                    daily = current - last_cum
+                                else:
+                                    daily = current
+                                snap.daily_gross_profit_usd = daily
+                                snap.last_daily_cumulative_gross = current
+                                snap.last_daily_snapshot_date = today_utc
+                                db.commit()
+                        print(f"[scheduler] user_id={uid} gross_profit={result.gross_profit}")
+                        err_msg = None
+                        break
+                    except Exception as e:
+                        err_msg = str(e)
+                        print(f"[scheduler] user_id={uid} attempt {attempt + 1}/3 error: {e}")
+                        if attempt < 2:
+                            await asyncio.sleep(10.0)
+                if err_msg:
+                    await _record_api_failure("daily_gross_refresh", uid, err_msg)
+            finally:
+                db.close()
+
+
+def _get_next_1015_utc_wait_sec() -> float:
+    """Seconds until next 10:15 UTC."""
+    now = datetime.utcnow()
+    next_run = now.replace(
+        hour=DAILY_DEDUCTION_UTC_HOUR,
+        minute=DAILY_DEDUCTION_UTC_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if next_run <= now:
+        next_run += timedelta(days=1)
+    return (next_run - now).total_seconds()
+
+
+async def _run_daily_token_deduction_scheduler() -> None:
+    """At 10:15 UTC daily, deduct tokens by daily_gross_profit_usd. Retry 3x at 5-min intervals; alert on failure."""
+    while True:
+        wait_sec = _get_next_1015_utc_wait_sec()
+        logger.info("Next daily token deduction at 10:15 UTC in %.0fs", wait_sec)
+        await asyncio.sleep(wait_sec)
+        last_error: Optional[str] = None
+        for attempt in range(DEDUCTION_MAX_RETRIES):
+            db = database.SessionLocal()
+            try:
+                log_entries, err = run_daily_token_deduction(db)
+                if err:
+                    last_error = err
+                    logger.warning("Daily token deduction attempt %d/%d failed: %s", attempt + 1, DEDUCTION_MAX_RETRIES, err)
+                    if attempt < DEDUCTION_MAX_RETRIES - 1:
+                        await asyncio.sleep(DEDUCTION_RETRY_INTERVAL_SEC)
+                    continue
+                for entry in log_entries:
+                    logger.info(
+                        "token_deduction user_id=%s gross_profit=%s tokens_deducted=%s new_tokens_remaining=%s ts=%s",
+                        entry["user_id"],
+                        entry["gross_profit"],
+                        entry["tokens_deducted"],
+                        entry["tokens_remaining_after"],
+                        entry["timestamp"],
+                    )
+                if not log_entries:
+                    logger.info("Daily token deduction: no users to deduct")
+                last_error = None
+                break
+            except Exception as e:
+                last_error = str(e)
+                logger.exception("Daily token deduction attempt %d/%d error: %s", attempt + 1, DEDUCTION_MAX_RETRIES, e)
+                if attempt < DEDUCTION_MAX_RETRIES - 1:
+                    await asyncio.sleep(DEDUCTION_RETRY_INTERVAL_SEC)
+            finally:
+                db.close()
+        if last_error:
+            alert_msg = f"Daily token deduction failed after {DEDUCTION_MAX_RETRIES} retries: {last_error}"
+            logger.error(alert_msg)
+            await _alert_admins_deduction_failure(alert_msg)
+
+
+async def _alert_admins_deduction_failure(message: str) -> None:
+    """Alert admins (e.g. Slack webhook). Set DEDUCTION_ALERT_WEBHOOK_URL in env for Slack."""
+    webhook_url = os.getenv("DEDUCTION_ALERT_WEBHOOK_URL", "").strip()
+    if webhook_url:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    webhook_url,
+                    json={"text": f"[uTrader] {message}"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+        except Exception as e:
+            logger.warning("Failed to send deduction alert webhook: %s", e)
+    # Always recorded in API failures for admin panel
+    await _record_api_failure("daily_token_deduction", None, message)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start in-process daily 09:40 UTC gross profit refresh (dev and prod; no cron needed)
+    scheduler_task = asyncio.create_task(_run_daily_gross_profit_scheduler())
+    deduction_task = asyncio.create_task(_run_daily_token_deduction_scheduler())
+    yield
+    scheduler_task.cancel()
+    deduction_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await deduction_task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="utrader.io API", lifespan=lifespan)
 
 # NextAuth JWT (from /api/auth/token). Set NEXTAUTH_SECRET in env to enable.
 NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
@@ -71,6 +315,44 @@ async def get_redis_or_raise():
         )
 
 
+# --- Registration token award ---
+REGISTRATION_TOKEN_AWARD = 150
+
+
+def _award_registration_tokens(user_id: int, db: Session) -> None:
+    """
+    Award REGISTRATION_TOKEN_AWARD (150) tokens to a new user on registration.
+    Uses user_token_balance: create row if missing, else add 150 to tokens_remaining.
+    Logs for audit; on failure logs error and does not raise (do not block registration).
+    """
+    # Trial initial_credit is 100; we award 150, so store +50 as purchased so formula (initial_credit + purchased - used) = 150.
+    registration_bonus_purchased = max(0, REGISTRATION_TOKEN_AWARD - FREE_TIER_TOKENS)  # 50
+    try:
+        row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+        now = datetime.utcnow()
+        if row is None:
+            row = models.UserTokenBalance(
+                user_id=user_id,
+                tokens_remaining=float(REGISTRATION_TOKEN_AWARD),
+                last_gross_usd_used=0.0,
+                purchased_tokens=float(registration_bonus_purchased),
+                updated_at=now,
+            )
+            db.add(row)
+        else:
+            row.tokens_remaining = float(row.tokens_remaining or 0) + REGISTRATION_TOKEN_AWARD
+            row.purchased_tokens = float(row.purchased_tokens or 0) + registration_bonus_purchased
+            row.updated_at = now
+        db.commit()
+        logger.info("token_award user_id=%s amount=%s reason=registration", user_id, REGISTRATION_TOKEN_AWARD)
+    except Exception as e:
+        logger.exception("token_award failed user_id=%s amount=%s reason=registration error=%s", user_id, REGISTRATION_TOKEN_AWARD, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 # --- Google OAuth ---
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
@@ -108,6 +390,7 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
+    _award_registration_tokens(new_user.id, db)
     return new_user
 
 
@@ -230,7 +513,7 @@ class FundingTradesResponse(BaseModel):
     gross_profit: float
     bitfinex_fee: float
     net_profit: float
-    calculation_breakdown: Optional[CalculationBreakdown] = None
+    calculation_breakdown: Optional["CalculationBreakdown"] = None
 
 
 class CurrencyBreakdownItem(BaseModel):
@@ -291,6 +574,20 @@ class AdminUserUpdate(BaseModel):
     rebalance_interval: Optional[int] = None
 
 
+class ApiFailureOut(BaseModel):
+    id: str
+    ts: str
+    context: str
+    user_id: Optional[int]
+    error: str
+
+
+class AdminRetryBody(BaseModel):
+    """Retry a failed API call: by failure id or by user_id."""
+    failure_id: Optional[str] = None
+    user_id: Optional[int] = None
+
+
 # --- Google Auth Endpoint ---
 @app.post("/auth/google")
 def google_login(payload: GoogleAuthPayload, db: Session = Depends(database.get_db)):
@@ -310,11 +607,14 @@ def google_login(payload: GoogleAuthPayload, db: Session = Depends(database.get_
 async def get_all_bot_stats(
     user_id: int,
     current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
 ):
-    """Fetches live heartbeat data from Redis. Caller must be the same user (user end only)."""
+    """Fetches live heartbeat data from Redis. Caller must be the same user. Includes bot_status from DB."""
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
     redis = await get_redis()
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    bot_status = getattr(user, "bot_status", None) if user else None
 
     keys = await redis.keys(f"status:{user_id}:*")
 
@@ -325,7 +625,12 @@ async def get_all_bot_stats(
             all_engines.append(json.loads(raw_data))
 
     if not all_engines:
-        return {"active": False, "engines": [], "total_loaned": "0.00"}
+        return {
+            "active": False,
+            "engines": [],
+            "total_loaned": "0.00",
+            "bot_status": bot_status or "stopped",
+        }
 
     total_val = sum(float(str(e["loaned"]).replace(",", "")) for e in all_engines)
 
@@ -333,6 +638,7 @@ async def get_all_bot_stats(
         "active": True,
         "engines": all_engines,
         "total_loaned": f"{total_val:,.2f}",
+        "bot_status": bot_status or "running",
     }
 
 
@@ -371,6 +677,24 @@ def _detail_invalid_keys(msg: str) -> str:
 
 
 # --- Connect Exchange (Bitfinex) ---
+async def _trigger_bot_start_after_keys_saved(user_id: int, db: Session) -> None:
+    """Auto-start bot after API keys are saved (idempotent). Does not raise; logs on failure."""
+    try:
+        redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+        enqueued = await _enqueue_bot_task(redis, user_id)
+        if enqueued:
+            user = db.query(models.User).filter(models.User.id == user_id).first()
+            if user and hasattr(user, "bot_status"):
+                user.bot_status = "starting"
+                db.commit()
+    except Exception as e:
+        logger.warning("bot_auto_start_after_keys_saved user_id=%s error=%s", user_id, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 @app.post("/connect-exchange")
 async def connect_exchange(
     payload: APIKeysInput,
@@ -382,6 +706,7 @@ async def connect_exchange(
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    await _trigger_bot_start_after_keys_saved(current_user.id, db)
     return {
         "status": "success",
         "message": result.get("message", "Exchange connected and trial activated."),
@@ -715,6 +1040,10 @@ class ConnectByEmailInput(BaseModel):
     gemini_key: Optional[str] = None
 
 
+class DevLoginAsInput(BaseModel):
+    email: str
+
+
 def _get_or_create_user_by_email(email: str, db: Session) -> models.User:
     """Find user by email, or create one (dev only). Email must be @gmail.com."""
     email = (email or "").strip().lower()
@@ -733,6 +1062,7 @@ def _get_or_create_user_by_email(email: str, db: Session) -> models.User:
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
+    _award_registration_tokens(new_user.id, db)
     return new_user
 
 
@@ -753,6 +1083,7 @@ async def connect_exchange_by_email(
     balance, result = await _validate_and_save_bitfinex_keys(keys_payload, user, db)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
         "status": "success",
         "message": result.get("message", "Exchange connected and trial activated."),
@@ -789,12 +1120,52 @@ async def connect_exchange_update_by_email(
     if payload.gemini_key is not None:
         vault.encrypted_gemini_key = security.encrypt_key(payload.gemini_key) if payload.gemini_key else None
     db.commit()
+    await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
         "status": "success",
         "message": "API keys updated.",
         "balance": balance,
         "user_id": user.id,
     }
+
+
+@app.post("/dev/create-test-user")
+async def dev_create_test_user(
+    payload: DevLoginAsInput,
+    db: Session = Depends(database.get_db),
+):
+    """Dev-only: create a new user by email and award registration tokens (no API keys). For E2E testing. Set ALLOW_DEV_CONNECT=1."""
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    email = (payload.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required.")
+    user = _get_or_create_user_by_email(email, db)
+    return {"user_id": user.id, "email": user.email}
+
+
+@app.post("/dev/login-as")
+async def dev_login_as(
+    payload: DevLoginAsInput,
+    db: Session = Depends(database.get_db),
+):
+    """Dev-only: return a backend JWT for the given email (bypass Google). Set ALLOW_DEV_CONNECT=1 and NEXTAUTH_SECRET."""
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    if not NEXTAUTH_SECRET:
+        raise HTTPException(status_code=500, detail="NEXTAUTH_SECRET not set.")
+    email = (payload.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required.")
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    token = jwt.encode(
+        {"email": user.email, "sub": str(user.id)},
+        NEXTAUTH_SECRET,
+        algorithm="HS256",
+    )
+    return {"token": token}
 
 
 @app.post("/connect-exchange/by-user")
@@ -815,6 +1186,7 @@ async def connect_exchange_by_user(
     balance, result = await _validate_and_save_bitfinex_keys(keys_payload, user, db)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+    await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
         "status": "success",
         "message": result.get("message", "Exchange connected and trial activated."),
@@ -822,7 +1194,33 @@ async def connect_exchange_by_user(
     }
 
 
-# --- Start / Stop Bot ---
+# --- Start / Stop Bot (idempotent; clear ARQ keys to allow re-enqueue after stop) ---
+ARQ_JOB_PREFIX = "arq:job:"
+ARQ_RESULT_PREFIX = "arq:result:"
+ARQ_QUEUE_NAME = "arq:queue"
+
+
+async def _clear_arq_job_keys(redis, job_id: str) -> None:
+    """Remove ARQ keys for job_id so the same id can be enqueued again (idempotent start after stop)."""
+    try:
+        await redis.delete(ARQ_JOB_PREFIX + job_id)
+        await redis.delete(ARQ_RESULT_PREFIX + job_id)
+        await redis.zrem(ARQ_QUEUE_NAME, job_id)
+    except Exception:
+        pass
+
+
+async def _enqueue_bot_task(redis, user_id: int) -> bool:
+    """Enqueue run_bot_task for user_id. Returns True if enqueued, False if already running/queued."""
+    job_id = f"bot_user_{user_id}"
+    job = await redis.enqueue_job("run_bot_task", user_id, _job_id=job_id)
+    if job is not None:
+        return True
+    await _clear_arq_job_keys(redis, job_id)
+    job = await redis.enqueue_job("run_bot_task", user_id, _job_id=job_id)
+    return job is not None
+
+
 @app.post("/start-bot")
 async def start_bot(
     current_user: models.User = Depends(get_current_user),
@@ -836,39 +1234,49 @@ async def start_bot(
         db.commit()
         raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
 
-    # Balance is checked in the worker right before execution; bypass gate here so user can always enqueue
     redis = await get_redis_or_raise()
-    job_id = f"bot_user_{current_user.id}"
-    job = await redis.enqueue_job("run_bot_task", current_user.id, _job_id=job_id)
-    if job is None:
-        # Clear stale result from a previous run so user can start again (worker uses keep_result=0 for new runs)
+    enqueued = await _enqueue_bot_task(redis, current_user.id)
+    if enqueued:
         try:
-            await redis.delete(f"arq:result:{job_id}")
-            job = await redis.enqueue_job("run_bot_task", current_user.id, _job_id=job_id)
+            current_user.bot_status = "starting"
+            db.commit()
         except Exception:
-            pass
-    if job is None:
-        return {"status": "success", "message": "Bot already running or queued."}
-    return {"status": "success", "message": f"Bot queued for user {current_user.id}"}
+            db.rollback()
+        return {"status": "success", "message": f"Bot queued for user {current_user.id}"}
+    return {"status": "success", "message": "Bot already running or queued."}
 
 
 @app.post("/stop-bot")
-async def stop_bot(current_user: models.User = Depends(get_current_user)):
+async def stop_bot(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
     from arq.jobs import Job
     redis = await get_redis_or_raise()
     job_id = f"bot_user_{current_user.id}"
     job = Job(job_id=job_id, redis=redis)
     try:
         aborted = await job.abort()
+        await _clear_arq_job_keys(redis, job_id)  # so next Start enqueues reliably
+        try:
+            current_user.bot_status = "stopped"
+            db.commit()
+        except Exception:
+            db.rollback()
         if aborted:
             return {"status": "success", "message": "Shutdown signal sent"}
     except Exception:
         pass
+    await _clear_arq_job_keys(redis, job_id)
+    try:
+        current_user.bot_status = "stopped"
+        db.commit()
+    except Exception:
+        db.rollback()
     return {"status": "error", "message": "No active bot found"}
 
 
 # Legacy-style control endpoints that address bots by numeric user_id directly.
-# Useful for simple frontends or internal tools without Google auth wiring yet.
 @app.post("/start-bot/{user_id}")
 async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
     try:
@@ -881,19 +1289,16 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
             db.commit()
             raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
 
-        # Balance checked in worker before execution; bypass here so user can always enqueue
         redis = await get_redis_or_raise()
-        job_id = f"bot_user_{user.id}"
-        job = await redis.enqueue_job("run_bot_task", user.id, _job_id=job_id)
-        if job is None:
+        enqueued = await _enqueue_bot_task(redis, user.id)
+        if enqueued:
             try:
-                await redis.delete(f"arq:result:{job_id}")
-                job = await redis.enqueue_job("run_bot_task", user.id, _job_id=job_id)
+                user.bot_status = "starting"
+                db.commit()
             except Exception:
-                pass
-        if job is None:
-            return {"status": "success", "message": "Bot already running or queued."}
-        return {"status": "success", "message": f"Bot queued for user {user.id}"}
+                db.rollback()
+            return {"status": "success", "message": f"Bot queued for user {user.id}"}
+        return {"status": "success", "message": "Bot already running or queued."}
     except HTTPException:
         raise
     except Exception as e:
@@ -901,17 +1306,26 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
 
 
 @app.post("/stop-bot/{user_id}")
-async def stop_bot_for_user(user_id: int):
+async def stop_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
     from arq.jobs import Job
     redis = await get_redis_or_raise()
     job_id = f"bot_user_{user_id}"
     job = Job(job_id=job_id, redis=redis)
+    user = db.query(models.User).filter(models.User.id == user_id).first()
     try:
         aborted = await job.abort()
+        await _clear_arq_job_keys(redis, job_id)
+        if user and hasattr(user, "bot_status"):
+            user.bot_status = "stopped"
+            db.commit()
         if aborted:
             return {"status": "success", "message": "Shutdown signal sent"}
     except Exception:
         pass
+    await _clear_arq_job_keys(redis, job_id)
+    if user and hasattr(user, "bot_status"):
+        user.bot_status = "stopped"
+        db.commit()
     return {"status": "error", "message": "No active bot found"}
 
 
@@ -1161,12 +1575,97 @@ def _max_mts_from_trades(trades: list) -> Optional[int]:
     return max(mts_list) if mts_list else None
 
 
+# --- Ledgers-based gross profit (Margin Funding Payment): from user registration to latest ---
+MARGIN_FUNDING_PAYMENT_DESC = "Margin Funding Payment"
+
+
+def _gross_and_fees_from_ledger_entries(
+    entries: list,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
+) -> tuple[float, float]:
+    """
+    Parse Bitfinex ledger entries (same logic as user script).
+    Entry format: entry[3]=MTS, entry[4] or entry[5]=amount, entry[8]=description.
+    Margin Funding Payment: positive = gross earned, negative = fees paid.
+    If start_ms/end_ms are set, only count entries where start_ms <= entry[3] <= end_ms.
+    Returns (gross_usd, fees_usd).
+    """
+    gross = 0.0
+    fees = 0.0
+    for entry in entries:
+        try:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 9:
+                continue
+            # User script: raw_ts = entry[3]; amount = entry[5] if entry[4] is None else entry[4]; desc = entry[8]
+            raw_ts = entry[3]
+            ts_ms = int(raw_ts) if raw_ts is not None else None
+            if start_ms is not None and (ts_ms is None or ts_ms < start_ms):
+                continue
+            if end_ms is not None and (ts_ms is None or ts_ms > end_ms):
+                continue
+            amount = entry[5] if entry[4] is None else entry[4]
+            amount = float(amount) if amount is not None else 0.0
+            desc = str(entry[8]) if len(entry) > 8 and entry[8] is not None else ""
+            if MARGIN_FUNDING_PAYMENT_DESC not in desc:
+                if "fee" in desc.lower() and amount < 0:
+                    fees += abs(amount)
+                continue
+            if amount > 0:
+                gross += amount
+            else:
+                fees += abs(amount)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return gross, fees
+
+
+async def _fetch_ledgers_script_style(
+    mgr: BitfinexManager,
+    currency: str,
+    limit: int = 100,
+) -> tuple[list, Optional[str]]:
+    """Fetch ledger entries with same API call as user script: POST body {"limit": limit} only (no start/end)."""
+    data, err = await mgr.ledgers_hist(currency=currency, limit=limit)
+    if err:
+        return [], err
+    if not isinstance(data, list):
+        return [], None
+    return data, None
+
+
+async def _gross_profit_from_ledgers(
+    mgr: BitfinexManager,
+    start_ms: int,
+) -> tuple[float, float, Optional[str]]:
+    """
+    Sum gross profit and fees from ledgers (Margin Funding Payment), same API as user script.
+    Fetches USD first (matches user script); then USDT, USDt. Skips a currency on error so one
+    failure (e.g. no USDT ledger) does not discard USD result.
+    Window: [registration (start_ms), end_ms]. Only entries with start_ms <= entry[3] <= end_ms are counted.
+    """
+    end_ms = int(datetime.utcnow().timestamp() * 1000)
+    total_gross = 0.0
+    total_fees = 0.0
+    last_err: Optional[str] = None
+    # Bitfinex ~10 req/s per IP: space ledger calls to stay under limit
+    for i, currency in enumerate(("USD", "USDT", "USDt")):
+        if i > 0:
+            await asyncio.sleep(0.2)
+        entries, err = await _fetch_ledgers_script_style(mgr, currency, limit=100)
+        if err:
+            last_err = err
+            continue
+        g, f = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms)
+        total_gross += g
+        total_fees += f
+    return round(total_gross, 6), round(total_fees, 6), last_err if (last_err is not None and total_gross == 0 and total_fees == 0) else None
+
+
 async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[LendingStatsResponse, bool, List[FundingTradeRecord]]:
     """
-    Fetch repaid lending trades from Bitfinex and update stored gross profit (stack on server).
-    First time or no last_trade_mts: full fetch from vault.created_at to now. Later: only fetch
-    new trades since last_trade_mts (fewer API calls). Bitfinex: POST /v2/auth/r/funding/trades/hist.
-    Returns (result, rate_limited, trade_records). When rate_limited True, caller should set cooldown and use cache.
+    Compute gross profit from Bitfinex: prefer ledgers (Margin Funding Payment from registration to latest),
+    then fall back to funding trades. Persist to user_profit_snapshot and return (result, rate_limited, trade_records).
     """
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user or not user.vault:
@@ -1177,6 +1676,59 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
     if getattr(user.vault, "created_at", None) and user.vault.created_at:
         start_ms = int(user.vault.created_at.timestamp() * 1000)
     snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+
+    # Prefer ledgers-based gross profit (Margin Funding Payment between registration and latest)
+    if start_ms is not None:
+        gross_ledgers, fees_ledgers, err_ledgers = await _gross_profit_from_ledgers(mgr, start_ms)
+        if err_ledgers and bitfinex_cache.is_rate_limit_error(err_ledgers):
+            if snap and snap.gross_profit_usd is not None:
+                gross = float(snap.gross_profit_usd)
+                return LendingStatsResponse(
+                    gross_profit=gross, bitfinex_fee=round(gross * BITFINEX_LENDER_FEE_PCT, 2),
+                    net_profit=round(gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                    total_trades_count=getattr(snap, "total_trades_count", None),
+                ), True, []
+            return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0), True, []
+        if not err_ledgers:
+            net_ledgers = gross_ledgers - fees_ledgers
+            result = LendingStatsResponse(
+                gross_profit=round(gross_ledgers, 2),
+                bitfinex_fee=round(fees_ledgers, 2),
+                net_profit=round(net_ledgers, 2),
+            )
+            if snap:
+                snap.gross_profit_usd = result.gross_profit
+                snap.net_profit_usd = result.net_profit
+                snap.bitfinex_fee_usd = result.bitfinex_fee
+                snap.updated_at = datetime.utcnow()
+            else:
+                db.add(models.UserProfitSnapshot(
+                    user_id=user_id,
+                    gross_profit_usd=result.gross_profit,
+                    net_profit_usd=result.net_profit,
+                    bitfinex_fee_usd=result.bitfinex_fee,
+                ))
+            tier = (user.plan_tier or "trial").lower()
+            initial_credit = PLAN_TOKEN_CREDITS.get(tier, FREE_TIER_TOKENS)
+            token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+            purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
+            gross = float(result.gross_profit)
+            tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
+            tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
+            if token_row:
+                token_row.tokens_remaining = tokens_remaining
+                token_row.last_gross_usd_used = gross
+                token_row.updated_at = datetime.utcnow()
+            else:
+                db.add(models.UserTokenBalance(
+                    user_id=user_id,
+                    tokens_remaining=tokens_remaining,
+                    last_gross_usd_used=gross,
+                ))
+            db.commit()
+            return result, False, []
+
+    # Fallback: funding trades (repaid lending trades)
     last_mts = getattr(snap, "last_trade_mts", None) if snap else None
     incremental = last_mts is not None
 
@@ -1455,7 +2007,8 @@ async def cron_refresh_lending_stats(
         raise HTTPException(status_code=403, detail="Forbidden")
     try:
         result, rate_limited, _ = await _refresh_user_lending_snapshot(body.user_id, db)
-    except Exception:
+    except Exception as e:
+        await _record_api_failure("cron_refresh", body.user_id, str(e))
         result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
     if not rate_limited:
         cache_data = result.model_dump()
@@ -1630,16 +2183,23 @@ def get_user_status(
     tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
     tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
 
-    # Utilization from latest PerformanceLog, if available.
-    log = (
-        db.query(models.PerformanceLog)
-        .filter(models.PerformanceLog.user_id == user_id)
-        .order_by(models.PerformanceLog.timestamp.desc())
-        .first()
-    )
-    total_assets = float(log.total_assets) if log and log.total_assets is not None else 0.0
-    used_amount = min(total_assets, user.lending_limit or 0.0)
-    utilization_pct = (used_amount / user.lending_limit * 100.0) if user.lending_limit else 0.0
+    # Utilization from latest PerformanceLog, if available (table may lack waroc column).
+    total_assets = 0.0
+    used_amount = 0.0
+    utilization_pct = 0.0
+    try:
+        log = (
+            db.query(models.PerformanceLog)
+            .filter(models.PerformanceLog.user_id == user_id)
+            .order_by(models.PerformanceLog.timestamp.desc())
+            .first()
+        )
+        if log and log.total_assets is not None:
+            total_assets = float(log.total_assets)
+        used_amount = min(total_assets, user.lending_limit or 0.0)
+        utilization_pct = (used_amount / user.lending_limit * 100.0) if user.lending_limit else 0.0
+    except ProgrammingError:
+        pass
 
     return UserStatusResponse(
         plan_tier=user.plan_tier or "trial",
@@ -1651,7 +2211,7 @@ def get_user_status(
         tokens_remaining=tokens_remaining,
         tokens_used=tokens_used,
         initial_token_credit=int(initial_credit) + int(purchased),
-        gross_profit_usd=gross,
+        gross_profit_usd=round(gross, 2),
     )
 
 
@@ -1722,6 +2282,48 @@ def update_user(
         pro_expiry=user.pro_expiry,
         status=user.status or "active",
     )
+
+
+@app.get("/admin/api-failures", response_model=List[ApiFailureOut])
+async def list_api_failures(
+    limit: int = Query(100, ge=1, le=200),
+    _: models.User = Depends(get_admin_user),
+):
+    """Recent API failures (e.g. daily gross refresh, Bitfinex errors) for admin panel."""
+    raw = await _get_api_failures(limit=limit)
+    return [ApiFailureOut(id=e["id"], ts=e["ts"], context=e["context"], user_id=e.get("user_id"), error=e["error"]) for e in raw]
+
+
+@app.post("/admin/api-failures/retry")
+async def retry_api_failure(
+    body: AdminRetryBody,
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Retry a failed gross profit refresh for a user (by failure_id or user_id)."""
+    user_id: Optional[int] = None
+    if body.user_id is not None:
+        user_id = body.user_id
+    elif body.failure_id:
+        async with _api_failures_lock:
+            for e in _api_failures:
+                if e.get("id") == body.failure_id:
+                    user_id = e.get("user_id")
+                    break
+        if user_id is None:
+            raise HTTPException(status_code=404, detail="Failure not found or has no user_id.")
+    else:
+        raise HTTPException(status_code=400, detail="Provide failure_id or user_id.")
+    try:
+        result, rate_limited, _ = await _refresh_user_lending_snapshot(user_id, db)
+        if not rate_limited:
+            cache_data = result.model_dump()
+            cache_data.pop("trades", None)
+            await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
+        return {"ok": True, "user_id": user_id, "gross_profit": result.gross_profit}
+    except Exception as e:
+        await _record_api_failure("admin_retry", user_id, str(e))
+        raise HTTPException(status_code=502, detail=f"Retry failed: {e}")
 
 
 def _aggregate_lent_per_currency(credits_data: Any) -> dict:
@@ -2169,23 +2771,78 @@ async def wallet_summary(
 # --- Stripe Webhook (referrals + subscription) ---
 stripe.api_key = os.getenv("STRIPE_API_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-# Price IDs: Pro 20 USDT/mo, AI Ultra 60 USDT/mo, Whales 200 USDT/mo (create in Stripe Dashboard)
+# Price IDs: monthly and yearly (create in Stripe Dashboard)
 STRIPE_PRICE_PRO_MONTHLY = os.getenv("STRIPE_PRICE_PRO_MONTHLY", "")
 STRIPE_PRICE_AI_ULTRA_MONTHLY = os.getenv("STRIPE_PRICE_AI_ULTRA_MONTHLY", "")
 STRIPE_PRICE_WHALES_MONTHLY = os.getenv("STRIPE_PRICE_WHALES_MONTHLY", "")
+STRIPE_PRICE_PRO_YEARLY = os.getenv("STRIPE_PRICE_PRO_YEARLY", "")
+STRIPE_PRICE_AI_ULTRA_YEARLY = os.getenv("STRIPE_PRICE_AI_ULTRA_YEARLY", "")
+STRIPE_PRICE_WHALES_YEARLY = os.getenv("STRIPE_PRICE_WHALES_YEARLY", "")
 
 # Plan limits and rebalance (minutes) for webhook
 PLAN_REBALANCE_MIN = {"pro": 30, "ai_ultra": 3, "whales": 1}
 PLAN_LENDING_LIMIT = {"pro": 250_000.0, "ai_ultra": 250_000.0, "whales": 1_500_000.0}
 
+# Token award per subscription payment (added to purchased_tokens in webhook)
+PLAN_TOKEN_AWARD_MONTHLY = {"pro": 2000, "ai_ultra": 9000, "whales": 40000}
+PLAN_TOKEN_AWARD_YEARLY = {"pro": 24000, "ai_ultra": 108000, "whales": 480000}
+
 
 class CreateCheckoutPayload(BaseModel):
     plan: str  # "pro" | "ai_ultra" | "whales"
-    interval: str  # "monthly" (only monthly for new plans)
+    interval: str  # "monthly" | "yearly"
 
 
 class CreateCheckoutTokensPayload(BaseModel):
     amount_usd: float  # e.g. 10 → user gets 1000 tokens (1 USD = 100 tokens)
+
+
+# --- Token deposit (Add tokens): USD × 10 = tokens, min $1 (Stripe checkout placeholder) ---
+class TokenDepositPayload(BaseModel):
+    usd_amount: float
+
+
+@app.post("/api/v1/tokens/deposit")
+def token_deposit(
+    payload: TokenDepositPayload,
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Validate USD amount and compute tokens to award (tokens = round(usd_amount × 10)).
+    Minimum $1. No Stripe checkout yet; returns calculation only.
+    """
+    usd_amount = payload.usd_amount
+    user_id = current_user.id
+
+    # Validation: must be a number and >= 1
+    try:
+        amount_float = float(usd_amount)
+    except (TypeError, ValueError):
+        msg = "Please enter a valid USD amount"
+        logger.warning("token_deposit_validation_failed user_id=%s usd_amount=%s error=%s", user_id, usd_amount, msg)
+        return JSONResponse(status_code=400, content={"status": "error", "message": msg})
+
+    if isinstance(usd_amount, bool) or (not isinstance(usd_amount, (int, float))):
+        msg = "Please enter a valid USD amount"
+        logger.warning("token_deposit_validation_failed user_id=%s usd_amount=%s error=%s", user_id, usd_amount, msg)
+        return JSONResponse(status_code=400, content={"status": "error", "message": msg})
+
+    if amount_float < 1:
+        msg = "Minimum deposit is $1"
+        logger.warning("token_deposit_validation_failed user_id=%s usd_amount=%s error=%s", user_id, usd_amount, msg)
+        return JSONResponse(status_code=400, content={"status": "error", "message": msg})
+
+    # int() so $10.99 → 109 tokens (spec); use round() for true nearest-integer if preferred
+    tokens_to_award = int(amount_float * 10)
+    logger.info("token_deposit_calculation user_id=%s usd_amount=%s tokens_to_award=%s", user_id, amount_float, tokens_to_award)
+
+    # TODO: Add Stripe checkout session creation here
+    return {
+        "status": "success",
+        "usd_amount": amount_float,
+        "tokens_to_award": tokens_to_award,
+        "message": "Stripe checkout setup pending (add later)",
+    }
 
 
 @app.post("/api/create-checkout-session-tokens")
@@ -2223,29 +2880,43 @@ async def create_checkout_session_tokens(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _get_stripe_price_id(plan: str, interval: str) -> str:
+    """Return Stripe Price ID for plan + interval. Empty string if not configured."""
+    if interval == "yearly":
+        if plan == "pro":
+            return STRIPE_PRICE_PRO_YEARLY or ""
+        if plan == "ai_ultra":
+            return STRIPE_PRICE_AI_ULTRA_YEARLY or ""
+        if plan == "whales":
+            return STRIPE_PRICE_WHALES_YEARLY or ""
+    else:
+        if plan == "pro":
+            return STRIPE_PRICE_PRO_MONTHLY or ""
+        if plan == "ai_ultra":
+            return STRIPE_PRICE_AI_ULTRA_MONTHLY or ""
+        if plan == "whales":
+            return STRIPE_PRICE_WHALES_MONTHLY or ""
+    return ""
+
+
 @app.post("/api/create-checkout-session")
 async def create_checkout_session(
     payload: CreateCheckoutPayload,
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Create a Stripe Checkout Session. Plans: pro 20 USDT, ai_ultra 60 USDT, whales 200 USDT per month.
+    Create a Stripe Checkout Session. Monthly: Pro 20, AI Ultra 60, Whales 200 USDT/mo.
+    Yearly: Pro 192, AI Ultra 576, Whales 1920 USDT/year.
     """
     plan = (payload.plan or "").lower()
     interval = (payload.interval or "monthly").lower()
-    if plan not in ("pro", "ai_ultra", "whales") or interval != "monthly":
-        raise HTTPException(status_code=400, detail="Invalid plan or interval. Only monthly is supported.")
-    price_id = None
-    if plan == "pro":
-        price_id = STRIPE_PRICE_PRO_MONTHLY
-    elif plan == "ai_ultra":
-        price_id = STRIPE_PRICE_AI_ULTRA_MONTHLY
-    elif plan == "whales":
-        price_id = STRIPE_PRICE_WHALES_MONTHLY
+    if plan not in ("pro", "ai_ultra", "whales") or interval not in ("monthly", "yearly"):
+        raise HTTPException(status_code=400, detail="Invalid plan or interval. Use plan: pro|ai_ultra|whales, interval: monthly|yearly.")
+    price_id = _get_stripe_price_id(plan, interval)
     if not price_id or not stripe.api_key:
         raise HTTPException(
             status_code=503,
-            detail="Subscription is not configured. Please set STRIPE_API_KEY and Stripe Price IDs in the server environment.",
+            detail="Subscription is not configured. Please set STRIPE_API_KEY and Stripe Price IDs (monthly and/or yearly) in the server environment.",
         )
     origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
     try:
@@ -2256,7 +2927,7 @@ async def create_checkout_session(
             success_url=origin + "/dashboard?subscription=success",
             cancel_url=origin + "/dashboard?subscription=cancel",
             metadata={"user_id": str(current_user.id), "plan": plan, "interval": interval},
-            subscription_data={"metadata": {"plan": plan, "user_id": str(current_user.id)}},
+            subscription_data={"metadata": {"plan": plan, "user_id": str(current_user.id), "interval": interval}},
         )
         return {"url": session.url}
     except Exception as e:
@@ -2309,11 +2980,15 @@ async def stripe_webhook(request: Request):
 
             interval_days = 30
             plan = "pro"
+            interval = "monthly"
             sub_id = data.get("subscription")
             if sub_id:
                 try:
                     sub = stripe.Subscription.retrieve(sub_id)
-                    plan = (sub.metadata or {}).get("plan") or "pro"
+                    meta = sub.metadata or {}
+                    plan = meta.get("plan") or "pro"
+                    interval = (meta.get("interval") or "monthly").lower()
+                    interval_days = 365 if interval == "yearly" else 30
                 except Exception:
                     pass
 
@@ -2325,6 +3000,30 @@ async def stripe_webhook(request: Request):
             now = datetime.utcnow()
             base = user.pro_expiry if user.pro_expiry and user.pro_expiry > now else now
             user.pro_expiry = base + timedelta(days=interval_days)
+
+            # Award plan-specific tokens to purchased_tokens (add, do not overwrite)
+            tokens_to_award = (
+                PLAN_TOKEN_AWARD_YEARLY.get(plan, 0)
+                if interval == "yearly"
+                else PLAN_TOKEN_AWARD_MONTHLY.get(plan, 0)
+            )
+            if tokens_to_award > 0:
+                token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user.id).first()
+                if token_row:
+                    token_row.purchased_tokens = float(token_row.purchased_tokens or 0) + tokens_to_award
+                    token_row.updated_at = now
+                else:
+                    db.add(models.UserTokenBalance(
+                        user_id=user.id,
+                        purchased_tokens=float(tokens_to_award),
+                        tokens_remaining=0.0,
+                        last_gross_usd_used=0.0,
+                        updated_at=now,
+                    ))
+                logger.info(
+                    "subscription_token_award user_id=%s plan=%s interval=%s tokens_added=%s timestamp=%s",
+                    user.id, plan, interval, tokens_to_award, now.isoformat(),
+                )
 
             if user.referred_by:
                 referrer = db.query(models.User).filter(models.User.id == user.referred_by).first()

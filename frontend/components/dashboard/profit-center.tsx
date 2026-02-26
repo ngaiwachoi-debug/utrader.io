@@ -7,6 +7,7 @@ import {
   Wallet,
   BarChart3,
   Clock,
+  RefreshCw,
 } from "lucide-react"
 import { useDateRange } from "@/lib/date-range-context"
 import { useT } from "@/lib/i18n"
@@ -117,6 +118,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const [lendingRateLimited, setLendingRateLimited] = useState(false)
   const [tradesCount, setTradesCount] = useState<number | null>(null)
   const [fundingTrades, setFundingTrades] = useState<Array<{ id: number; currency: string; mts_create: number; amount: number; rate: number; period: number; interest_usd: number }>>([])
+  const [refreshing, setRefreshing] = useState(false)
   const [calculationBreakdown, setCalculationBreakdown] = useState<{
     trades_count: number
     per_currency: Array<{ currency: string; interest_ccy: number; ticker_price_usd: number; interest_usd: number }>
@@ -146,57 +148,33 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         setError(null)
         const token = await getBackendToken()
         const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-        // On dashboard load: force refresh gross profit from Bitfinex (returns repaid lending trades), then fetch stats
-        let grossFromRefresh: number | null = null
-        let netFromRefresh: number | null = null
-        try {
-          const refreshRes = await fetch(`${API_BASE}/api/refresh-lending-stats`, { method: "POST", credentials: "include", headers })
-          if (refreshRes.ok) {
-            const refreshData = await refreshRes.json()
-            const trades = refreshData.trades
-            const arr = Array.isArray(trades) ? trades : []
-            setTradesCount(
-              typeof refreshData.total_trades_count === "number"
-                ? refreshData.total_trades_count
-                : arr.length
-            )
-            setFundingTrades(arr)
-            if (refreshData.calculation_breakdown) {
-              setCalculationBreakdown(refreshData.calculation_breakdown)
-            } else {
-              setCalculationBreakdown(null)
-            }
-            grossFromRefresh = typeof refreshData.gross_profit === "number" ? refreshData.gross_profit : null
-            netFromRefresh = typeof refreshData.net_profit === "number" ? refreshData.net_profit : null
-          }
-        } catch {
-          // ignore refresh failure; we still load from cache/GET below
-        }
         const start = range.start.toISOString().slice(0, 10)
         const end = range.end.toISOString().slice(0, 10)
-        // Prefer lending stats (Bitfinex since registration); fallback to /stats
-        const lendingRes = await fetch(`${API_BASE}/stats/${userId}/lending`)
+
+        // Gross Profit and Net Profit: single direct backend source (server is source of truth)
+        const lendingRes = await fetch(`${API_BASE}/stats/${userId}/lending`, { credentials: "include", headers })
         const src = lendingRes.headers.get("X-Data-Source")
         setLendingDataSource(src === "cache" ? "cache" : "live")
         setLendingRateLimited(lendingRes.headers.get("X-Rate-Limited") === "true")
-        let gross = grossFromRefresh ?? 0
-        let net = netFromRefresh ?? 0
-        if (grossFromRefresh == null || netFromRefresh == null) {
-          if (lendingRes.ok) {
-            const lendingData = await lendingRes.json()
-            gross = lendingData.gross_profit ?? 0
-            net = lendingData.net_profit ?? 0
-          } else {
-            const statsRes = await fetch(`${API_BASE}/stats/${userId}?start=${start}&end=${end}`)
-            if (statsRes.ok) {
-              const data = await statsRes.json()
-              gross = data.gross_profit ?? 0
-              net = data.net_profit ?? 0
-            }
-          }
+        if (lendingRes.ok) {
+          const lendingData = await lendingRes.json()
+          setGrossProfit(typeof lendingData.gross_profit === "number" ? lendingData.gross_profit : 0)
+          setNetProfit(typeof lendingData.net_profit === "number" ? lendingData.net_profit : 0)
+          const trades = Array.isArray(lendingData.trades) ? lendingData.trades : []
+          setFundingTrades(trades)
+          setTradesCount(
+            typeof lendingData.total_trades_count === "number"
+              ? lendingData.total_trades_count
+              : trades.length
+          )
+          setCalculationBreakdown(lendingData.calculation_breakdown ?? null)
+        } else {
+          setGrossProfit(0)
+          setNetProfit(0)
+          setFundingTrades([])
+          setTradesCount(null)
+          setCalculationBreakdown(null)
         }
-        setGrossProfit(gross)
-        setNetProfit(net)
 
         const [historyRes, statusRes] = await Promise.all([
           fetch(`${API_BASE}/stats/${userId}/history?start=${start}&end=${end}`, { credentials: "include", headers }),
@@ -229,6 +207,28 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
     fetchStats()
   }, [userId, range.start, range.end, t])
 
+  const refreshFromServer = async () => {
+    if (userId == null) return
+    setRefreshing(true)
+    try {
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      const res = await fetch(`${API_BASE}/api/refresh-lending-stats`, { method: "POST", credentials: "include", headers })
+      if (res.ok) {
+        const data = await res.json()
+        setGrossProfit(typeof data.gross_profit === "number" ? data.gross_profit : 0)
+        setNetProfit(typeof data.net_profit === "number" ? data.net_profit : 0)
+        const trades = Array.isArray(data.trades) ? data.trades : []
+        setFundingTrades(trades)
+        setTradesCount(typeof data.total_trades_count === "number" ? data.total_trades_count : trades.length)
+        setCalculationBreakdown(data.calculation_breakdown ?? null)
+        setLendingDataSource("live")
+      }
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   if (userId == null) {
     return (
       <div className="flex flex-col gap-6">
@@ -243,11 +243,22 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   return (
     <div className="flex flex-col gap-6">
       {/* Page Title */}
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">{t("dashboard.profitCenter")}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {t("dashboard.profitCenterDesc")}
-        </p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h1 className="text-2xl font-bold text-foreground">{t("dashboard.profitCenter")}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t("dashboard.profitCenterDesc")}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={refreshFromServer}
+          disabled={refreshing || loading}
+          className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground hover:bg-secondary disabled:opacity-50"
+        >
+          <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+          {refreshing ? "Refreshing…" : "Refresh from server"}
+        </button>
       </div>
 
       {error && (

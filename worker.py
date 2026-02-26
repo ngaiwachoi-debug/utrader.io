@@ -72,6 +72,12 @@ async def run_bot_task(ctx, user_id: int):
         vault = user.vault
         keys = vault.get_keys()
 
+        try:
+            user.bot_status = "running"
+            db.commit()
+        except Exception:
+            db.rollback()
+
         log_lines: list[str] = []
         manager = PortfolioManager(
             user_id=user_id,
@@ -139,6 +145,13 @@ async def run_bot_task(ctx, user_id: int):
     except Exception as e:
         print(f"[CRITICAL] Worker failed for User {user_id}: {e}")
     finally:
+        try:
+            u = db.query(models.User).filter(models.User.id == user_id).first()
+            if u and hasattr(u, "bot_status"):
+                u.bot_status = "stopped"
+                db.commit()
+        except Exception:
+            db.rollback()
         db.close()
         print(f"[INFO] Cleanup complete for User {user_id}")
 

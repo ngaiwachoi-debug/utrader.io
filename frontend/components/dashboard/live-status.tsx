@@ -82,6 +82,19 @@ type WalletSummary = {
   offers_detail?: CreditDetail[]
 }
 
+/** Client-side cache for Live Status: 10 minutes. No reload except on Refresh click. */
+const LIVE_STATUS_CACHE_TTL_MS = 10 * 60 * 1000
+type LiveStatusCacheEntry = {
+  fetchedAt: number
+  botActive: boolean | null
+  totalAssets: number | null
+  walletSummary: WalletSummary | null
+  walletError: string | null
+  walletDataSource: "live" | "cache" | null
+  walletRateLimited: boolean
+}
+const liveStatusCache: Record<number, LiveStatusCacheEntry> = {}
+
 export function LiveStatus() {
   const t = useT()
   const userId = useCurrentUserId()
@@ -126,15 +139,22 @@ export function LiveStatus() {
         fetch(`${API_BASE}/bot-stats/${userId}`, { credentials: "include", headers }),
         fetch(`${API_BASE}/wallets/${userId}`, { credentials: "include", headers }),
       ])
+      let nextBotActive: boolean | null = null
+      let nextTotalAssets: number | null = null
+      let nextWalletSummary: WalletSummary | null = walletSummary
+      let nextWalletError: string | null = null
+      let nextWalletDataSource: "live" | "cache" | null = null
+      let nextWalletRateLimited = false
+
       if (botRes.ok) {
         const data = await botRes.json()
-        setBotActive(Boolean(data.active))
+        nextBotActive = Boolean(data.active)
         const total = parseFloat(String(data.total_loaned ?? "0").replace(/,/g, ""))
-        setTotalAssets(Number.isFinite(total) ? total : 0)
+        nextTotalAssets = Number.isFinite(total) ? total : 0
       }
       if (walletsRes.ok) {
         const wallets = await walletsRes.json()
-        setWalletSummary({
+        nextWalletSummary = {
           total_usd_all: Number(wallets.total_usd_all) || 0,
           usd_only: Number(wallets.usd_only) || 0,
           per_currency: wallets.per_currency || {},
@@ -154,21 +174,34 @@ export function LiveStatus() {
           offers_count: Number(wallets.offers_count) ?? 0,
           credits_detail: Array.isArray(wallets.credits_detail) ? wallets.credits_detail : [],
           offers_detail: Array.isArray(wallets.offers_detail) ? wallets.offers_detail : [],
-        })
-        const src = walletsRes.headers.get("X-Data-Source")
-        setWalletDataSource(src === "cache" ? "cache" : "live")
-        setWalletRateLimited(walletsRes.headers.get("X-Rate-Limited") === "true")
-        setWalletError(null)
+        }
+        nextWalletDataSource = walletsRes.headers.get("X-Data-Source") === "cache" ? "cache" : "live"
+        nextWalletRateLimited = walletsRes.headers.get("X-Rate-Limited") === "true"
       } else {
         const incomplete = walletsRes.headers.get("X-Data-Incomplete") === "true"
-        const msg =
+        nextWalletError =
           walletsRes.status === 503 || incomplete
             ? t("liveStatus.dataIncomplete")
             : t("liveStatus.connectApiKeys")
-        setWalletError(msg)
-        // Keep previous walletSummary so we don't flash wrong numbers
       }
+
+      setBotActive(nextBotActive)
+      setTotalAssets(nextTotalAssets)
+      setWalletSummary(nextWalletSummary)
+      setWalletError(nextWalletError)
+      setWalletDataSource(nextWalletDataSource)
+      setWalletRateLimited(nextWalletRateLimited)
       setRefreshCooldownUntil(Date.now() + REFRESH_COOLDOWN_SEC * 1000)
+
+      liveStatusCache[userId] = {
+        fetchedAt: Date.now(),
+        botActive: nextBotActive,
+        totalAssets: nextTotalAssets,
+        walletSummary: nextWalletSummary,
+        walletError: nextWalletError,
+        walletDataSource: nextWalletDataSource,
+        walletRateLimited: nextWalletRateLimited,
+      }
     } catch (e) {
       console.error("Failed to fetch live status", e)
       setError(t("liveStatus.unableToLoad"))
@@ -183,9 +216,40 @@ export function LiveStatus() {
       setWalletSummary(null)
       setWalletError(null)
       setBotActive(null)
+      setWalletDataSource(null)
+      setWalletRateLimited(false)
+      return
+    }
+    const cached = liveStatusCache[userId]
+    if (cached && Date.now() - cached.fetchedAt < LIVE_STATUS_CACHE_TTL_MS) {
+      setBotActive(cached.botActive)
+      setTotalAssets(cached.totalAssets)
+      setWalletSummary(cached.walletSummary)
+      setWalletError(cached.walletError)
+      setWalletDataSource(cached.walletDataSource)
+      setWalletRateLimited(cached.walletRateLimited)
+      setLoading(false)
       return
     }
     refreshStatus()
+  }, [userId])
+
+  // Poll bot status every 5s so Running/Stopped updates without full refresh
+  const BOT_STATUS_POLL_MS = 5000
+  useEffect(() => {
+    if (userId == null) return
+    const pollBotStatus = async () => {
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      fetch(`${API_BASE}/bot-stats/${userId}`, { credentials: "include", headers })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data && typeof data.active === "boolean") setBotActive(data.active)
+        })
+        .catch(() => {})
+    }
+    const t = setInterval(pollBotStatus, BOT_STATUS_POLL_MS)
+    return () => clearInterval(t)
   }, [userId])
 
 

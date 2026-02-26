@@ -19,19 +19,25 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
   const [isLoading, setIsLoading] = useState(true)
 
   const fetchMe = useCallback(async () => {
-    if (status !== "authenticated" || !session?.user) {
+    const { getBackendToken } = await import("@/lib/auth")
+    const token = await getBackendToken()
+    if (!token) {
       setUserId(null)
       setIsLoading(false)
       return
     }
-    try {
-      const { getBackendToken } = await import("@/lib/auth")
-      const token = await getBackendToken()
-      if (!token) {
+    // When NextAuth is unauthenticated, only continue if we have a dev token (e.g. "Dev: Login as choiwangai")
+    if (status !== "authenticated" && !session?.user) {
+      const hasDevToken =
+        typeof window !== "undefined" &&
+        sessionStorage.getItem("utrader_dev_backend_token")
+      if (!hasDevToken) {
         setUserId(null)
         setIsLoading(false)
         return
       }
+    }
+    try {
       const res = await fetch(`${API_BASE}/api/me`, {
         credentials: "include",
         headers: { Authorization: `Bearer ${token}` },
@@ -50,9 +56,17 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
   }, [status, session?.user])
 
   useEffect(() => {
-    if (status === "unauthenticated" || status === "loading") {
+    if (status === "loading") {
       setUserId(null)
-      setIsLoading(status === "loading")
+      setIsLoading(true)
+      return
+    }
+    const hasDevToken =
+      typeof window !== "undefined" &&
+      sessionStorage.getItem("utrader_dev_backend_token")
+    if (status === "unauthenticated" && !hasDevToken) {
+      setUserId(null)
+      setIsLoading(false)
       return
     }
     fetchMe()
