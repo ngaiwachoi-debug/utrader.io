@@ -229,7 +229,7 @@ class FundingTradesResponse(BaseModel):
     gross_profit: float
     bitfinex_fee: float
     net_profit: float
-    calculation_breakdown: Optional[CalculationBreakdown] = None
+    calculation_breakdown: Optional["CalculationBreakdown"] = None
 
 
 class CurrencyBreakdownItem(BaseModel):

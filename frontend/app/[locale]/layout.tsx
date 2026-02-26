@@ -1,12 +1,8 @@
 import type { Metadata, Viewport } from 'next'
-import { Inter, Geist_Mono } from 'next/font/google'
 import { Analytics } from '@vercel/analytics/next'
 import { Providers } from '@/components/providers'
 import { Toaster } from 'sonner'
 import '../globals.css'
-
-const _inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
-const _geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
 
 export const metadata: Metadata = {
   title: 'uTrader.io - Crypto Lending Dashboard',
@@ -41,9 +37,39 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   // suppressHydrationWarning: ignores mismatches from browser extensions (e.g. Bitdefender's bis_skin_checked).
+  // Pre-hydration: remove extension-injected attributes (e.g. Bitdefender bis_skin_checked) so React doesn't see a server/client mismatch.
+  const removeExtensionAttrs = `
+    (function(){
+      var attrs = ['bis_skin_checked','cz-shortcut-listen','data-gramm','data-new-gr-c-s-check-loaded'];
+      function clean(el){
+        if (!el || !el.removeAttribute) return;
+        attrs.forEach(function(a){ el.removeAttribute(a); });
+        if (el.children) for (var i=0;i<el.children.length;i++) clean(el.children[i]);
+      }
+      function run(){
+        clean(document.documentElement);
+        if (document.body) clean(document.body);
+        if (document.body) {
+          var obs = new MutationObserver(function(mutations){
+            mutations.forEach(function(m){ if (m.type==='attributes') clean(m.target); });
+          });
+          obs.observe(document.body, { attributes: true, attributeFilter: attrs, subtree: true });
+        }
+      }
+      function schedule(){ if (document.body) run(); else setTimeout(schedule, 0); }
+      if (document.readyState==='loading') { document.addEventListener('DOMContentLoaded', run); schedule(); }
+      else run();
+    })();
+  `;
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${_inter.variable} ${_geistMono.variable} font-sans antialiased`} suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: removeExtensionAttrs }} />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet" />
+      </head>
+      <body className="font-sans antialiased" suppressHydrationWarning>
         <Providers>
           <div suppressHydrationWarning>{children}</div>
         </Providers>
