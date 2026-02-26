@@ -229,7 +229,7 @@ class FundingTradesResponse(BaseModel):
     gross_profit: float
     bitfinex_fee: float
     net_profit: float
-    calculation_breakdown: Optional["CalculationBreakdown"] = None
+    calculation_breakdown: Optional[CalculationBreakdown] = None
 
 
 class CurrencyBreakdownItem(BaseModel):
@@ -313,24 +313,15 @@ async def get_all_bot_stats(
     """Fetches live heartbeat data from Redis. Caller must be the same user (user end only)."""
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
-    try:
-        redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
-    except (asyncio.TimeoutError, Exception):
-        return {"active": False, "engines": [], "total_loaned": "0.00"}
+    redis = await get_redis()
 
-    try:
-        keys = await redis.keys(f"status:{user_id}:*")
-    except Exception:
-        return {"active": False, "engines": [], "total_loaned": "0.00"}
+    keys = await redis.keys(f"status:{user_id}:*")
 
     all_engines = []
     for key in keys:
-        try:
-            raw_data = await redis.get(key)
-            if raw_data:
-                all_engines.append(json.loads(raw_data))
-        except Exception:
-            continue
+        raw_data = await redis.get(key)
+        if raw_data:
+            all_engines.append(json.loads(raw_data))
 
     if not all_engines:
         return {"active": False, "engines": [], "total_loaned": "0.00"}
@@ -830,15 +821,12 @@ async def connect_exchange_by_user(
     }
 
 
-# --- Start / Stop Bot (user-end: only the logged-in user can start/stop their own bot) ---
-# Status is user-end: GET /bot-stats/{user_id} and GET /terminal-logs/{user_id} require auth and user_id == current_user.id.
-# The bot runs on the server (ARQ worker). User turns it on/off only via Live Status (Start Bot / Stop Bot) or after saving API keys.
+# --- Start / Stop Bot ---
 @app.post("/start-bot")
 async def start_bot(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
-    """User-end: start the lending bot for the currently logged-in user. Bot runs on server."""
     if not current_user.vault:
         raise HTTPException(status_code=404, detail="API keys not found.")
 
@@ -865,7 +853,6 @@ async def start_bot(
 
 @app.post("/stop-bot")
 async def stop_bot(current_user: models.User = Depends(get_current_user)):
-    """User-end: stop the lending bot for the currently logged-in user."""
     from arq.jobs import Job
     redis = await get_redis_or_raise()
     job_id = f"bot_user_{current_user.id}"
@@ -879,7 +866,8 @@ async def stop_bot(current_user: models.User = Depends(get_current_user)):
     return {"status": "error", "message": "No active bot found"}
 
 
-# Dev/admin only: start/stop bot by user_id (no auth). Do not use from the product frontend.
+# Legacy-style control endpoints that address bots by numeric user_id directly.
+# Useful for simple frontends or internal tools without Google auth wiring yet.
 @app.post("/start-bot/{user_id}")
 async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
     try:
@@ -913,7 +901,6 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
 
 @app.post("/stop-bot/{user_id}")
 async def stop_bot_for_user(user_id: int):
-    """Dev/admin only: stop bot by user_id. Do not use from the product frontend."""
     from arq.jobs import Job
     redis = await get_redis_or_raise()
     job_id = f"bot_user_{user_id}"

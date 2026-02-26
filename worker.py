@@ -58,7 +58,7 @@ async def run_bot_task(ctx, user_id: int):
         user.rebalance_interval = cfg["sleep_minutes"]
         db.commit()
 
-        # Balance check right before bot executes (user-end requested). Bypass on low token balance for now.
+        # Balance check right before bot runs; if low, log and bypass for now (product: allow run)
         snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
         gross = float(snap.gross_profit_usd) if snap and snap.gross_profit_usd is not None else 0.0
         tier = (user.plan_tier or "trial").lower()
@@ -67,7 +67,7 @@ async def run_bot_task(ctx, user_id: int):
         purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
         tokens_remaining = max(0.0, float(initial) + purchased - int(gross * TOKENS_PER_USDT_GROSS))
         if tokens_remaining < 0.1:
-            print(f"[INFO] User {user_id} token balance below 0.1 (bypassing). Bot will run.")
+            print(f"[INFO] User {user_id} token balance below 0.1 (bypassing for now). Bot will run.")
 
         vault = user.vault
         keys = vault.get_keys()
@@ -137,11 +137,7 @@ async def run_bot_task(ctx, user_id: int):
     except asyncio.CancelledError:
         print(f"[SHUTDOWN] Task for User {user_id} was cancelled gracefully.")
     except Exception as e:
-        msg = str(e).lower()
-        if "balance" in msg or "insufficient" in msg:
-            print(f"[INFO] User {user_id} balance-related error (bypassing): {e}")
-        else:
-            print(f"[CRITICAL] Worker failed for User {user_id}: {e}")
+        print(f"[CRITICAL] Worker failed for User {user_id}: {e}")
     finally:
         db.close()
         print(f"[INFO] Cleanup complete for User {user_id}")
