@@ -56,7 +56,6 @@ export function SettingsPage() {
   const [initialTokenCredit, setInitialTokenCredit] = useState<number | null>(null)
   const [usedAmount, setUsedAmount] = useState<number>(0)
   const [trialRemainingDays, setTrialRemainingDays] = useState<number | null>(null)
-  const [statusError, setStatusError] = useState<string | null>(null)
 
   useEffect(() => {
     if (userId == null) {
@@ -65,19 +64,14 @@ export function SettingsPage() {
       setLendingLimit(250000)
       setRebalanceMinutes(3)
       setTrialRemainingDays(null)
-      setStatusError(null)
       return
     }
     const fetchUserStatus = async () => {
-      setStatusError(null)
       try {
         const token = await getBackendToken()
         const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
         const res = await fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers })
-        if (!res.ok) {
-          setStatusError(t("dashboard.apiUnreachable"))
-          return
-        }
+        if (!res.ok) return
         const data = await res.json()
 
         setPlanTier((data.plan_tier ?? "trial").toUpperCase() + " User")
@@ -100,11 +94,10 @@ export function SettingsPage() {
         setUsedAmount(Number(data.used_amount) ?? 0)
       } catch (e) {
         console.error("Failed to fetch user status", e)
-        setStatusError(t("dashboard.apiUnreachable"))
       }
     }
     fetchUserStatus()
-  }, [userId, t])
+  }, [userId])
 
   const tabs: { id: SettingsTab; labelKey: string }[] = [
     { id: "lending", labelKey: "settings.tabs.lending" },
@@ -117,12 +110,6 @@ export function SettingsPage() {
     <div className="flex flex-col gap-6">
       {/* Page Title */}
       <h1 className="text-2xl font-bold text-foreground">{t("settings.title")}</h1>
-
-      {statusError && (
-        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
-          {statusError}
-        </div>
-      )}
 
       {/* Account & Membership Card */}
       <div className="rounded-xl border border-border bg-card p-5">
