@@ -62,7 +62,9 @@ export function SettingsPage() {
       setPlanName("Expert Plan")
       setLendingLimit(250000)
       setRebalanceMinutes(3)
-      setTrialRemainingDays(null)
+      setTokensRemaining(null)
+      setTokensUsed(null)
+      setInitialTokenCredit(null)
       return
     }
     const fetchUserStatus = async () => {
