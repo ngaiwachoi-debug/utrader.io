@@ -55,7 +55,6 @@ export function SettingsPage() {
   const [tokensUsed, setTokensUsed] = useState<number | null>(null)
   const [initialTokenCredit, setInitialTokenCredit] = useState<number | null>(null)
   const [usedAmount, setUsedAmount] = useState<number>(0)
-  const [trialRemainingDays, setTrialRemainingDays] = useState<number | null>(null)
 
   useEffect(() => {
     if (userId == null) {
@@ -83,8 +82,6 @@ export function SettingsPage() {
 
         setLendingLimit(Number(data.lending_limit) ?? 0)
         setRebalanceMinutes(Number(data.rebalance_interval) ?? 0)
-        const trd = data.trial_remaining_days
-        setTrialRemainingDays(typeof trd === "number" ? trd : trd != null ? Number(trd) : null)
         const tr = data.tokens_remaining
         setTokensRemaining(typeof tr === "number" ? tr : tr != null ? Number(tr) : null)
         const tu = data.tokens_used
@@ -489,7 +486,7 @@ function ApiKeysTab({
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
-        // User-end: start bot on server (same as Live Status "Start Bot"). Bot runs on server.
+        // Auto-start bot after connecting API keys so Terminal shows output
         if (userId != null) {
           try {
             const startRes = await fetch(`${API_BASE}/start-bot`, {
@@ -510,7 +507,6 @@ function ApiKeysTab({
           }
         }
       } else if (allowDev && userId != null) {
-        // Dev-only: connect keys by user_id (no login). Do not use in production.
         const res = await fetch(`${API_BASE}/connect-exchange/by-user`, {
           method: "POST",
           credentials: "include",
@@ -540,7 +536,7 @@ function ApiKeysTab({
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
             : undefined,
         })
-        // Dev-only: start bot by user_id (no auth). Product uses POST /start-bot with token only.
+        // Auto-start bot after connecting API keys (dev path) so Terminal shows output
         try {
           const startRes = await fetch(`${API_BASE}/start-bot/${userId}`, { method: "POST", credentials: "include" })
           if (startRes.ok) {

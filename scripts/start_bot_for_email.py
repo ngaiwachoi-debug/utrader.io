@@ -1,9 +1,8 @@
 """
-Start the lending bot for a user by email (e.g. choiwangai@gmail.com).
-Requires: backend running (e.g. uvicorn main:app). Uses POST /start-bot/{user_id} (no auth).
+Start the lending bot for a user by email.
+Requires: backend running (e.g. uvicorn main:app), Redis running, ARQ worker running.
 
 Usage (from project root):
-  python scripts/start_bot_for_email.py
   python scripts/start_bot_for_email.py choiwangai@gmail.com
 
 Or with custom API base:
@@ -12,14 +11,8 @@ Or with custom API base:
 import os
 import sys
 
-# Project root = parent of scripts/
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-_root = os.path.dirname(_script_dir)
-if _root not in sys.path:
-    sys.path.insert(0, _root)
-
-from database import SessionLocal
-import models
+# Add project root so we can import database and models
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import requests
@@ -27,14 +20,16 @@ except ImportError:
     print("Install requests: pip install requests")
     sys.exit(1)
 
-DEFAULT_EMAIL = "choiwangai@gmail.com"
+from database import SessionLocal
+import models
+
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
 
 def main():
-    email = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("BOT_EMAIL", DEFAULT_EMAIL)).strip()
-    if not email:
-        print("Usage: python scripts/start_bot_for_email.py [email]")
+    email = (sys.argv[1] if len(sys.argv) > 1 else "choiwangai@gmail.com").strip().lower()
+    if not email or "@" not in email:
+        print("Usage: python scripts/start_bot_for_email.py <email>")
         sys.exit(1)
 
     db = SessionLocal()
@@ -42,9 +37,6 @@ def main():
         user = db.query(models.User).filter(models.User.email == email).first()
         if not user:
             print(f"No user found with email: {email}")
-            sys.exit(1)
-        if not user.vault:
-            print(f"User {email} (id={user.id}) has no API keys. Connect exchange first.")
             sys.exit(1)
         user_id = user.id
     finally:
@@ -56,22 +48,27 @@ def main():
         r = requests.post(url, timeout=15)
     except requests.exceptions.ConnectionError as e:
         print(f"Connection error: {e}")
-        print("Make sure the backend is running (e.g. uvicorn main:app).")
+        print("Ensure the backend is running (e.g. uvicorn main:app) and Redis is up.")
         sys.exit(1)
-
-    try:
-        body = r.json()
-    except Exception:
-        body = {}
-    msg = body.get("message", r.text or f"HTTP {r.status_code}")
 
     if r.status_code == 200:
-        print(f"OK: {msg}")
-        print("If the worker is running (python scripts/run_worker.py), the bot will start within a few seconds.")
-    else:
-        print(f"Error ({r.status_code}): {msg}")
-        sys.exit(1)
+        data = r.json()
+        print("Success:", data.get("message", data))
+        print("Terminal output should appear within ~15 seconds (worker must be running).")
+        return 0
+
+    try:
+        j = r.json()
+        detail = j.get("detail", j) if isinstance(j, dict) else r.text
+    except Exception:
+        detail = r.text
+    print(f"Error {r.status_code}: {detail}")
+    if r.status_code == 404:
+        print("User may have no API keys saved. Save keys in Settings first.")
+    if r.status_code == 402:
+        print("Token balance too low or subscription expired. Add tokens or renew.")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

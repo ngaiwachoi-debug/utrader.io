@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import {
   Wallet,
   DollarSign,
@@ -14,7 +14,7 @@ import {
   Moon,
 } from "lucide-react"
 import { useT } from "@/lib/i18n"
-import { useCurrentUserId, useCurrentUser } from "@/lib/current-user-context"
+import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
 import {
   LineChart,
@@ -85,7 +85,6 @@ type WalletSummary = {
 export function LiveStatus() {
   const t = useT()
   const userId = useCurrentUserId()
-  const { apiError } = useCurrentUser()
   const [activeTab, setActiveTab] = useState("total")
   const [totalAssets, setTotalAssets] = useState<number | null>(null)
   const [walletSummary, setWalletSummary] = useState<WalletSummary | null>(null)
@@ -101,8 +100,6 @@ export function LiveStatus() {
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
   const REFRESH_COOLDOWN_SEC = 15
   const [ledgerPage, setLedgerPage] = useState(1)
-  const justStartedBotAt = useRef<number>(0)
-  const OPTIMISTIC_ACTIVE_GRACE_MS = 15000
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -117,7 +114,6 @@ export function LiveStatus() {
     if (len > 0) setLedgerPage(1)
   }, [walletSummary?.credits_detail?.length])
 
-  // User-end: status and start/stop use auth; only the logged-in user's bot. Bot runs on server.
   const refreshStatus = async () => {
     if (userId == null) return
     try {
@@ -132,10 +128,7 @@ export function LiveStatus() {
       ])
       if (botRes.ok) {
         const data = await botRes.json()
-        const reportedActive = Boolean(data.active)
-        const withinGrace = justStartedBotAt.current > 0 && (Date.now() - justStartedBotAt.current) < OPTIMISTIC_ACTIVE_GRACE_MS
-        setBotActive(reportedActive || withinGrace)
-        if (reportedActive && justStartedBotAt.current > 0) justStartedBotAt.current = 0
+        setBotActive(Boolean(data.active))
         const total = parseFloat(String(data.total_loaned ?? "0").replace(/,/g, ""))
         setTotalAssets(Number.isFinite(total) ? total : 0)
       }
@@ -218,16 +211,8 @@ export function LiveStatus() {
           msg = text || t("liveStatus.startFailed")
         }
         setError(msg || t("liveStatus.startFailed"))
-        return
       }
-      const body = await res.json().catch(() => ({}))
-      const message = (body && typeof body.message === "string") ? body.message : ""
-      justStartedBotAt.current = Date.now()
-      setBotActive(true)
       await refreshStatus()
-      if (message && !message.toLowerCase().includes("already running")) {
-        setError(null)
-      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")
@@ -273,19 +258,8 @@ export function LiveStatus() {
       <div className="flex flex-col gap-6">
         <h1 className="text-2xl font-bold text-foreground">{t("liveStatus.title")}</h1>
         <div className="rounded-xl border border-border bg-card p-8 text-center">
-          {apiError ? (
-            <>
-              <p className="text-muted-foreground">{t("dashboard.apiUnreachable")}</p>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Check NEXT_PUBLIC_API_BASE and ensure the backend is running, then refresh.
-              </p>
-            </>
-          ) : (
-            <>
-              <p className="text-muted-foreground">{t("liveStatus.connectApiKeys")}</p>
-              <p className="mt-2 text-sm text-muted-foreground">Sign in to see your lending data.</p>
-            </>
-          )}
+          <p className="text-muted-foreground">{t("liveStatus.connectApiKeys")}</p>
+          <p className="mt-2 text-sm text-muted-foreground">Sign in to see your lending data.</p>
         </div>
       </div>
     )

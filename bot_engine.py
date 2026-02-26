@@ -22,12 +22,13 @@ class WallStreet_Omni_FullEngine:
     Autonomous Crypto Lending Engine. 
     Manages funding book deployments and broadcasts live stats to Redis.
     """
-    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, currency: str, spot_price: float, redis_pool=None):
+    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, currency: str, spot_price: float, redis_pool=None, log_lines: list | None = None):
         self.user_id = user_id
         self.api_key = api_key
         self.api_secret = api_secret
         self.gemini_key = gemini_key
         self.redis_pool = redis_pool # 🟢 Injected Redis pool for Dashboard
+        self.log_lines = log_lines  # optional list to capture lines for Whales terminal
         
         self._nonce = int(time.time() * 1000000)
         self.wallet_currency = currency
@@ -61,51 +62,41 @@ class WallStreet_Omni_FullEngine:
         self.tranche_mezzanine = 0.30
         self.tranche_tail = 0.20
 
-        print(f"[{self._now()}] [User {self.user_id}] Omni-Node Initialized | {self.wallet_currency}")
+        self._log(f"[{self._now()}] [User {self.user_id}] Omni-Node Initialized | {self.wallet_currency}")
 
     def _now(self) -> str:
         return datetime.now().strftime("%H:%M:%S")
+
+    def _log(self, msg: str) -> None:
+        try:
+            print(msg)
+        except UnicodeEncodeError:
+            print(msg.encode("ascii", errors="replace").decode("ascii"))
+        if self.log_lines is not None:
+            self.log_lines.append(msg)
 
     def get_nonce(self) -> str:
         self._nonce += 1
         return str(self._nonce)
 
-    def _generate_signature(self, path: str, nonce: str, json_body: str) -> str:
-        """Sign the exact request body. Bitfinex requires no spaces (separators=(',', ':'))."""
-        signature_payload = f"/api/v2{path}{nonce}{json_body}"
-        return hmac.new(self.api_secret.encode(), signature_payload.encode(), hashlib.sha384).hexdigest()
-
-    def _is_balance_error(self, response_text: str) -> bool:
-        """Bitfinex returns [code, msg]. Treat balance/insufficient/minimum as bypassable."""
-        if not response_text:
-            return False
-        t = response_text.lower()
-        return (
-            "balance" in t or "insufficient" in t or "below the minimum" in t
-            or "amount is" in t and "minimum" in t
-        )
+    def _generate_signature(self, path: str, nonce: str, body: dict) -> str:
+        payload = json.dumps(body) if body else "{}"
+        signature = f"/api/v2{path}{nonce}{payload}"
+        return hmac.new(self.api_secret.encode(), signature.encode(), hashlib.sha384).hexdigest()
 
     async def _api_request(self, path: str, body: dict = None) -> dict | list | None:
-        body = body if body is not None else {}
-        json_body = json.dumps(body, separators=(",", ":"))
         nonce = self.get_nonce()
         headers = {
-            "bfx-nonce": nonce,
+            "bfx-nonce": nonce, 
             "bfx-apikey": self.api_key,
-            "bfx-signature": self._generate_signature(path, nonce, json_body),
-            "Content-Type": "application/json",
+            "bfx-signature": self._generate_signature(path, nonce, body or {}),
+            "Content-Type": "application/json"
         }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.rest_url}{path}", headers=headers, data=json_body, timeout=10
-                ) as resp:
-                    text = await resp.text()
-                    if resp.status != 200:
-                        if self._is_balance_error(text):
-                            print(f"[User {self.user_id}] Balance-related API response (bypassing): {path} -> {text[:200]}")
-                        return None
-                    return json.loads(text) if text else None
+                async with session.post(f"{self.rest_url}{path}", headers=headers, json=body, timeout=10) as resp:
+                    if resp.status != 200: return None
+                    return await resp.json()
         except Exception as e:
             print(f"[User {self.user_id}] API Error ({path}): {e}")
             return None
@@ -201,7 +192,7 @@ class WallStreet_Omni_FullEngine:
         utilization = (self.total_loaned / self.total_balance) if self.total_balance > 0 else 0.0
         
         # 🟢 Log and Broadcast
-        print(f"[{self._now()}] [User {self.user_id}] 📊 [{self.wallet_currency}] WAROC: {self.waroc*365*100:>5.2f}% APR | Loaned: {self.total_loaned:,.2f}")
+        self._log(f"[{self._now()}] [User {self.user_id}] 📊 [{self.wallet_currency}] WAROC: {self.waroc*365*100:>5.2f}% APR | Loaned: {self.total_loaned:,.2f}")
         await self.broadcast_status()
         
         return self.waroc, utilization, self.total_loaned
@@ -221,7 +212,7 @@ class WallStreet_Omni_FullEngine:
         if full_rebuild:
             wapr, util, loaned = await self.check_portfolio_status()
             insight = await self.get_ai_insight(wapr, util, loaned)
-            print(f"\n[{self._now()}] [User {self.user_id}] 📈 Strategy: {insight}")
+            self._log(f"\n[{self._now()}] [User {self.user_id}] 📈 Strategy: {insight}")
             await self._api_request("/auth/w/funding/offer/cancel/all", {"currency": self.wallet_currency})
             await asyncio.sleep(2) 
 
@@ -230,9 +221,10 @@ class WallStreet_Omni_FullEngine:
         available = next((float(w[4]) for w in wallets if w[0] == "funding" and w[1] == self.wallet_currency), 0.0)
         if available < self.MIN_ORDER_AMT: return 
 
-        print(f"[{self._now()}] [User {self.user_id}] 🌊 [{self.wallet_currency}] Grid Available: {available:,.4f}")
-        ops, running_balance = [], available
         safe_frr = max(self.current_frr, 0.0001) * self.chase_discount
+        self._log(f"[{self._now()}] [User {self.user_id}] 🌊 [{self.wallet_currency}] Deploying | Target Rate: {safe_frr*365*100:.2f}% | Discount: {self.chase_discount:.3f}")
+        self._log(f"[{self._now()}] [User {self.user_id}] 🌊 [{self.wallet_currency}] Grid Available: {available:,.4f}")
+        ops, running_balance = [], available
 
         # Tranche Calculation
         if full_rebuild and available < self.SWEEP_AMT:
@@ -271,7 +263,7 @@ class WallStreet_Omni_FullEngine:
         for op in ops:
             lbl = op.pop("label")
             await self._api_request("/auth/w/funding/offer/submit", op)
-            print(f"   └─ [{self.wallet_currency}] {lbl:<10} | {float(op['rate'])*365*100:>6.2f}% APR")
+            self._log(f"   └─ [{self.wallet_currency}] TICKET ISSUED | {lbl:<10} | {float(op['amount']):>10,.4f} | {float(op['rate'])*365*100:>6.2f}% APR | {op.get('period', 0)}d")
             await asyncio.sleep(0.15)
 
     async def run_loop(self):
@@ -296,53 +288,32 @@ class WallStreet_Omni_FullEngine:
 
 class PortfolioManager:
     """Orchestrates multiple asset engines for a user."""
-    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, redis_pool=None):
+    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, redis_pool=None, log_lines: list | None = None):
         self.user_id, self.api_key, self.api_secret, self.gemini_key = user_id, api_key, api_secret, gemini_key
         self.redis_pool = redis_pool
+        self.log_lines = log_lines
         self._nonce = int(time.time() * 1000000)
 
-    def _is_balance_error(self, response_text: str) -> bool:
-        if not response_text:
-            return False
-        t = response_text.lower()
-        return (
-            "balance" in t or "insufficient" in t or "below the minimum" in t
-            or ("amount is" in t and "minimum" in t)
-        )
-
     async def _api_request(self, path: str, body: dict = None):
-        body = body if body is not None else {}
-        json_body = json.dumps(body, separators=(",", ":"))
         self._nonce += 1
-        nonce_str = str(self._nonce)
-        sig_payload = f"/api/v2{path}{nonce_str}{json_body}"
-        sig = hmac.new(self.api_secret.encode(), sig_payload.encode(), hashlib.sha384).hexdigest()
-        headers = {
-            "bfx-nonce": nonce_str,
-            "bfx-apikey": self.api_key,
-            "Content-Type": "application/json",
-            "bfx-signature": sig,
-        }
+        headers = {"bfx-nonce": str(self._nonce), "bfx-apikey": self.api_key, "Content-Type": "application/json",
+                   "bfx-signature": hmac.new(self.api_secret.encode(), f"/api/v2{path}{self._nonce}{json.dumps(body or {}) if body else '{}'}".encode(), hashlib.sha384).hexdigest()}
         async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"https://api.bitfinex.com/v2{path}", headers=headers, data=json_body, timeout=10
-            ) as r:
-                text = await r.text()
-                if r.status != 200:
-                    if self._is_balance_error(text):
-                        print(f"[User {self.user_id}] Balance-related API response (bypassing): {path} -> {text[:200]}")
-                    return None
-                return json.loads(text) if text else None
+            async with s.post(f"https://api.bitfinex.com/v2{path}", headers=headers, json=body) as r:
+                return await r.json() if r.status == 200 else None
 
     async def scan_and_launch(self):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] [SCANNER] Initializing...")
+        msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] [SCANNER] Initializing..."
+        print(msg)
+        if self.log_lines is not None:
+            self.log_lines.append(msg)
         wallets = await self._api_request("/auth/r/wallets", {})
         if not wallets: return
         
         engines = []
         for w in wallets:
             if w[0] == "funding" and float(w[2]) > 0:
-                engine = WallStreet_Omni_FullEngine(self.user_id, self.api_key, self.api_secret, self.gemini_key, w[1], 1.0, self.redis_pool)
+                engine = WallStreet_Omni_FullEngine(self.user_id, self.api_key, self.api_secret, self.gemini_key, w[1], 1.0, self.redis_pool, self.log_lines)
                 engines.append(engine.run_loop())
         
         if engines:

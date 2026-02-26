@@ -22,7 +22,7 @@ const authMiddleware = withAuth(
   }
 );
 
-export default function proxy(req: NextRequest) {
+export default function middleware(req: NextRequest) {
   const publicPathnameRegex = RegExp(
     `^(/(${locales.join('|')}))?(${publicPages.join('|')})?/?$`,
     'i'

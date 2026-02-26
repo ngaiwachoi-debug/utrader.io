@@ -147,19 +147,27 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         const token = await getBackendToken()
         const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
         // On dashboard load: force refresh gross profit from Bitfinex (returns repaid lending trades), then fetch stats
+        let grossFromRefresh: number | null = null
+        let netFromRefresh: number | null = null
         try {
           const refreshRes = await fetch(`${API_BASE}/api/refresh-lending-stats`, { method: "POST", credentials: "include", headers })
           if (refreshRes.ok) {
             const refreshData = await refreshRes.json()
             const trades = refreshData.trades
             const arr = Array.isArray(trades) ? trades : []
-            setTradesCount(arr.length)
+            setTradesCount(
+              typeof refreshData.total_trades_count === "number"
+                ? refreshData.total_trades_count
+                : arr.length
+            )
             setFundingTrades(arr)
             if (refreshData.calculation_breakdown) {
               setCalculationBreakdown(refreshData.calculation_breakdown)
             } else {
               setCalculationBreakdown(null)
             }
+            grossFromRefresh = typeof refreshData.gross_profit === "number" ? refreshData.gross_profit : null
+            netFromRefresh = typeof refreshData.net_profit === "number" ? refreshData.net_profit : null
           }
         } catch {
           // ignore refresh failure; we still load from cache/GET below
@@ -171,18 +179,20 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         const src = lendingRes.headers.get("X-Data-Source")
         setLendingDataSource(src === "cache" ? "cache" : "live")
         setLendingRateLimited(lendingRes.headers.get("X-Rate-Limited") === "true")
-        let gross = 0
-        let net = 0
-        if (lendingRes.ok) {
-          const lendingData = await lendingRes.json()
-          gross = lendingData.gross_profit ?? 0
-          net = lendingData.net_profit ?? 0
-        } else {
-          const statsRes = await fetch(`${API_BASE}/stats/${userId}?start=${start}&end=${end}`)
-          if (statsRes.ok) {
-            const data = await statsRes.json()
-            gross = data.gross_profit ?? 0
-            net = data.net_profit ?? 0
+        let gross = grossFromRefresh ?? 0
+        let net = netFromRefresh ?? 0
+        if (grossFromRefresh == null || netFromRefresh == null) {
+          if (lendingRes.ok) {
+            const lendingData = await lendingRes.json()
+            gross = lendingData.gross_profit ?? 0
+            net = lendingData.net_profit ?? 0
+          } else {
+            const statsRes = await fetch(`${API_BASE}/stats/${userId}?start=${start}&end=${end}`)
+            if (statsRes.ok) {
+              const data = await statsRes.json()
+              gross = data.gross_profit ?? 0
+              net = data.net_profit ?? 0
+            }
           }
         }
         setGrossProfit(gross)
