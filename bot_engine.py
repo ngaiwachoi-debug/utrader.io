@@ -70,24 +70,30 @@ class WallStreet_Omni_FullEngine:
         self._nonce += 1
         return str(self._nonce)
 
-    def _generate_signature(self, path: str, nonce: str, body: dict) -> str:
-        payload = json.dumps(body) if body else "{}"
-        signature = f"/api/v2{path}{nonce}{payload}"
-        return hmac.new(self.api_secret.encode(), signature.encode(), hashlib.sha384).hexdigest()
+    def _generate_signature(self, path: str, nonce: str, json_body: str) -> str:
+        """Sign the exact request body. Bitfinex requires no spaces (separators=(',', ':'))."""
+        signature_payload = f"/api/v2{path}{nonce}{json_body}"
+        return hmac.new(self.api_secret.encode(), signature_payload.encode(), hashlib.sha384).hexdigest()
 
     async def _api_request(self, path: str, body: dict = None) -> dict | list | None:
+        body = body if body is not None else {}
+        json_body = json.dumps(body, separators=(",", ":"))
         nonce = self.get_nonce()
         headers = {
-            "bfx-nonce": nonce, 
+            "bfx-nonce": nonce,
             "bfx-apikey": self.api_key,
-            "bfx-signature": self._generate_signature(path, nonce, body or {}),
-            "Content-Type": "application/json"
+            "bfx-signature": self._generate_signature(path, nonce, json_body),
+            "Content-Type": "application/json",
         }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(f"{self.rest_url}{path}", headers=headers, json=body, timeout=10) as resp:
-                    if resp.status != 200: return None
-                    return await resp.json()
+                async with session.post(
+                    f"{self.rest_url}{path}", headers=headers, data=json_body, timeout=10
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    text = await resp.text()
+                    return json.loads(text) if text else None
         except Exception as e:
             print(f"[User {self.user_id}] API Error ({path}): {e}")
             return None
@@ -284,12 +290,26 @@ class PortfolioManager:
         self._nonce = int(time.time() * 1000000)
 
     async def _api_request(self, path: str, body: dict = None):
+        body = body if body is not None else {}
+        json_body = json.dumps(body, separators=(",", ":"))
         self._nonce += 1
-        headers = {"bfx-nonce": str(self._nonce), "bfx-apikey": self.api_key, "Content-Type": "application/json",
-                   "bfx-signature": hmac.new(self.api_secret.encode(), f"/api/v2{path}{self._nonce}{json.dumps(body or {}) if body else '{}'}".encode(), hashlib.sha384).hexdigest()}
+        nonce_str = str(self._nonce)
+        sig_payload = f"/api/v2{path}{nonce_str}{json_body}"
+        sig = hmac.new(self.api_secret.encode(), sig_payload.encode(), hashlib.sha384).hexdigest()
+        headers = {
+            "bfx-nonce": nonce_str,
+            "bfx-apikey": self.api_key,
+            "Content-Type": "application/json",
+            "bfx-signature": sig,
+        }
         async with aiohttp.ClientSession() as s:
-            async with s.post(f"https://api.bitfinex.com/v2{path}", headers=headers, json=body) as r:
-                return await r.json() if r.status == 200 else None
+            async with s.post(
+                f"https://api.bitfinex.com/v2{path}", headers=headers, data=json_body, timeout=10
+            ) as r:
+                if r.status != 200:
+                    return None
+                text = await r.text()
+                return json.loads(text) if text else None
 
     async def scan_and_launch(self):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] [SCANNER] Initializing...")
