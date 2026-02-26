@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   Wallet,
   DollarSign,
@@ -101,6 +101,8 @@ export function LiveStatus() {
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
   const REFRESH_COOLDOWN_SEC = 15
   const [ledgerPage, setLedgerPage] = useState(1)
+  const justStartedBotAt = useRef<number>(0)
+  const OPTIMISTIC_ACTIVE_GRACE_MS = 15000
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -129,7 +131,10 @@ export function LiveStatus() {
       ])
       if (botRes.ok) {
         const data = await botRes.json()
-        setBotActive(Boolean(data.active))
+        const reportedActive = Boolean(data.active)
+        const withinGrace = justStartedBotAt.current > 0 && (Date.now() - justStartedBotAt.current) < OPTIMISTIC_ACTIVE_GRACE_MS
+        setBotActive(reportedActive || withinGrace)
+        if (reportedActive && justStartedBotAt.current > 0) justStartedBotAt.current = 0
         const total = parseFloat(String(data.total_loaned ?? "0").replace(/,/g, ""))
         setTotalAssets(Number.isFinite(total) ? total : 0)
       }
@@ -212,8 +217,16 @@ export function LiveStatus() {
           msg = text || t("liveStatus.startFailed")
         }
         setError(msg || t("liveStatus.startFailed"))
+        return
       }
+      const body = await res.json().catch(() => ({}))
+      const message = (body && typeof body.message === "string") ? body.message : ""
+      justStartedBotAt.current = Date.now()
+      setBotActive(true)
       await refreshStatus()
+      if (message && !message.toLowerCase().includes("already running")) {
+        setError(null)
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")

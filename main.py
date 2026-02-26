@@ -313,15 +313,24 @@ async def get_all_bot_stats(
     """Fetches live heartbeat data from Redis. Caller must be the same user (user end only)."""
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
-    redis = await get_redis()
+    try:
+        redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+    except (asyncio.TimeoutError, Exception):
+        return {"active": False, "engines": [], "total_loaned": "0.00"}
 
-    keys = await redis.keys(f"status:{user_id}:*")
+    try:
+        keys = await redis.keys(f"status:{user_id}:*")
+    except Exception:
+        return {"active": False, "engines": [], "total_loaned": "0.00"}
 
     all_engines = []
     for key in keys:
-        raw_data = await redis.get(key)
-        if raw_data:
-            all_engines.append(json.loads(raw_data))
+        try:
+            raw_data = await redis.get(key)
+            if raw_data:
+                all_engines.append(json.loads(raw_data))
+        except Exception:
+            continue
 
     if not all_engines:
         return {"active": False, "engines": [], "total_loaned": "0.00"}
