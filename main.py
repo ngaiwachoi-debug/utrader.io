@@ -1072,6 +1072,35 @@ def _aggregate_lent_per_currency(credits_data: Any) -> dict:
     return result
 
 
+def _total_lent_usd(lent_per_currency: dict, ticker_prices: Optional[Dict[str, float]] = None) -> float:
+    """Convert lent_per_currency to total USD. USD/USDt/USDT/UST = 1:1; others use ticker_prices (tCCYUSD)."""
+    if not lent_per_currency:
+        return 0.0
+    from services.bitfinex_service import _get_tickers_sync
+    stablecoins = ("USD", "USDt", "USDT", "UST")
+    need_price = [c for c in lent_per_currency if c not in stablecoins]
+    prices: Dict[str, float] = ticker_prices or {}
+    if need_price and not prices:
+        symbols = [f"t{c}USD" for c in need_price]
+        tickers, _ = _get_tickers_sync(symbols)
+        if tickers:
+            for row in tickers:
+                try:
+                    if isinstance(row, (list, tuple)) and len(row) >= 8:
+                        sym = (row[0] or "").strip()
+                        if sym:
+                            prices[sym] = float(row[7]) if row[7] is not None else 0.0
+                except (TypeError, ValueError, IndexError):
+                    continue
+    total = 0.0
+    for currency, amount in lent_per_currency.items():
+        if currency in stablecoins:
+            total += amount
+        else:
+            total += amount * prices.get(f"t{currency}USD", 0.0)
+    return total
+
+
 @app.get("/wallets/{user_id}")
 async def wallet_summary(
     user_id: int,
@@ -1106,6 +1135,7 @@ async def wallet_summary(
             "per_currency": {},
             "per_currency_usd": {},
             "lent_per_currency": {},
+            "total_lent_usd": 0.0,
             "_rate_limited": True,
         }
 
@@ -1131,10 +1161,12 @@ async def wallet_summary(
             "per_currency": {},
             "per_currency_usd": {},
             "lent_per_currency": {},
+            "total_lent_usd": 0.0,
             "_rate_limited": True,
         }
     lent_per_currency = _aggregate_lent_per_currency(credits) if credits else {}
     summary["lent_per_currency"] = lent_per_currency
+    summary["total_lent_usd"] = round(_total_lent_usd(lent_per_currency), 2)
     await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_WALLETS, summary)
     response.headers["X-Data-Source"] = "live"
     exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_WALLETS)

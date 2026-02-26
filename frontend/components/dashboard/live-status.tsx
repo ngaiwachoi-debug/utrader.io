@@ -74,6 +74,7 @@ type WalletSummary = {
   per_currency: Record<string, number>
   per_currency_usd: Record<string, number>
   lent_per_currency?: Record<string, number>
+  total_lent_usd?: number
 }
 
 export function LiveStatus() {
@@ -148,9 +149,6 @@ export function LiveStatus() {
         setBotActive(Boolean(data.active))
         const total = parseFloat(String(data.total_loaned ?? "0").replace(/,/g, ""))
         setTotalAssets(Number.isFinite(total) ? total : 0)
-      } else {
-        setBotActive(null)
-        setTotalAssets(null)
       }
       if (walletsRes.ok) {
         const wallets = await walletsRes.json()
@@ -160,27 +158,20 @@ export function LiveStatus() {
           per_currency: wallets.per_currency || {},
           per_currency_usd: wallets.per_currency_usd || {},
           lent_per_currency: wallets.lent_per_currency || {},
+          total_lent_usd: Number(wallets.total_lent_usd) ?? 0,
         })
         const src = walletsRes.headers.get("X-Data-Source")
         setWalletDataSource(src === "cache" ? "cache" : "live")
         setWalletRateLimited(walletsRes.headers.get("X-Rate-Limited") === "true")
+        setWalletError(null)
       } else {
-        setWalletSummary(null)
         setWalletError(t("liveStatus.connectApiKeys"))
-        setWalletDataSource(null)
-        setWalletRateLimited(false)
       }
       setRefreshCooldownUntil(Date.now() + REFRESH_COOLDOWN_SEC * 1000)
       await fetchLedger()
     } catch (e) {
       console.error("Failed to fetch live status", e)
       setError(t("liveStatus.unableToLoad"))
-      setBotActive(null)
-      setTotalAssets(null)
-      setWalletSummary(null)
-      setWalletError(null)
-      setWalletDataSource(null)
-      setWalletRateLimited(false)
     } finally {
       setLoading(false)
     }
@@ -319,7 +310,7 @@ export function LiveStatus() {
           </p>
         </div>
 
-        {/* Currently loaned (from bot total) */}
+        {/* Currently loaned (Bitfinex total_lent_usd when available, else bot total) */}
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -330,7 +321,7 @@ export function LiveStatus() {
           </div>
           <div className="mt-3">
             <span className="text-3xl font-bold text-foreground">
-              {loading && totalAssets === null ? "…" : `$${(totalAssets ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+              {loading && walletSummary == null && totalAssets === null ? "…" : `$${(walletSummary?.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
             </span>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
@@ -390,17 +381,21 @@ export function LiveStatus() {
             <div
               className="h-full bg-emerald transition-all"
               style={{
-                width: `${walletSummary?.total_usd_all && (totalAssets ?? 0) > 0
-                  ? Math.min(100, (100 * (totalAssets ?? 0)) / walletSummary.total_usd_all)
-                  : 54.2}%`,
+                width: `${(() => {
+                  const lent = walletSummary?.total_lent_usd ?? totalAssets ?? 0
+                  const total = walletSummary?.total_usd_all ?? 0
+                  return total > 0 ? Math.min(100, (100 * lent) / total) : 0
+                })()}%`,
               }}
             />
             <div
               className="h-full bg-amber-500/80 transition-all"
               style={{
-                width: `${walletSummary?.total_usd_all && (totalAssets ?? 0) >= 0
-                  ? Math.min(100, Math.max(0, 100 - (walletSummary?.total_usd_all ? (100 * (totalAssets ?? 0)) / walletSummary.total_usd_all : 54.2)))
-                  : 45.8}%`,
+                width: `${(() => {
+                  const lent = walletSummary?.total_lent_usd ?? totalAssets ?? 0
+                  const total = walletSummary?.total_usd_all ?? 0
+                  return total > 0 ? Math.min(100, Math.max(0, (100 * (total - lent)) / total)) : total ? 100 : 0
+                })()}%`,
               }}
             />
           </div>
@@ -422,12 +417,12 @@ export function LiveStatus() {
               <Activity className="h-4 w-4 text-emerald" />
             </div>
             <p className="mt-2 text-xl font-bold text-foreground">
-              ${(totalAssets ?? 112082.11).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              ${(walletSummary?.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </p>
             <p className="text-xs text-emerald">
-              {walletSummary?.total_usd_all
-                ? `${(((totalAssets ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : "54.2%"}
+              {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
+                ? `${(((walletSummary?.total_lent_usd ?? totalAssets ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : "0.0%"}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.generatingReturns")}</p>
           </div>
@@ -437,14 +432,12 @@ export function LiveStatus() {
               <Clock className="h-4 w-4 text-amber-500" />
             </div>
             <p className="mt-2 text-xl font-bold text-foreground">
-              ${(walletSummary?.total_usd_all != null && totalAssets != null
-                ? (walletSummary.total_usd_all - totalAssets).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-                : "94,610.41")}
+              ${((walletSummary?.total_usd_all ?? 0) - (walletSummary?.total_lent_usd ?? totalAssets ?? 0)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </p>
             <p className="text-xs text-amber-500">
-              {walletSummary?.total_usd_all && totalAssets != null
-                ? `${(((walletSummary.total_usd_all - totalAssets) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : "45.8%"}
+              {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
+                ? `${((((walletSummary.total_usd_all - (walletSummary?.total_lent_usd ?? totalAssets ?? 0)) / walletSummary.total_usd_all) * 100)).toFixed(1)}%`
+                : "0.0%"}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.awaitingOpportunities")}</p>
           </div>
