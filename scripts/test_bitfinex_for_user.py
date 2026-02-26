@@ -1,7 +1,7 @@
 """
 Test Bitfinex API response for a user (e.g. choiwangai@gmail.com).
-Uses stored API keys from DB, calls Bitfinex wallets + funding_credits,
-and prints totals and lent amounts so Portfolio Allocation can be verified.
+Uses stored API keys from DB and the same portfolio allocation snapshot as the
+Dashboard (wallets + funding/credits + funding/offers, all in USD).
 
 Run from project root:
   python scripts/test_bitfinex_for_user.py
@@ -17,52 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from database import SessionLocal
 import models
 from services.bitfinex_service import BitfinexManager
-from services.bitfinex_service import _get_tickers_sync
-
-
-def _total_lent_usd(lent_per_currency: dict) -> float:
-    """Convert lent_per_currency to total USD; non-USD need ticker price."""
-    if not lent_per_currency:
-        return 0.0
-    need_price = [c for c in lent_per_currency if c not in ("USD", "USDt", "USDT", "UST")]
-    prices = {}
-    if need_price:
-        symbols = [f"t{c}USD" for c in need_price]
-        tickers, _ = _get_tickers_sync(symbols)
-        if tickers:
-            for row in tickers:
-                try:
-                    if isinstance(row, (list, tuple)) and len(row) >= 8:
-                        sym = (row[0] or "").strip()
-                        if sym:
-                            prices[sym] = float(row[7]) if row[7] is not None else 0.0
-                except (TypeError, ValueError, IndexError):
-                    pass
-    total = 0.0
-    for currency, amount in lent_per_currency.items():
-        if currency in ("USD", "USDt", "USDT", "UST"):
-            total += amount
-        else:
-            total += amount * prices.get(f"t{currency}USD", 0.0)
-    return total
-
-
-def _aggregate_lent(credits_data) -> dict:
-    result = {}
-    if not isinstance(credits_data, list):
-        return result
-    for row in credits_data:
-        try:
-            if isinstance(row, (list, tuple)) and len(row) > 5:
-                symbol = (row[1] or "").strip().upper()
-                if symbol.startswith("F"):
-                    symbol = symbol[1:]
-                amount = float(row[5]) if row[5] is not None else 0.0
-                if symbol:
-                    result[symbol] = result.get(symbol, 0.0) + amount
-        except (TypeError, ValueError, IndexError):
-            continue
-    return result
+from main import _portfolio_allocation_snapshot
 
 
 async def main():
@@ -79,24 +34,17 @@ async def main():
             return
         keys = vault.get_keys()
         mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
-        print(f"Bitfinex API test for {email} (user_id={user.id})")
-        print("-" * 50)
-        summary = await mgr.compute_usd_balances()
-        credits, err = await mgr.funding_credits()
-        if err:
-            print(f"Funding credits error: {err}")
-        lent_per_currency = _aggregate_lent(credits) if credits else {}
-        total_lent_usd = round(_total_lent_usd(lent_per_currency), 2)
-        total_usd_all = summary.get("total_usd_all") or 0.0
-        print(f"total_usd_all (wallet): {total_usd_all}")
-        print(f"lent_per_currency:      {lent_per_currency}")
-        print(f"total_lent_usd:         {total_lent_usd}")
-        print(f"pending (total - lent): {total_usd_all - total_lent_usd}")
-        print("-" * 50)
-        print("Portfolio Allocation should show:")
-        print(f"  Actively Earning:   ${total_lent_usd:,.2f}")
-        print(f"  Pending Deployment: ${total_usd_all - total_lent_usd:,.2f}")
-        print(f"  Idle Funds:         $0.00")
+        print(f"Bitfinex portfolio allocation test for {email} (user_id={user.id})")
+        print("-" * 60)
+        summary, log_str, rate_limited = await _portfolio_allocation_snapshot(mgr)
+        if rate_limited:
+            print("Rate limited by Bitfinex; try again later.")
+        print(log_str)
+        print("-" * 60)
+        print("Dashboard mapping:")
+        print(f"  Actively Earning (Return Generating): ${summary.get('total_lent_usd', 0):,.2f}")
+        print(f"  Pending Deployment (In Order Book):   ${summary.get('total_offers_usd', 0):,.2f}")
+        print(f"  Idle Funds (Cash Drag):               ${summary.get('idle_usd', 0):,.2f}")
     finally:
         db.close()
 

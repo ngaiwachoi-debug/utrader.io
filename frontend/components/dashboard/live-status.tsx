@@ -74,7 +74,10 @@ type WalletSummary = {
   per_currency: Record<string, number>
   per_currency_usd: Record<string, number>
   lent_per_currency?: Record<string, number>
+  offers_per_currency?: Record<string, number>
   total_lent_usd?: number
+  total_offers_usd?: number
+  idle_usd?: number
 }
 
 export function LiveStatus() {
@@ -158,7 +161,10 @@ export function LiveStatus() {
           per_currency: wallets.per_currency || {},
           per_currency_usd: wallets.per_currency_usd || {},
           lent_per_currency: wallets.lent_per_currency || {},
+          offers_per_currency: wallets.offers_per_currency || {},
           total_lent_usd: Number(wallets.total_lent_usd) ?? 0,
+          total_offers_usd: Number(wallets.total_offers_usd) ?? 0,
+          idle_usd: Number(wallets.idle_usd) ?? 0,
         })
         const src = walletsRes.headers.get("X-Data-Source")
         setWalletDataSource(src === "cache" ? "cache" : "live")
@@ -392,9 +398,19 @@ export function LiveStatus() {
               className="h-full bg-amber-500/80 transition-all"
               style={{
                 width: `${(() => {
-                  const lent = walletSummary?.total_lent_usd ?? totalAssets ?? 0
+                  const offers = walletSummary?.total_offers_usd ?? 0
                   const total = walletSummary?.total_usd_all ?? 0
-                  return total > 0 ? Math.min(100, Math.max(0, (100 * (total - lent)) / total)) : total ? 100 : 0
+                  return total > 0 ? Math.min(100, (100 * offers) / total) : 0
+                })()}%`,
+              }}
+            />
+            <div
+              className="h-full bg-muted-foreground/50 transition-all"
+              style={{
+                width: `${(() => {
+                  const idle = walletSummary?.idle_usd ?? 0
+                  const total = walletSummary?.total_usd_all ?? 0
+                  return total > 0 ? Math.min(100, (100 * idle) / total) : 0
                 })()}%`,
               }}
             />
@@ -406,7 +422,11 @@ export function LiveStatus() {
             </span>
             <span className="flex items-center gap-1.5">
               <span className="h-2 w-4 rounded-full bg-amber-500/80" />
-              {t("liveStatus.deploying")}
+              {t("liveStatus.inOrderBook")}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-4 rounded-full bg-muted-foreground/50" />
+              {t("liveStatus.idleFunds")}
             </span>
           </div>
         </div>
@@ -424,7 +444,7 @@ export function LiveStatus() {
                 ? `${(((walletSummary?.total_lent_usd ?? totalAssets ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
                 : "0.0%"}
             </p>
-            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.generatingReturns")}</p>
+            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.returnGenerating")}</p>
           </div>
           <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
             <div className="flex items-center justify-between">
@@ -432,23 +452,29 @@ export function LiveStatus() {
               <Clock className="h-4 w-4 text-amber-500" />
             </div>
             <p className="mt-2 text-xl font-bold text-foreground">
-              ${((walletSummary?.total_usd_all ?? 0) - (walletSummary?.total_lent_usd ?? totalAssets ?? 0)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              ${(walletSummary?.total_offers_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </p>
             <p className="text-xs text-amber-500">
               {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
-                ? `${((((walletSummary.total_usd_all - (walletSummary?.total_lent_usd ?? totalAssets ?? 0)) / walletSummary.total_usd_all) * 100)).toFixed(1)}%`
+                ? `${(((walletSummary?.total_offers_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
                 : "0.0%"}
             </p>
-            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.awaitingOpportunities")}</p>
+            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.inOrderBook")}</p>
           </div>
           <div className="rounded-xl border border-border bg-secondary/30 p-4">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.idleFunds")}</span>
               <Moon className="h-4 w-4 text-muted-foreground" />
             </div>
-            <p className="mt-2 text-xl font-bold text-foreground">$0.00</p>
-            <p className="text-xs text-muted-foreground">0.0%</p>
-            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.notDeployed")}</p>
+            <p className="mt-2 text-xl font-bold text-foreground">
+              ${(walletSummary?.idle_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
+                ? `${(((walletSummary?.idle_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : "0.0%"}
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.cashDrag")}</p>
           </div>
         </div>
       </div>

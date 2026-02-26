@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta
 import json
 import os
@@ -1072,33 +1073,144 @@ def _aggregate_lent_per_currency(credits_data: Any) -> dict:
     return result
 
 
-def _total_lent_usd(lent_per_currency: dict, ticker_prices: Optional[Dict[str, float]] = None) -> float:
-    """Convert lent_per_currency to total USD. USD/USDt/USDT/UST = 1:1; others use ticker_prices (tCCYUSD)."""
-    if not lent_per_currency:
-        return 0.0
-    from services.bitfinex_service import _get_tickers_sync
-    stablecoins = ("USD", "USDt", "USDT", "UST")
-    need_price = [c for c in lent_per_currency if c not in stablecoins]
-    prices: Dict[str, float] = ticker_prices or {}
-    if need_price and not prices:
-        symbols = [f"t{c}USD" for c in need_price]
-        tickers, _ = _get_tickers_sync(symbols)
-        if tickers:
-            for row in tickers:
-                try:
-                    if isinstance(row, (list, tuple)) and len(row) >= 8:
-                        sym = (row[0] or "").strip()
-                        if sym:
-                            prices[sym] = float(row[7]) if row[7] is not None else 0.0
-                except (TypeError, ValueError, IndexError):
-                    continue
+def _aggregate_offers_per_currency(offers_data: Any) -> dict:
+    """Aggregate Bitfinex funding offers into amount per currency.
+    offers_data is list of arrays: [ID, SYMBOL, MTS_CREATED, MTS_UPDATED, AMOUNT, ...]. AMOUNT at idx 4.
+    """
+    result: dict = {}
+    if not isinstance(offers_data, list):
+        return result
+    for row in offers_data:
+        try:
+            if isinstance(row, (list, tuple)) and len(row) > 4:
+                symbol = (row[1] or "").strip().upper()
+                if symbol.startswith("F"):
+                    symbol = symbol[1:]
+                amount = float(row[4]) if row[4] is not None else 0.0
+                if symbol:
+                    result[symbol] = result.get(symbol, 0.0) + amount
+        except (TypeError, ValueError, IndexError):
+            continue
+    return result
+
+
+def _per_currency_to_usd(per_currency: dict, prices: Dict[str, float], stablecoins: tuple = ("USD", "USDt", "USDT", "UST")) -> float:
+    """Sum amount × price per currency; stablecoins = 1.0."""
     total = 0.0
-    for currency, amount in lent_per_currency.items():
+    for currency, amount in (per_currency or {}).items():
         if currency in stablecoins:
             total += amount
         else:
             total += amount * prices.get(f"t{currency}USD", 0.0)
     return total
+
+
+def _total_lent_usd(lent_per_currency: dict, ticker_prices: Optional[Dict[str, float]] = None) -> float:
+    """Convert lent_per_currency to total USD. USD/USDt/USDT/UST = 1:1; others use ticker_prices (tCCYUSD)."""
+    stablecoins = ("USD", "USDt", "USDT", "UST")
+    prices = ticker_prices if ticker_prices else _fetch_ticker_prices(set(lent_per_currency or {}))
+    return _per_currency_to_usd(lent_per_currency, prices, stablecoins)
+
+
+def _fetch_ticker_prices(currencies: set) -> Dict[str, float]:
+    """Fetch tCCYUSD prices for all non-stablecoins. Returns dict keyed by tCCYUSD."""
+    from services.bitfinex_service import _get_tickers_sync
+    stablecoins = {"USD", "USDt", "USDT", "UST"}
+    need = [c for c in currencies if c and c not in stablecoins]
+    if not need:
+        return {}
+    symbols = [f"t{c}USD" for c in need]
+    tickers, _ = _get_tickers_sync(symbols)
+    out: Dict[str, float] = {}
+    if tickers:
+        for row in tickers:
+            try:
+                if isinstance(row, (list, tuple)) and len(row) >= 8:
+                    sym = (row[0] or "").strip()
+                    if sym:
+                        out[sym] = float(row[7]) if row[7] is not None else 0.0
+            except (TypeError, ValueError, IndexError):
+                continue
+    return out
+
+
+def _funding_balances_from_wallets(wallets: Any) -> Dict[str, float]:
+    """Extract funding wallet balance per currency from /v2/auth/r/wallets response."""
+    result: Dict[str, float] = {}
+    if not isinstance(wallets, list):
+        return result
+    for w in wallets:
+        try:
+            w_type, currency, balance = w[0], w[1], float(w[2])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if w_type != "funding":
+            continue
+        currency = (currency or "").strip().upper()
+        if currency:
+            result[currency] = result.get(currency, 0.0) + balance
+    return result
+
+
+async def _portfolio_allocation_snapshot(mgr: BitfinexManager) -> tuple:
+    """
+    Wallets, credits, offers in rapid succession; one ticker fetch.
+    Returns (summary_dict, log_str, rate_limited: bool).
+    Actively Earning = credits USD; Pending = offers USD; Idle = Total Wallet USD - credits - offers.
+    """
+    # Snapshot: three calls in quick succession
+    wallets, credits, offers = await asyncio.gather(
+        mgr.wallets(),
+        mgr.funding_credits(),
+        mgr.funding_offers(),
+    )
+    w_err = wallets[1] if isinstance(wallets, tuple) else None
+    c_err = credits[1] if isinstance(credits, tuple) else None
+    o_err = offers[1] if isinstance(offers, tuple) else None
+    rate_limited = bitfinex_cache.is_rate_limit_error(w_err) or bitfinex_cache.is_rate_limit_error(c_err) or bitfinex_cache.is_rate_limit_error(o_err)
+    wallets_data = wallets[0] if isinstance(wallets, tuple) else None
+    credits_data = credits[0] if isinstance(credits, tuple) else None
+    offers_data = offers[0] if isinstance(offers, tuple) else None
+
+    funding_balances = _funding_balances_from_wallets(wallets_data) if wallets_data else {}
+    credits_per_currency = _aggregate_lent_per_currency(credits_data) if credits_data else {}
+    offers_per_currency = _aggregate_offers_per_currency(offers_data) if offers_data else {}
+
+    all_currencies = set(funding_balances) | set(credits_per_currency) | set(offers_per_currency)
+    prices = _fetch_ticker_prices(all_currencies)
+    stablecoins = ("USD", "USDt", "USDT", "UST")
+
+    total_wallet_usd = _per_currency_to_usd(funding_balances, prices, stablecoins)
+    credits_usd = _per_currency_to_usd(credits_per_currency, prices, stablecoins)
+    offers_usd = _per_currency_to_usd(offers_per_currency, prices, stablecoins)
+    idle_usd = total_wallet_usd - credits_usd - offers_usd
+    idle_usd = max(0.0, idle_usd)  # avoid negative from rounding
+
+    # Per-currency USD for wallet (for frontend)
+    per_currency_usd: Dict[str, float] = {}
+    for c, amt in funding_balances.items():
+        if c in stablecoins:
+            per_currency_usd[c] = amt
+        else:
+            per_currency_usd[c] = amt * prices.get(f"t{c}USD", 0.0)
+
+    summary = {
+        "total_usd_all": round(total_wallet_usd, 2),
+        "usd_only": funding_balances.get("USD", 0.0) + funding_balances.get("USDt", 0.0) + funding_balances.get("USDT", 0.0),
+        "per_currency": funding_balances,
+        "per_currency_usd": per_currency_usd,
+        "lent_per_currency": credits_per_currency,
+        "offers_per_currency": offers_per_currency,
+        "total_lent_usd": round(credits_usd, 2),       # Actively Earning
+        "total_offers_usd": round(offers_usd, 2),      # Pending Deployment (In Order Book)
+        "idle_usd": round(idle_usd, 2),               # Idle Funds (Cash Drag)
+    }
+    log_str = (
+        f"Portfolio Allocation: Total Wallet USD: ${total_wallet_usd:,.2f} | "
+        f"Credits USD: ${credits_usd:,.2f} | Offers USD: ${offers_usd:,.2f} | "
+        f"Resulting Idle: ${idle_usd:,.2f} (X - Y - Z)"
+    )
+    return summary, log_str, rate_limited
 
 
 @app.get("/wallets/{user_id}")
@@ -1135,38 +1247,25 @@ async def wallet_summary(
             "per_currency": {},
             "per_currency_usd": {},
             "lent_per_currency": {},
+            "offers_per_currency": {},
             "total_lent_usd": 0.0,
+            "total_offers_usd": 0.0,
+            "idle_usd": 0.0,
             "_rate_limited": True,
         }
 
     keys = user.vault.get_keys()
     mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
-    summary = await mgr.compute_usd_balances()
-    credits, err = await mgr.funding_credits()
-    if bitfinex_cache.is_rate_limit_error(err):
-        await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
-        cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
-        if cached is not None:
-            data, _ = cached
-            if data is not None:
-                response.headers["X-Data-Source"] = "cache"
-                response.headers["X-Rate-Limited"] = "true"
-                response.headers["Retry-After"] = "60"
-                return data
-        response.headers["X-Rate-Limited"] = "true"
-        response.headers["Retry-After"] = "60"
-        return {
-            "total_usd_all": 0.0,
-            "usd_only": 0.0,
-            "per_currency": {},
-            "per_currency_usd": {},
-            "lent_per_currency": {},
-            "total_lent_usd": 0.0,
-            "_rate_limited": True,
-        }
-    lent_per_currency = _aggregate_lent_per_currency(credits) if credits else {}
-    summary["lent_per_currency"] = lent_per_currency
-    summary["total_lent_usd"] = round(_total_lent_usd(lent_per_currency), 2)
+    try:
+        summary, log_str, rate_limited = await _portfolio_allocation_snapshot(mgr)
+        if os.getenv("LOG_PORTFOLIO_ALLOCATION"):
+            print(f"[user_id={user_id}] {log_str}")
+        if rate_limited:
+            await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
+    except Exception as e:
+        if bitfinex_cache.is_rate_limit_error(str(e)):
+            await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
+        raise
     await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_WALLETS, summary)
     response.headers["X-Data-Source"] = "live"
     exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_WALLETS)
