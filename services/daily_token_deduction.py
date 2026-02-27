@@ -1,15 +1,16 @@
 """
-Daily token deduction (post-Bitfinex API call at 10:15 UTC).
+Daily token deduction at 10:30 UTC (30-min buffer after 10:00 UTC API fetch). No Bitfinex API call here.
 
-Uses daily_gross_profit_usd from user_profit_snapshot (stored at 09:40 UTC).
+Uses daily_gross_profit_usd from user_profit_snapshot (stored at 10:00 UTC, optional retry at 10:10).
 Formula: new_tokens_remaining = tokens_remaining - daily_gross_profit (1:1 USD);
 if new_tokens_remaining < 0 set to 0; if daily_gross_profit <= 0 do not deduct.
 
 Used tokens (display): used_tokens = int(gross_profit_usd × TOKENS_PER_USDT_GROSS) with TOKENS_PER_USDT_GROSS = 10.
+Example: choiwangai@gmail.com gross_profit_usd = 72.20 → used_tokens = 722.
 Referral: only purchased tokens (not free 150) trigger L1/L2/L3 USDT Credit rewards.
 We consume free tokens first; purchased_burned = max(0, daily_gross - free_remaining).
 """
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -32,29 +33,37 @@ def apply_deduction_rule(tokens_remaining: float, daily_gross_profit: float) -> 
     return max(0.0, new_raw), True
 
 
-def run_daily_token_deduction(db: Session) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def run_daily_token_deduction(
+    db: Session,
+    user_ids: Optional[List[int]] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     For each user with token balance and profit snapshot, deduct daily gross profit
     from tokens_remaining (1:1 USD), update last_gross_usd_used and updated_at.
     Persists each deduction to deduction_log (with email and account_switch_note).
+    If user_ids is provided, only those users are processed (e.g. 11:15 catch-up).
 
     Returns (list of deduction log entries, error_message if failed).
     """
     log_entries: List[Dict[str, Any]] = []
     try:
-        # Users who have both user_token_balance and user_profit_snapshot; join User for email
-        rows = (
+        q = (
             db.query(models.UserTokenBalance, models.UserProfitSnapshot, models.User)
             .join(
                 models.UserProfitSnapshot,
                 models.UserTokenBalance.user_id == models.UserProfitSnapshot.user_id,
             )
             .join(models.User, models.User.id == models.UserTokenBalance.user_id)
-            .all()
         )
+        if user_ids is not None:
+            q = q.filter(models.UserTokenBalance.user_id.in_(user_ids))
+        rows = q.all()
         now_utc = datetime.utcnow()
+        date_utc = now_utc.date() if hasattr(now_utc, "date") else date(now_utc.year, now_utc.month, now_utc.day)
         for token_row, snap, user in rows:
             user_id = token_row.user_id
+            if getattr(snap, "last_deduction_processed_date", None) == date_utc:
+                continue  # already processed (prevent double-charge)
             email = getattr(user, "email", None) or ""
             daily_gross = getattr(snap, "daily_gross_profit_usd", None)
             if daily_gross is None:
@@ -107,6 +116,10 @@ def run_daily_token_deduction(db: Session) -> Tuple[List[Dict[str, Any]], Option
                 ))
             if getattr(snap, "account_switch_note", None) is not None:
                 snap.account_switch_note = None
+            if hasattr(snap, "deduction_processed"):
+                snap.deduction_processed = True
+            if hasattr(snap, "last_deduction_processed_date"):
+                snap.last_deduction_processed_date = date_utc
 
         db.commit()
         return log_entries, None

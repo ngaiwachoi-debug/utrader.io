@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Column, Date, Integer, String, Float, DateTime, ForeignKey, Text
+from sqlalchemy import BigInteger, Boolean, Column, Date, Integer, String, Float, DateTime, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -29,6 +29,9 @@ class User(Base):
 
     # Bot process state (updated by API on start/stop and by worker on run/exit)
     bot_status = Column(String, default="stopped")  # stopped | running | starting
+
+    # Monthly API key deletion count for abuse detection (persisted; {"YYYY-MM": count})
+    key_deletions = Column(Text, default="{}", nullable=True)  # JSON: {"2026-02": 2}
 
     # Relationships
     vault = relationship("APIVault", back_populates="user", uselist=False)
@@ -125,6 +128,12 @@ class UserProfitSnapshot(Base):
     last_daily_snapshot_date = Column(Date, nullable=True)  # UTC date of that snapshot
     last_vault_updated_at = Column(DateTime, nullable=True)  # vault.keys_updated_at at last 09:40 run; detect account switch
     account_switch_note = Column(Text, nullable=True)  # set at 09:40 when Bitfinex account changed; read at 10:15 for DeductionLog then cleared
+    # Prevent double-charge: set True after 10:30/11:15 deduction for date_utc
+    deduction_processed = Column(Boolean, default=False, nullable=True)
+    last_deduction_processed_date = Column(Date, nullable=True)  # UTC date for which deduction was run
+    invalid_key_days = Column(Integer, default=0, nullable=True)  # consecutive days API key invalid; reset only on key restore
+    last_cached_daily_gross_usd = Column(Float, nullable=True)  # set when 10:30 used cache; for reconciliation at 11:15
+    reconciliation_completed = Column(Boolean, default=True, nullable=True)  # False when key restored post-11:15; 23:00 sweep sets True
 
 
 class UserTokenBalance(Base):

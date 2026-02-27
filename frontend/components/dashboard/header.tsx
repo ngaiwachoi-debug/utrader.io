@@ -5,10 +5,9 @@ import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
 import { signOut } from "next-auth/react"
 import { clearBackendTokenCache, getBackendToken } from "@/lib/auth"
-import { Star, Clock, Search, Bell, HelpCircle, User, Globe, Calendar, LogOut } from "lucide-react"
+import { Star, Clock, Search, Bell, HelpCircle, User, Globe, LogOut } from "lucide-react"
 import { useLanguage } from "@/lib/i18n"
 import { useSession } from "next-auth/react"
-import { useDateRange } from "@/lib/date-range-context"
 import {
   Select,
   SelectContent,
@@ -16,9 +15,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import { Calendar as CalendarComponent } from "@/components/ui/calendar"
-import type { DateRange as PickerRange } from "react-day-picker"
 import { useCurrentUserId } from "@/lib/current-user-context"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
@@ -33,13 +29,11 @@ export function Header({ onUpgradeClick }: HeaderProps) {
   const { data: session, status } = useSession()
   const userId = useCurrentUserId()
   const { language, setLanguage, t } = useLanguage()
-  const { range, setRange, formatRange } = useDateRange()
   const signedIn = status === "authenticated" && !!session?.user
   const [currencyView, setCurrencyView] = useState<CurrencyView>("USD")
   const [totalUsdAll, setTotalUsdAll] = useState<number | null>(null)
   const [usdOnly, setUsdOnly] = useState<number | null>(null)
   const [walletsLoading, setWalletsLoading] = useState(true)
-  const [dateOpen, setDateOpen] = useState(false)
   const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
   const [lendingLimit, setLendingLimit] = useState<number>(250_000)
   const [walletDataSource, setWalletDataSource] = useState<"live" | "cache" | null>(null)
@@ -122,10 +116,6 @@ export function Header({ onUpgradeClick }: HeaderProps) {
     }
   }
 
-  const pickerRange: PickerRange | undefined = range
-    ? { from: range.start, to: range.end }
-    : undefined
-
   return (
     <header className="sticky top-0 z-30 flex flex-col border-b border-border bg-card/80 backdrop-blur-md">
       <div className="flex h-14 items-center justify-between px-4 lg:px-6">
@@ -137,36 +127,6 @@ export function Header({ onUpgradeClick }: HeaderProps) {
         </div>
 
         <div className="flex items-center gap-2 lg:gap-3">
-          {/* Date Range Picker */}
-          <Popover open={dateOpen} onOpenChange={setDateOpen}>
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                className="hidden md:flex items-center gap-2 rounded-lg border border-border bg-secondary px-3 py-1.5 text-xs text-muted-foreground hover:bg-secondary/80 transition-colors"
-              >
-                <Calendar className="h-3.5 w-3.5" />
-                <span>{formatRange()}</span>
-              </button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0 bg-card border-border" align="end">
-              <CalendarComponent
-                mode="range"
-                selected={pickerRange}
-                onSelect={(v) => {
-                  if (v?.from) {
-                    setRange({
-                      start: v.from,
-                      end: v.to ?? v.from,
-                    })
-                    setDateOpen(false)
-                  }
-                }}
-                numberOfMonths={2}
-                defaultMonth={range.start}
-              />
-            </PopoverContent>
-          </Popover>
-
           {/* Currency Select: USD | USDT (do not translate) */}
           <Select
             value={currencyView}

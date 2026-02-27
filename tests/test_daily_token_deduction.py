@@ -1,5 +1,5 @@
 """
-Unit tests for daily token deduction (post-Bitfinex 10:15 UTC).
+Unit tests for daily token deduction (10:30 UTC; uses snapshot from 10:00 UTC API fetch).
 
 Run from project root:
   python -m pytest tests/test_daily_token_deduction.py -v

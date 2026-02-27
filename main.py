@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -59,20 +59,55 @@ from google.auth.transport import requests as google_requests
 import database
 import models
 import security
+from utils.logging import generate_trace_id, get_trace_id, set_trace_id
 from services.bitfinex_service import BitfinexManager, hash_bitfinex_id
 from services import bitfinex_cache
 from services.daily_token_deduction import run_daily_token_deduction
+from services import ledger_cache as ledger_cache_svc
 
-# Daily gross profit refresh: run at 09:40 UTC (in-process; no cron needed)
-DAILY_GROSS_REFRESH_UTC_HOUR = 9
-DAILY_GROSS_REFRESH_UTC_MINUTE = 40
+# Single daily Bitfinex API call at 10:00 UTC (no API before 10:00). One retry at 10:10 if data incomplete.
+DAILY_API_FETCH_UTC_HOUR = 10
+DAILY_API_FETCH_UTC_MINUTE = 0
+DAILY_API_RETRY_UTC_HOUR = 10
+DAILY_API_RETRY_UTC_MINUTE = 10
 DELAY_BETWEEN_USERS_SEC = 3.0
+# Ledger data is "incomplete" if latest entry is newer than this (Bitfinex may still be finalizing).
+LEDGER_FRESHNESS_MINUTES = 20
 
-# Daily token deduction: 10:15 UTC (15-min buffer after Bitfinex refresh at 10:00; gross stored at 09:40)
+# Token deduction at 10:30 UTC (30-min buffer after 10:00 API fetch; uses stored snapshot only, no API call).
 DAILY_DEDUCTION_UTC_HOUR = 10
-DAILY_DEDUCTION_UTC_MINUTE = 15
+DAILY_DEDUCTION_UTC_MINUTE = 30
 DEDUCTION_RETRY_INTERVAL_SEC = 300  # 5 minutes
 DEDUCTION_MAX_RETRIES = 3
+
+# 09:00 UTC pre-window: fetch + cache ledger for all users (7-day TTL); prevents revenue loss if key removed before 10:00.
+PREWINDOW_LEDGER_FETCH_UTC_HOUR = 9
+PREWINDOW_LEDGER_FETCH_UTC_MINUTE = 0
+
+# API key lock: no delete/modify during fee window (09:55–10:35 UTC).
+API_KEY_LOCK_START_UTC_HOUR = 9
+API_KEY_LOCK_START_UTC_MINUTE = 55
+API_KEY_LOCK_END_UTC_HOUR = 10
+API_KEY_LOCK_END_UTC_MINUTE = 35
+
+# 11:15 UTC catch-up for restored keys (failed at 10:30, key restored after).
+CATCHUP_DEDUCTION_UTC_HOUR = 11
+CATCHUP_DEDUCTION_UTC_MINUTE = 15
+
+# Late fee after N days of invalid key (no restoration). 12:00 UTC job applies fee.
+# invalid_key_days is NOT reset after fee; only reset when user restores API key (POST /api/keys).
+# Incremental fee: day 3 = 5%, day 4 = 10%, day 5 = 15% (LATE_FEE_PCT_PER_DAY * (invalid_key_days - 2)).
+LATE_FEE_DAYS = 3
+LATE_FEE_PCT = 0.05  # base 5% at day 3
+LATE_FEE_PCT_PER_DAY = 0.05  # extra 5% per day beyond day 2 (day 3→5%, day 4→10%, day 5→15%)
+MAX_LATE_FEE_PCT = 0.25  # cap incremental late fee at 25% (e.g. day 7+ = 25%)
+LATE_FEE_UTC_HOUR = 12
+LATE_FEE_UTC_MINUTE = 0
+
+# 23:00 UTC reconciliation sweep for users who restored key after 11:15 (post-catch-up).
+RECONCILIATION_UTC_HOUR = 23
+RECONCILIATION_UTC_MINUTE = 0
+RECONCILIATION_BATCH_SIZE = 10  # process 10 users per batch; 1s delay between batches
 
 # Exclusive admin: only this email can access /admin/* (set ADMIN_EMAIL in env to override)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "ngaiwanchoi@gmail.com").strip().lower()
@@ -91,6 +126,10 @@ _deduction_logs_lock = threading.Lock()
 ADMIN_AUDIT_MAX = 2000
 _admin_audit_logs: List[Dict[str, Any]] = []
 _admin_audit_lock = threading.Lock()
+
+# Monthly API key deletion count: persisted in users.key_deletions (JSON); in-memory fallback if column missing.
+_key_deletions: Dict[tuple, int] = {}
+_key_deletions_lock = threading.Lock()
 
 
 def _admin_audit(email: str, action: str, detail: Optional[Dict[str, Any]] = None) -> None:
@@ -165,26 +204,35 @@ def _get_scheduler_test_user_id() -> Optional[int]:
         return None
 
 
-async def _run_daily_gross_profit_scheduler() -> None:
-    """Background task: at 09:40 UTC every day, refresh gross profit for all users with vaults."""
-    first_wait = _get_scheduler_first_wait_sec()
+def _is_api_key_lock_window() -> bool:
+    """True during 09:55–10:35 UTC when API key delete/modify is disabled (fee calculation window)."""
+    now = datetime.utcnow()
+    start = now.replace(hour=API_KEY_LOCK_START_UTC_HOUR, minute=API_KEY_LOCK_START_UTC_MINUTE, second=0, microsecond=0)
+    end = now.replace(hour=API_KEY_LOCK_END_UTC_HOUR, minute=API_KEY_LOCK_END_UTC_MINUTE, second=0, microsecond=0)
+    if start <= end:
+        return start <= now <= end
+    return now >= start or now <= end
+
+
+def _get_next_utc_wait_sec(hour: int, minute: int) -> float:
+    """Seconds until next given UTC time (hour, minute)."""
+    now = datetime.utcnow()
+    next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if next_run <= now:
+        next_run += timedelta(days=1)
+    return (next_run - now).total_seconds()
+
+
+async def _run_09_00_ledger_cache_scheduler() -> None:
+    """
+    Daily 09:00 UTC: fetch + cache Margin Funding ledger for all users (7-day TTL).
+    Validates API keys; sends in-app/email alert for invalid keys.
+    Prevents revenue loss if user deletes key at 05:00 UTC (10:30 deduction uses cache).
+    """
     while True:
-        if first_wait is not None:
-            wait_sec = first_wait
-            first_wait = None
-            print(f"[scheduler] TEST_SCHEDULER_SECONDS: first run in {wait_sec:.0f}s")
-        else:
-            now = datetime.utcnow()
-            next_run = now.replace(
-                hour=DAILY_GROSS_REFRESH_UTC_HOUR,
-                minute=DAILY_GROSS_REFRESH_UTC_MINUTE,
-                second=0,
-                microsecond=0,
-            )
-            if next_run <= now:
-                next_run += timedelta(days=1)
-            wait_sec = (next_run - now).total_seconds()
-            print(f"[scheduler] Next daily gross profit refresh at {next_run.isoformat()}Z (in {wait_sec:.0f}s)")
+        wait_sec = _get_next_utc_wait_sec(PREWINDOW_LEDGER_FETCH_UTC_HOUR, PREWINDOW_LEDGER_FETCH_UTC_MINUTE)
+        set_trace_id(generate_trace_id())
+        logger.info("trace_id=%s | Next 09:00 UTC ledger cache run in %.0fs", get_trace_id(), wait_sec)
         await asyncio.sleep(wait_sec)
         db = database.SessionLocal()
         try:
@@ -202,110 +250,329 @@ async def _run_daily_gross_profit_scheduler() -> None:
             db.close()
         if not user_ids:
             continue
-        print(f"[scheduler] Daily gross profit refresh: {len(user_ids)} user(s)")
+        try:
+            redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+        except Exception as e:
+            logger.warning("09:00 ledger cache: Redis unavailable: %s", e)
+            continue
+        today_utc = datetime.utcnow().date()
         for i, uid in enumerate(user_ids):
             if i > 0:
                 await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
             db = database.SessionLocal()
             try:
-                err_msg: Optional[str] = None
-                for attempt in range(3):
-                    try:
-                        result, rate_limited, _ = await _refresh_user_lending_snapshot(uid, db)
-                        # #region agent log
-                        _debug_log("main.py:scheduler_9:40", "after _refresh", {"user_id": uid, "gross_profit": result.gross_profit, "rate_limited": rate_limited, "hypothesisId": "H3"})
-                        # #endregion
-                        if not rate_limited:
-                            cache_data = result.model_dump()
-                            cache_data.pop("trades", None)
-                            await bitfinex_cache.set_cached(uid, bitfinex_cache.KEY_LENDING, cache_data)
-                            # Store daily_gross_profit_usd for 10:15 token deduction (same UTC day)
-                            snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
-                            vault = db.query(models.APIVault).filter(models.APIVault.user_id == uid).first()
-                            if snap and hasattr(snap, "daily_gross_profit_usd"):
-                                today_utc = datetime.utcnow().date()
-                                yesterday_utc = today_utc - timedelta(days=1)
-                                current = float(result.gross_profit)
-                                last_cum = getattr(snap, "last_daily_cumulative_gross", None)
-                                last_date = getattr(snap, "last_daily_snapshot_date", None)
-                                vault_updated = getattr(vault, "keys_updated_at", None) if vault else None
-                                last_vault_seen = getattr(snap, "last_vault_updated_at", None)
-
-                                def _dt_ts(d):
-                                    if d is None:
-                                        return 0
-                                    return d.timestamp() if hasattr(d, "timestamp") and callable(getattr(d, "timestamp")) else 0
-
-                                account_switched = (
-                                    vault_updated is not None
-                                    and (last_vault_seen is None or _dt_ts(vault_updated) > _dt_ts(last_vault_seen))
-                                )
-                                if account_switched:
-                                    daily = current
-                                    snap.daily_gross_profit_usd = daily
-                                    snap.last_daily_cumulative_gross = current
-                                    snap.last_daily_snapshot_date = today_utc
-                                    snap.last_vault_updated_at = vault_updated
-                                    snap.account_switch_note = "Bitfinex account switched – new ledger data pulled"
-                                    db.commit()
-                                    user_for_alert = db.query(models.User).filter(models.User.id == uid).first()
-                                    alert_email = user_for_alert.email if user_for_alert else None
-                                    logger.warning(
-                                        "Bitfinex account switched: user_id=%s email=%s – daily deductions now use new account; baseline reset.",
-                                        uid, alert_email,
-                                    )
-                                    await _alert_admins_deduction_failure(
-                                        f"User {alert_email or uid} (ID: {uid}) switched Bitfinex accounts – daily deductions now use new ledger."
-                                    )
-                                else:
-                                    if last_date == yesterday_utc and last_cum is not None:
-                                        daily = current - last_cum
-                                    else:
-                                        daily = current
-                                    snap.daily_gross_profit_usd = daily
-                                    snap.last_daily_cumulative_gross = current
-                                    snap.last_daily_snapshot_date = today_utc
-                                    if hasattr(snap, "account_switch_note"):
-                                        snap.account_switch_note = None
-                                    db.commit()
-                        print(f"[scheduler] user_id={uid} gross_profit={result.gross_profit}")
-                        err_msg = None
-                        break
-                    except Exception as e:
-                        err_msg = str(e)
-                        print(f"[scheduler] user_id={uid} attempt {attempt + 1}/3 error: {e}")
-                        if attempt < 2:
-                            await asyncio.sleep(10.0)
-                if err_msg:
-                    await _record_api_failure("daily_gross_refresh", uid, err_msg)
+                user = db.query(models.User).filter(models.User.id == uid).first()
+                vault = db.query(models.APIVault).filter(models.APIVault.user_id == uid).first()
+                if not user or not vault:
+                    continue
+                email = getattr(user, "email", None) or ""
+                try:
+                    keys = vault.get_keys()
+                    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+                    entries, _, fetch_err = await _fetch_all_margin_funding_entries(mgr)
+                    if fetch_err and not entries:
+                        logger.warning("09:00 UTC: Invalid API key for %s – alert sent", email)
+                        await _alert_admins_deduction_failure(
+                            f"User {email} (ID: {uid}): Bitfinex API key invalid. Update by 10:00 UTC to avoid fee processing with cached data."
+                        )
+                        continue
+                    start_ms = int(vault.created_at.timestamp() * 1000) if getattr(vault, "created_at", None) else None
+                    ok = await ledger_cache_svc.set_ledger_cache(redis, uid, today_utc, entries or [], start_ms=start_ms)
+                    if ok:
+                        logger.info("09:00 UTC: Cached ledger data for %s (API key valid)", email)
+                except Exception as e:
+                    logger.warning("09:00 UTC: Cache failed for user_id=%s: %s", uid, e)
+                    await _alert_admins_deduction_failure(
+                        f"User {email or uid} (ID: {uid}): Ledger cache failed – {e!s}"
+                    )
             finally:
                 db.close()
 
 
-def _get_next_1015_utc_wait_sec() -> float:
-    """Seconds until next 10:15 UTC."""
-    now = datetime.utcnow()
-    next_run = now.replace(
-        hour=DAILY_DEDUCTION_UTC_HOUR,
-        minute=DAILY_DEDUCTION_UTC_MINUTE,
-        second=0,
-        microsecond=0,
+async def _run_daily_gross_profit_scheduler() -> None:
+    """
+    Single daily API run at 10:00 UTC (no API before 10:00). Fetch Margin Funding ledger per user,
+    validate completeness (latest entry >= 20 mins old). If incomplete, retry once at 10:10.
+    If still incomplete after retry: skip deduction for the day (set daily_gross_profit_usd=0) and alert.
+    Max 2 API calls/day per user (10:00 + optional 10:10 retry).
+    """
+    first_wait = _get_scheduler_first_wait_sec()
+    while True:
+        if first_wait is not None:
+            wait_sec = first_wait
+            first_wait = None
+            print(f"[scheduler] TEST_SCHEDULER_SECONDS: first run in {wait_sec:.0f}s")
+        else:
+            wait_sec = _get_next_utc_wait_sec(DAILY_API_FETCH_UTC_HOUR, DAILY_API_FETCH_UTC_MINUTE)
+            print(f"[scheduler] Next daily API fetch at 10:00 UTC (in {wait_sec:.0f}s)")
+        await asyncio.sleep(wait_sec)
+        db = database.SessionLocal()
+        try:
+            user_ids = [
+                row[0]
+                for row in db.query(models.User.id)
+                .join(models.APIVault, models.User.id == models.APIVault.user_id)
+                .distinct()
+                .all()
+            ]
+            test_uid = _get_scheduler_test_user_id()
+            if test_uid is not None:
+                user_ids = [u for u in user_ids if u == test_uid]
+        finally:
+            db.close()
+        if not user_ids:
+            continue
+        print(f"[scheduler] 10:00 UTC API fetch: {len(user_ids)} user(s)")
+        incomplete_after_10_00: List[int] = []
+        for i, uid in enumerate(user_ids):
+            if i > 0:
+                await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
+            db = database.SessionLocal()
+            try:
+                success, data_incomplete, err = await _daily_10_00_fetch_and_save(uid, db)
+                if success:
+                    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                    if snap:
+                        cache_data = {
+                            "gross_profit": float(snap.gross_profit_usd or 0),
+                            "bitfinex_fee": float(snap.bitfinex_fee_usd or 0),
+                            "net_profit": float(snap.net_profit_usd or 0),
+                        }
+                        await bitfinex_cache.set_cached(uid, bitfinex_cache.KEY_LENDING, cache_data)
+                    user_obj = db.query(models.User).filter(models.User.id == uid).first()
+                    logger.info(
+                        "daily_10_00_fetch user_id=%s email=%s gross_profit_usd=%s data_complete=1",
+                        uid, getattr(user_obj, "email", None), getattr(snap, "gross_profit_usd", None),
+                    )
+                elif data_incomplete:
+                    incomplete_after_10_00.append(uid)
+                    logger.warning("daily_10_00_fetch user_id=%s data_incomplete (latest entry < %s mins)", uid, LEDGER_FRESHNESS_MINUTES)
+                else:
+                    if err:
+                        await _record_api_failure("daily_10_00_fetch", uid, err)
+            finally:
+                db.close()
+        if incomplete_after_10_00:
+            wait_retry = _get_next_utc_wait_sec(DAILY_API_RETRY_UTC_HOUR, DAILY_API_RETRY_UTC_MINUTE)
+            if wait_retry > 0 and wait_retry < 3600:
+                await asyncio.sleep(wait_retry)
+            print(f"[scheduler] 10:10 UTC retry: {len(incomplete_after_10_00)} user(s)")
+            still_incomplete: List[int] = []
+            for i, uid in enumerate(incomplete_after_10_00):
+                if i > 0:
+                    await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
+                db = database.SessionLocal()
+                try:
+                    success, data_incomplete, _ = await _daily_10_00_fetch_and_save(uid, db)
+                    if success:
+                        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                        if snap:
+                            await bitfinex_cache.set_cached(
+                                uid,
+                                bitfinex_cache.KEY_LENDING,
+                                {
+                                    "gross_profit": float(snap.gross_profit_usd or 0),
+                                    "bitfinex_fee": float(snap.bitfinex_fee_usd or 0),
+                                    "net_profit": float(snap.net_profit_usd or 0),
+                                },
+                            )
+                        logger.info("daily_10_10_retry user_id=%s success", uid)
+                    elif data_incomplete:
+                        still_incomplete.append(uid)
+                finally:
+                    db.close()
+            for uid in still_incomplete:
+                db = database.SessionLocal()
+                try:
+                    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                    if snap and hasattr(snap, "daily_gross_profit_usd"):
+                        snap.daily_gross_profit_usd = 0.0
+                        db.commit()
+                    user_obj = db.query(models.User).filter(models.User.id == uid).first()
+                    email = getattr(user_obj, "email", None) or ""
+                    logger.warning(
+                        "daily_fetch_incomplete user_id=%s email=%s – skip deduction for the day (no partial data)",
+                        uid, email,
+                    )
+                    await _alert_admins_deduction_failure(
+                        f"Incomplete ledger data for user {email} (ID: {uid}) – skipped deduction for the day. Latest entry < {LEDGER_FRESHNESS_MINUTES} mins."
+                    )
+                finally:
+                    db.close()
+
+
+def _get_next_1030_utc_wait_sec() -> float:
+    """Seconds until next 10:30 UTC (deduction uses stored snapshot only, no API call)."""
+    return _get_next_utc_wait_sec(DAILY_DEDUCTION_UTC_HOUR, DAILY_DEDUCTION_UTC_MINUTE)
+
+
+def _is_deduction_processed(db: Session, user_id: int, date_utc: date) -> bool:
+    """True if deduction was already processed for this user on date_utc (prevents double-charge)."""
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    if not snap:
+        return False
+    last_date = getattr(snap, "last_deduction_processed_date", None)
+    if last_date is None:
+        return False
+    if hasattr(last_date, "isoformat"):
+        return last_date == date_utc
+    return last_date == date_utc
+
+
+def _mark_deduction_processed(db: Session, user_id: int, date_utc: date) -> None:
+    """Mark deduction as processed for this user/date (post-10:30 or post-11:15)."""
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    if not snap:
+        return
+    if hasattr(snap, "deduction_processed"):
+        snap.deduction_processed = True
+    if hasattr(snap, "last_deduction_processed_date"):
+        snap.last_deduction_processed_date = date_utc
+    db.commit()
+    logger.info("trace_id=%s | Marked deduction_processed for user_id=%s date_utc=%s", get_trace_id(), user_id, date_utc)
+
+
+def _reconcile_cached_vs_fresh(db: Session, user_id: int, date_utc: date, dry_run: bool = False) -> bool:
+    """
+    Compare 09:00 cached daily_gross vs fresh (post-restoration) data. Refund if overcharged, deduct if undercharged.
+    Auto-run during 11:15 catch-up. When dry_run=True: log would-be deduction/refund, no DB write; return False if
+    would result in negative balance (manual review needed).
+    Returns True on success or no-op, False if dry run would fail (e.g. negative balance).
+    """
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    if not snap or not token_row:
+        return True
+    cached = float(getattr(snap, "last_cached_daily_gross_usd", None) or 0)
+    if cached <= 0:
+        return True
+    fresh = float(getattr(snap, "daily_gross_profit_usd", None) or 0)
+    diff_usd = fresh - cached
+    if abs(diff_usd) < 1e-9:
+        if not dry_run and hasattr(snap, "last_cached_daily_gross_usd"):
+            snap.last_cached_daily_gross_usd = None
+            db.commit()
+        return True
+    before = float(token_row.tokens_remaining or 0)
+    if diff_usd > 0:
+        # Undercharged: would deduct extra
+        after = max(0.0, before - diff_usd)
+        log_msg = "Reconciliation: Charged extra %.6f tokens (undercharged)" % diff_usd
+        if dry_run:
+            logger.info(
+                "trace_id=%s | user_id=%s date_utc=%s [DRY RUN] %s balance_before=%.2f would_be_after=%.2f",
+                get_trace_id(), user_id, date_utc, log_msg, before, after,
+            )
+            if before - diff_usd < -1e-9:
+                logger.warning(
+                    "trace_id=%s | user_id=%s dry run would result in negative balance (before=%.2f deduct=%.6f)",
+                    get_trace_id(), user_id, before, diff_usd,
+                )
+                return False
+            return True
+        token_row.tokens_remaining = after
+    else:
+        # Overcharged: refund
+        after = before + abs(diff_usd)
+        log_msg = "Reconciliation: Refunded %.6f tokens (overcharged)" % abs(diff_usd)
+        if dry_run:
+            logger.info(
+                "trace_id=%s | user_id=%s date_utc=%s [DRY RUN] %s balance_before=%.2f would_be_after=%.2f",
+                get_trace_id(), user_id, date_utc, log_msg, before, after,
+            )
+            return True
+        token_row.tokens_remaining = after
+    token_row.updated_at = datetime.utcnow()
+    if hasattr(snap, "last_cached_daily_gross_usd"):
+        snap.last_cached_daily_gross_usd = None
+    db.commit()
+    logger.info("trace_id=%s | user_id=%s date_utc=%s %s balance_before=%.2f balance_after=%.2f", get_trace_id(), user_id, date_utc, log_msg, before, float(token_row.tokens_remaining))
+    return True
+
+
+async def _apply_09_00_cache_before_deduction(db: Session, redis: Any) -> None:
+    """
+    If 10:00 fetch failed (invalid/deleted key), fill snapshot from 09:00 cached ledger so 10:30 deduction can run.
+    Uses start_ms from cache (so works even if vault was deleted after 09:00).
+    Log: "10:30 UTC: Processed deduction for {email} using 09:00 UTC cached data".
+    """
+    today_utc = datetime.utcnow().date()
+    start_today_ms = int(datetime(today_utc.year, today_utc.month, today_utc.day).timestamp() * 1000)
+    end_today_ms = start_today_ms + 86400 * 1000 - 1
+    end_ms = int(datetime.utcnow().timestamp() * 1000)
+    rows = (
+        db.query(models.UserTokenBalance, models.UserProfitSnapshot, models.User)
+        .join(models.UserProfitSnapshot, models.UserTokenBalance.user_id == models.UserProfitSnapshot.user_id)
+        .join(models.User, models.User.id == models.UserTokenBalance.user_id)
+        .filter(
+            (models.UserProfitSnapshot.daily_gross_profit_usd == 0) |
+            (models.UserProfitSnapshot.daily_gross_profit_usd.is_(None)),
+        )
+        .all()
     )
-    if next_run <= now:
-        next_run += timedelta(days=1)
-    return (next_run - now).total_seconds()
+    for token_row, snap, user in rows:
+        user_id = token_row.user_id
+        email = getattr(user, "email", None) or ""
+        cached = await ledger_cache_svc.get_ledger_cache_with_fallback(redis, db, user_id, today_utc)
+        if not cached:
+            continue
+        entries, start_ms, db_fallback_daily = cached[0], cached[1], (cached[2] if len(cached) > 2 else None)
+        if db_fallback_daily is not None:
+            # Redis down – used DB last_cached_daily_gross_usd for deduction
+            daily_gross = float(db_fallback_daily)
+            if hasattr(snap, "daily_gross_profit_usd"):
+                snap.daily_gross_profit_usd = round(daily_gross, 2)
+            if hasattr(snap, "updated_at"):
+                snap.updated_at = datetime.utcnow()
+            if hasattr(snap, "invalid_key_days"):
+                snap.invalid_key_days = (snap.invalid_key_days or 0) + 1
+            db.commit()
+            logger.info(
+                "trace_id=%s | 10:30 UTC: Processed deduction for %s using DB cache (Redis down) last_cached_daily_gross_usd=%.6f",
+                get_trace_id(), email or user_id, daily_gross,
+            )
+            await _notify_user_cached_deduction(email or str(user_id), round(daily_gross, 2))
+            continue
+        if not entries:
+            continue
+        start_ms = start_ms or 0
+        gross, fees = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms)
+        daily_gross, _ = _gross_and_fees_from_ledger_entries(entries, start_ms=start_today_ms, end_ms=end_today_ms)
+        snap.gross_profit_usd = round(gross, 2)
+        snap.net_profit_usd = round(gross - fees, 2)
+        snap.bitfinex_fee_usd = round(fees, 2)
+        if hasattr(snap, "daily_gross_profit_usd"):
+            snap.daily_gross_profit_usd = round(daily_gross, 2)
+        if hasattr(snap, "last_cached_daily_gross_usd"):
+            snap.last_cached_daily_gross_usd = round(daily_gross, 6)
+        if hasattr(snap, "updated_at"):
+            snap.updated_at = datetime.utcnow()
+        if hasattr(snap, "invalid_key_days"):
+            snap.invalid_key_days = (snap.invalid_key_days or 0) + 1
+        db.commit()
+        logger.info(
+            "trace_id=%s | 10:30 UTC: Processed deduction for %s using 09:00 UTC cached data (API key invalid/deleted)",
+            get_trace_id(), email or user_id,
+        )
+        await _notify_user_cached_deduction(email or str(user_id), round(daily_gross, 2))
 
 
 async def _run_daily_token_deduction_scheduler() -> None:
-    """At 10:15 UTC daily, deduct tokens by daily_gross_profit_usd. Retry 3x at 5-min intervals; alert on failure."""
+    """At 10:30 UTC daily, deduct tokens by daily_gross_profit_usd from stored snapshot only (no Bitfinex API call)."""
     while True:
-        wait_sec = _get_next_1015_utc_wait_sec()
-        logger.info("Next daily token deduction at 10:15 UTC in %.0fs", wait_sec)
+        wait_sec = _get_next_1030_utc_wait_sec()
+        set_trace_id(generate_trace_id())
+        logger.info("trace_id=%s | Next daily token deduction at 10:30 UTC in %.0fs", get_trace_id(), wait_sec)
         await asyncio.sleep(wait_sec)
         last_error: Optional[str] = None
         for attempt in range(DEDUCTION_MAX_RETRIES):
             db = database.SessionLocal()
             try:
+                try:
+                    redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+                    await _apply_09_00_cache_before_deduction(db, redis)
+                except Exception as e:
+                    logger.warning("09:00 cache fallback before deduction: %s", e)
                 log_entries, err = run_daily_token_deduction(db)
                 if err:
                     last_error = err
@@ -339,9 +606,258 @@ async def _run_daily_token_deduction_scheduler() -> None:
             finally:
                 db.close()
         if last_error:
-            alert_msg = f"Daily token deduction failed after {DEDUCTION_MAX_RETRIES} retries: {last_error}"
+            alert_msg = f"Daily token deduction (10:30 UTC) failed after {DEDUCTION_MAX_RETRIES} retries: {last_error}"
             logger.error(alert_msg)
             await _alert_admins_deduction_failure(alert_msg)
+
+
+def _get_next_1115_utc_wait_sec() -> float:
+    """Seconds until next 11:15 UTC (catch-up deduction for restored keys)."""
+    return _get_next_utc_wait_sec(CATCHUP_DEDUCTION_UTC_HOUR, CATCHUP_DEDUCTION_UTC_MINUTE)
+
+
+def _get_next_1200_utc_wait_sec() -> float:
+    """Seconds until next 12:00 UTC (late fee application)."""
+    return _get_next_utc_wait_sec(LATE_FEE_UTC_HOUR, LATE_FEE_UTC_MINUTE)
+
+
+def _get_next_2300_utc_wait_sec() -> float:
+    """Seconds until next 23:00 UTC (reconciliation sweep for key restored post-11:15)."""
+    return _get_next_utc_wait_sec(RECONCILIATION_UTC_HOUR, RECONCILIATION_UTC_MINUTE)
+
+
+def _late_fee_pct_for_days(invalid_days: int) -> float:
+    """Incremental late fee: day 3 = 5%%, day 4 = 10%%, …; capped at MAX_LATE_FEE_PCT (25%%)."""
+    if invalid_days < LATE_FEE_DAYS:
+        return 0.0
+    raw = (invalid_days - 2) * LATE_FEE_PCT_PER_DAY
+    return min(raw, MAX_LATE_FEE_PCT)
+
+
+async def _run_late_fee_scheduler() -> None:
+    """12:00 UTC: apply incremental late fee for users with invalid_key_days >= LATE_FEE_DAYS. Do NOT reset invalid_key_days."""
+    while True:
+        wait_sec = _get_next_1200_utc_wait_sec()
+        set_trace_id(generate_trace_id())
+        logger.info(
+            "trace_id=%s | Next 12:00 UTC late fee run in %.0fs",
+            get_trace_id(), wait_sec,
+        )
+        await asyncio.sleep(wait_sec)
+        db = database.SessionLocal()
+        try:
+            set_trace_id(generate_trace_id())
+            rows = (
+                db.query(models.UserProfitSnapshot, models.UserTokenBalance, models.User)
+                .join(models.UserTokenBalance, models.UserProfitSnapshot.user_id == models.UserTokenBalance.user_id)
+                .join(models.User, models.User.id == models.UserTokenBalance.user_id)
+                .all()
+            )
+            for snap, token_row, user in rows:
+                invalid_days = getattr(snap, "invalid_key_days", None) or 0
+                if invalid_days < LATE_FEE_DAYS:
+                    continue
+                base_fee = float(getattr(snap, "daily_gross_profit_usd", None) or 0)
+                if base_fee <= 0:
+                    base_fee = 0.01  # minimum so we still apply late fee
+                fee_pct = _late_fee_pct_for_days(invalid_days)
+                if (invalid_days - 2) * LATE_FEE_PCT_PER_DAY > MAX_LATE_FEE_PCT:
+                    logger.info(
+                        "trace_id=%s | User %s – late fee capped at 25%% (invalid_key_days=%s)",
+                        get_trace_id(), snap.user_id, invalid_days,
+                    )
+                total_fee = base_fee * (1 + fee_pct)
+                user_id = snap.user_id
+                email = getattr(user, "email", None) or ""
+                before = float(token_row.tokens_remaining or 0)
+                after = max(0.0, before - total_fee)
+                token_row.tokens_remaining = after
+                token_row.updated_at = datetime.utcnow()
+                # Do NOT reset invalid_key_days; only reset when user restores API key (POST /api/keys)
+                db.commit()
+                logger.info(
+                    "trace_id=%s | 12:00 UTC: Late fee applied user_id=%s email=%s base=%.4f pct=%.0f%% total=%.4f tokens_after=%.2f",
+                    get_trace_id(), user_id, email, base_fee, fee_pct * 100, total_fee, after,
+                )
+                logger.info(
+                    "trace_id=%s | User %s – invalid_key_days = %s (key still invalid post-late fee)",
+                    get_trace_id(), user_id, invalid_days,
+                )
+                await _alert_admins_deduction_failure(
+                    f"Late fee ({fee_pct*100:.0f}%%) applied – User: {email} (ID: {user_id}), "
+                    f"invalid API key for {invalid_days}+ days, deducted {total_fee:.4f} tokens."
+                )
+        except Exception as e:
+            logger.exception("trace_id=%s | Late fee scheduler error: %s", get_trace_id(), e)
+        finally:
+            db.close()
+
+
+async def _run_2300_reconciliation_scheduler() -> None:
+    """
+    23:00 UTC: reconciliation sweep for users who restored key after 11:15 (post-catch-up).
+    Runs _reconcile_cached_vs_fresh and marks reconciliation_completed = True.
+    """
+    while True:
+        wait_sec = _get_next_2300_utc_wait_sec()
+        set_trace_id(generate_trace_id())
+        logger.info(
+            "trace_id=%s | Next 23:00 UTC reconciliation sweep in %.0fs",
+            get_trace_id(), wait_sec,
+        )
+        await asyncio.sleep(wait_sec)
+        today_utc = datetime.utcnow().date()
+        cutoff_1115 = datetime(today_utc.year, today_utc.month, today_utc.day, 11, 15, 0)
+        cutoff_ts = cutoff_1115.timestamp()
+        db = database.SessionLocal()
+        try:
+            set_trace_id(generate_trace_id())
+            # Users with key restored after 11:15 today and not yet reconciled (reconciliation_completed = False)
+            snap_model = models.UserProfitSnapshot
+            if not hasattr(snap_model, "reconciliation_completed"):
+                rows = []
+            else:
+                rows = (
+                    db.query(models.User.id, models.User.email, models.APIVault.keys_updated_at)
+                    .join(models.APIVault, models.APIVault.user_id == models.User.id)
+                    .join(models.UserProfitSnapshot, models.UserProfitSnapshot.user_id == models.User.id)
+                    .filter(snap_model.reconciliation_completed == False)
+                    .all()
+                )
+            # Filter to users with keys_updated_at after 11:15 today
+            to_process = []
+            for r in rows:
+                user_id, email, keys_updated_at = r[0], r[1], r[2]
+                if keys_updated_at is None:
+                    continue
+                try:
+                    kua_ts = keys_updated_at.timestamp() if hasattr(keys_updated_at, "timestamp") else 0
+                except Exception:
+                    continue
+                if kua_ts >= cutoff_ts:
+                    to_process.append((user_id, email, keys_updated_at))
+            total_batches = (len(to_process) + RECONCILIATION_BATCH_SIZE - 1) // RECONCILIATION_BATCH_SIZE if to_process else 0
+            for batch_num, batch_start in enumerate(range(0, len(to_process), RECONCILIATION_BATCH_SIZE), start=1):
+                batch = to_process[batch_start : batch_start + RECONCILIATION_BATCH_SIZE]
+                for user_id, email, keys_updated_at in batch:
+                    ok = _reconcile_cached_vs_fresh(db, user_id, today_utc, dry_run=True)
+                    if not ok:
+                        logger.warning(
+                            "trace_id=%s | 23:00 reconciliation dry run failed for user %s – manual review needed",
+                            get_trace_id(), user_id,
+                        )
+                        await _alert_admins_deduction_failure(
+                            f"23:00 reconciliation dry run failed for user {user_id} – manual review needed"
+                        )
+                        continue
+                    _reconcile_cached_vs_fresh(db, user_id, today_utc, dry_run=False)
+                    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+                    if snap and hasattr(snap, "reconciliation_completed"):
+                        snap.reconciliation_completed = True
+                    db.commit()
+                    logger.info(
+                        "trace_id=%s | 23:00 UTC reconciliation: Processed user %s (key restored at %s)",
+                        get_trace_id(), user_id, keys_updated_at,
+                    )
+                logger.info(
+                    "trace_id=%s | 23:00 reconciliation – batch %s/%s processed (%s users)",
+                    get_trace_id(), batch_num, total_batches, len(batch),
+                )
+                if batch_num < total_batches:
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.exception("trace_id=%s | 23:00 reconciliation scheduler error: %s", get_trace_id(), e)
+        finally:
+            db.close()
+
+
+async def _run_11_15_catchup_deduction_scheduler() -> None:
+    """
+    11:15 UTC: catch-up deduction for users who had key restored after 10:30 (had failed at 10:30).
+    Re-fetch ledger with restored key, then run deduction for those users.
+    """
+    while True:
+        wait_sec = _get_next_1115_utc_wait_sec()
+        set_trace_id(generate_trace_id())
+        logger.info("trace_id=%s | Next 11:15 UTC catch-up deduction in %.0fs", get_trace_id(), wait_sec)
+        await asyncio.sleep(wait_sec)
+        today = datetime.utcnow().date()
+        cutoff_1030 = datetime(today.year, today.month, today.day, 10, 30, 0)
+        db = database.SessionLocal()
+        try:
+            rows = (
+                db.query(models.User.id, models.User.email, models.APIVault.keys_updated_at)
+                .join(models.APIVault, models.APIVault.user_id == models.User.id)
+                .join(models.UserProfitSnapshot, models.UserProfitSnapshot.user_id == models.User.id)
+                .filter(
+                    (models.UserProfitSnapshot.daily_gross_profit_usd == 0) |
+                    (models.UserProfitSnapshot.daily_gross_profit_usd.is_(None)),
+                )
+                .all()
+            )
+            cutoff_ts = cutoff_1030.timestamp()
+            restored = []
+            for r in rows:
+                if _is_deduction_processed(db, r[0], today):
+                    logger.info("trace_id=%s | 11:15 UTC: Skipping user_id=%s – deduction already processed for today (no double-charge)", get_trace_id(), r[0])
+                    continue
+                kua = r[2]
+                if kua is None:
+                    continue
+                try:
+                    kua_ts = kua.timestamp() if hasattr(kua, "timestamp") else 0
+                except Exception:
+                    continue
+                if kua_ts >= cutoff_ts:
+                    restored.append((r[0], r[1] or ""))
+            if not restored:
+                continue
+            for uid, email in restored:
+                try:
+                    success, _, err = await _daily_10_00_fetch_and_save(uid, db)
+                    if success:
+                        _reconcile_cached_vs_fresh(db, uid, today)
+                        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                        if snap and hasattr(snap, "invalid_key_days"):
+                            snap.invalid_key_days = 0
+                        db.commit()
+                        logger.info(
+                            "trace_id=%s | 11:15 UTC: Catch-up deduction for %s (API key restored – deducted using fresh ledger)",
+                            get_trace_id(), email or uid,
+                        )
+                except Exception as e:
+                    logger.warning("11:15 catch-up user_id=%s: %s", uid, e)
+            restored_ids = [uid for uid, _ in restored]
+            db.close()
+            db2 = database.SessionLocal()
+            try:
+                log_entries, err = run_daily_token_deduction(db2, user_ids=restored_ids)
+                if err:
+                    logger.warning("11:15 catch-up run_daily_token_deduction: %s", err)
+                else:
+                    with _deduction_logs_lock:
+                        for e in log_entries:
+                            _deduction_logs.append(e)
+                            while len(_deduction_logs) > DEDUCTION_LOGS_MAX:
+                                _deduction_logs.pop(0)
+            finally:
+                db2.close()
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+async def _notify_user_cached_deduction(user_email: str, cached_amount: float) -> None:
+    """Notify user when deduction used 09:00 UTC cached data (in-app + optional email)."""
+    msg = (
+        f"Your daily fee was processed using cached data (API key invalid). "
+        f"We will reconcile automatically when you restore your key."
+    )
+    logger.info("User notification (cached deduction): email=%s amount=%.2f msg=%s", user_email, cached_amount, msg[:80])
+    # In-app: store in admin_notifications for target_user_id if we have user_id (caller can pass later)
+    # Email: optional integration; for now logging only
 
 
 async def _alert_admins_deduction_failure(message: str) -> None:
@@ -374,18 +890,42 @@ async def lifespan(app: FastAPI):
             logger.info("Connected to Redis server at %s (queue + deduction)", host)
         except Exception as e:
             logger.warning("Redis startup check failed (queue may be unavailable): %s", e)
-    # Start in-process daily 09:40 UTC gross profit refresh (dev and prod; no cron needed)
+    # 09:00 UTC ledger cache; 10:00 API fetch; 10:30 deduction; 11:15 catch-up; 12:00 late fee; 23:00 reconciliation
+    ledger_cache_task = asyncio.create_task(_run_09_00_ledger_cache_scheduler())
     scheduler_task = asyncio.create_task(_run_daily_gross_profit_scheduler())
     deduction_task = asyncio.create_task(_run_daily_token_deduction_scheduler())
+    catchup_task = asyncio.create_task(_run_11_15_catchup_deduction_scheduler())
+    late_fee_task = asyncio.create_task(_run_late_fee_scheduler())
+    reconciliation_2300_task = asyncio.create_task(_run_2300_reconciliation_scheduler())
     yield
+    ledger_cache_task.cancel()
     scheduler_task.cancel()
     deduction_task.cancel()
+    catchup_task.cancel()
+    late_fee_task.cancel()
+    reconciliation_2300_task.cancel()
+    try:
+        await ledger_cache_task
+    except asyncio.CancelledError:
+        pass
     try:
         await scheduler_task
     except asyncio.CancelledError:
         pass
     try:
         await deduction_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await catchup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await late_fee_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await reconciliation_2300_task
     except asyncio.CancelledError:
         pass
 
@@ -1063,12 +1603,14 @@ async def get_api_keys_status(
     created_at = vault.created_at.isoformat() if (vault and getattr(vault, "created_at", None) and vault.created_at) else None
     last_tested_at = vault.last_tested_at.isoformat() if (vault and getattr(vault, "last_tested_at", None) and vault.last_tested_at) else None
     last_test_balance = getattr(vault, "last_test_balance", None) if vault else None
+    api_key_modification_locked = _is_api_key_lock_window()
     return {
         "has_keys": has_keys,
         "key_preview": "••••••••" if has_keys else None,
         "created_at": created_at,
         "last_tested_at": last_tested_at,
         "last_test_balance": last_test_balance,
+        "api_key_modification_locked": api_key_modification_locked,
     }
 
 
@@ -1176,7 +1718,14 @@ async def delete_api_keys(
     """
     Remove stored API keys for the current user (red bin button).
     User can only have one key; deleting clears it so they can add a new one.
+    Blocked 09:55–10:35 UTC (daily fee calculation window).
     """
+    if _is_api_key_lock_window():
+        logger.info("API key lock: DELETE /api/keys blocked for user_id=%s", current_user.id)
+        raise HTTPException(
+            status_code=403,
+            detail="API key modification disabled during daily fee processing (09:55–10:35 UTC).",
+        )
     vault = (
         db.query(models.APIVault)
         .filter(models.APIVault.user_id == current_user.id)
@@ -1185,6 +1734,44 @@ async def delete_api_keys(
     if vault:
         db.delete(vault)
         db.commit()
+        current_month = datetime.utcnow().strftime("%Y-%m")
+        count = 0
+        user_row = db.query(models.User).filter(models.User.id == current_user.id).first()
+        if user_row and hasattr(user_row, "key_deletions"):
+            raw = getattr(user_row, "key_deletions", None) or "{}"
+            try:
+                kd = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except json.JSONDecodeError as e:
+                logger.error(
+                    "trace_id=%s | User %s – key_deletions malformed JSON, reset to empty: %s",
+                    get_trace_id(), current_user.id, e,
+                )
+                kd = {}
+            if not isinstance(kd, dict):
+                kd = {}
+            kd[current_month] = kd.get(current_month, 0) + 1
+            count = kd[current_month]
+            user_row.key_deletions = json.dumps(kd)
+            db.commit()
+            logger.info(
+                "trace_id=%s | User %s – key_deletions for %s = %s (persisted to DB)",
+                get_trace_id(), current_user.id, current_month, count,
+            )
+        else:
+            with _key_deletions_lock:
+                k = (current_user.id, current_month)
+                _key_deletions[k] = _key_deletions.get(k, 0) + 1
+                count = _key_deletions[k]
+        if count >= 2:
+            email = getattr(current_user, "email", "") or ""
+            alert_msg = (
+                f"URGENT: Repeated API Key Deletion (Potential Free Rider) – User: {email}, Deletions: {count}"
+            )
+            logger.warning(
+                "trace_id=%s | User deleted key %dx this month – flagged for review: user_id=%s email=%s",
+                get_trace_id(), count, current_user.id, email,
+            )
+            await _alert_admins_deduction_failure(alert_msg)
     return {"success": True, "message": "API keys removed."}
 
 
@@ -1196,10 +1783,15 @@ async def api_keys(
 ):
     """
     Validate Bitfinex API key and secret, encrypt and save to DB, return balance on success.
-    get_current_user ensures the user exists in the database before proceeding.
-    Returns 200 OK with saved key metadata and balance when successful.
-    Only one key per user; saving overwrites any existing key.
+    Blocked 09:55–10:35 UTC when overwriting existing keys (daily fee calculation window).
     """
+    vault_existing = db.query(models.APIVault).filter(models.APIVault.user_id == current_user.id).first()
+    if vault_existing and vault_existing.encrypted_key and _is_api_key_lock_window():
+        logger.info("API key lock: POST /api/keys (overwrite) blocked for user_id=%s", current_user.id)
+        raise HTTPException(
+            status_code=403,
+            detail="API key modification disabled during daily fee processing (09:55–10:35 UTC).",
+        )
     balance, result = await _validate_and_save_bitfinex_keys(
         payload, current_user, db
     )
@@ -1405,6 +1997,13 @@ async def _validate_and_save_bitfinex_keys(payload, current_user, db):
     vault.keys_updated_at = datetime.utcnow()
 
     db.commit()
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == current_user.id).first()
+    if snap:
+        if hasattr(snap, "invalid_key_days"):
+            snap.invalid_key_days = 0
+        if hasattr(snap, "reconciliation_completed"):
+            snap.reconciliation_completed = False  # 23:00 sweep will run reconciliation if key restored post-11:15
+        db.commit()
     return balance, {"message": "Exchange connected and trial activated."}
 
 
@@ -1504,6 +2103,13 @@ async def connect_exchange_update_by_email(
         vault.encrypted_gemini_key = security.encrypt_key(payload.gemini_key) if payload.gemini_key else None
     vault.keys_updated_at = datetime.utcnow()
     db.commit()
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user.id).first()
+    if snap:
+        if hasattr(snap, "invalid_key_days"):
+            snap.invalid_key_days = 0
+        if hasattr(snap, "reconciliation_completed"):
+            snap.reconciliation_completed = False
+        db.commit()
     await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
         "status": "success",
@@ -1729,7 +2335,7 @@ async def stop_bot_for_user(user_id: int, db: Session = Depends(database.get_db)
 
 @app.post("/dev/run-daily-deduction")
 def dev_run_daily_deduction(db: Session = Depends(database.get_db)):
-    """Dev-only: run daily token deduction once (same logic as 10:15 UTC scheduler). Set ALLOW_DEV_CONNECT=1."""
+    """Dev-only: run daily token deduction once (same logic as 10:30 UTC scheduler; uses stored snapshot only). Set ALLOW_DEV_CONNECT=1."""
     if os.getenv("ALLOW_DEV_CONNECT") != "1":
         raise HTTPException(status_code=404, detail="Not available.")
     log_entries, err = run_daily_token_deduction(db)
@@ -2041,6 +2647,132 @@ async def _fetch_ledgers_script_style(
     if not isinstance(data, list):
         return [], None
     return data, None
+
+
+def _is_ledger_data_complete(latest_entry_mts: Optional[int]) -> bool:
+    """True if ledger is complete: latest entry is at least LEDGER_FRESHNESS_MINUTES old (Bitfinex finalized)."""
+    if latest_entry_mts is None:
+        return True
+    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    return (now_ms - latest_entry_mts) >= (LEDGER_FRESHNESS_MINUTES * 60 * 1000)
+
+
+async def _fetch_all_margin_funding_entries(
+    mgr: BitfinexManager,
+) -> tuple[list, Optional[int], Optional[str]]:
+    """
+    Fetch full Margin Funding Payment ledger for USD, USDT, USDt. Returns (merged_entries, latest_mts, err).
+    Used by 10:00 UTC daily job only. latest_mts = max(entry[3]) for validation (incomplete if < 20 mins old).
+    """
+    all_entries: list = []
+    latest_mts: Optional[int] = None
+    last_err: Optional[str] = None
+    for i, currency in enumerate(("USD", "USDT", "USDt")):
+        if i > 0:
+            await asyncio.sleep(0.2)
+        entries, err = await _fetch_ledgers_script_style(mgr, currency, limit=100)
+        if err:
+            last_err = err
+            continue
+        for e in entries:
+            if isinstance(e, (list, tuple)) and len(e) > 3 and e[3] is not None:
+                try:
+                    ts = int(e[3])
+                    if latest_mts is None or ts > latest_mts:
+                        latest_mts = ts
+                except (TypeError, ValueError):
+                    pass
+        all_entries.extend(entries)
+    return all_entries, latest_mts, last_err
+
+
+async def _daily_10_00_fetch_and_save(
+    user_id: int,
+    db: Session,
+) -> tuple[bool, bool, Optional[str]]:
+    """
+    Single 10:00-style API call: fetch Margin Funding ledger, validate completeness, then save.
+    Returns (success, data_incomplete, error_message).
+    If data_incomplete (latest entry < 20 mins old): do not save; return (False, True, None). Caller may retry at 10:10.
+    If complete: compute gross_profit_usd and daily_gross_profit_usd, save to user_profit_snapshot, return (True, False, None).
+    If API error: return (False, False, err).
+    """
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user or not user.vault:
+        return False, False, "No user or vault"
+    keys = user.vault.get_keys()
+    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+    start_ms = None
+    if getattr(user.vault, "created_at", None) and user.vault.created_at:
+        start_ms = int(user.vault.created_at.timestamp() * 1000)
+    if start_ms is None:
+        return False, False, "No vault created_at"
+    end_ms = int(datetime.utcnow().timestamp() * 1000)
+    entries, latest_mts, fetch_err = await _fetch_all_margin_funding_entries(mgr)
+    if fetch_err and not entries:
+        return False, False, fetch_err
+    if not _is_ledger_data_complete(latest_mts):
+        return False, True, None
+    gross, fees = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms)
+    today = datetime.utcnow().date()
+    start_today_ms = int(datetime(today.year, today.month, today.day).timestamp() * 1000)
+    end_today_ms = start_today_ms + 86400 * 1000 - 1
+    daily_gross, _ = _gross_and_fees_from_ledger_entries(entries, start_ms=start_today_ms, end_ms=end_today_ms)
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    net = gross - fees
+    if snap:
+        snap.gross_profit_usd = round(gross, 2)
+        snap.net_profit_usd = round(net, 2)
+        snap.bitfinex_fee_usd = round(fees, 2)
+        snap.updated_at = datetime.utcnow()
+        if hasattr(snap, "daily_gross_profit_usd"):
+            snap.daily_gross_profit_usd = round(daily_gross, 2)
+        if hasattr(snap, "last_daily_cumulative_gross"):
+            snap.last_daily_cumulative_gross = gross
+        if hasattr(snap, "last_daily_snapshot_date"):
+            snap.last_daily_snapshot_date = today
+        if hasattr(snap, "account_switch_note"):
+            snap.account_switch_note = None
+        vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
+        if vault and hasattr(snap, "last_vault_updated_at"):
+            vault_updated = getattr(vault, "keys_updated_at", None)
+            last_seen = getattr(snap, "last_vault_updated_at", None)
+
+            def _ts(d):
+                if d is None:
+                    return 0
+                return d.timestamp() if hasattr(d, "timestamp") and callable(getattr(d, "timestamp")) else 0
+
+            if vault_updated and (last_seen is None or _ts(vault_updated) > _ts(last_seen)):
+                if hasattr(snap, "account_switch_note"):
+                    snap.account_switch_note = "Bitfinex account switched – new ledger data pulled"
+                user_for_alert = db.query(models.User).filter(models.User.id == user_id).first()
+                alert_email = getattr(user_for_alert, "email", None) if user_for_alert else None
+                logger.warning(
+                    "Bitfinex account switched: user_id=%s email=%s – daily deductions now use new account",
+                    user_id, alert_email,
+                )
+                await _alert_admins_deduction_failure(
+                    f"User {alert_email or user_id} (ID: {user_id}) switched Bitfinex accounts – daily deductions now use new ledger."
+                )
+            snap.last_vault_updated_at = vault_updated
+    else:
+        new_snap = models.UserProfitSnapshot(
+            user_id=user_id,
+            gross_profit_usd=round(gross, 2),
+            net_profit_usd=round(net, 2),
+            bitfinex_fee_usd=round(fees, 2),
+        )
+        db.add(new_snap)
+        db.flush()
+        if hasattr(new_snap, "daily_gross_profit_usd"):
+            new_snap.daily_gross_profit_usd = round(daily_gross, 2)
+        if hasattr(new_snap, "last_daily_cumulative_gross"):
+            new_snap.last_daily_cumulative_gross = gross
+        if hasattr(new_snap, "last_daily_snapshot_date"):
+            new_snap.last_daily_snapshot_date = today
+    db.commit()
+    return True, False, None
 
 
 async def _gross_profit_from_ledgers(

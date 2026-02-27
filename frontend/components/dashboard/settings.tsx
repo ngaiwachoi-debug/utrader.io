@@ -546,6 +546,7 @@ function ApiKeysTab({
   const [testResult, setTestResult] = useState<{ success: boolean; fundingWallet?: number } | null>(null)
   const [testingKeys, setTestingKeys] = useState(false)
   const [removingKey, setRemovingKey] = useState(false)
+  const [apiKeyModificationLocked, setApiKeyModificationLocked] = useState(false)
 
   const clearMessage = () => setMessage(null)
   const isPermissionsError = (text: string) => /missing permission|invalid api key|enable them|bitfinex api settings/i.test(text)
@@ -570,6 +571,7 @@ function ApiKeysTab({
         setCreatedAt(data.created_at ?? null)
         setLastTestedAt(data.last_tested_at ?? null)
         setLastTestBalance(data.last_test_balance != null ? Number(data.last_test_balance) : null)
+        setApiKeyModificationLocked(!!data.api_key_modification_locked)
       } else {
         setHasKeys(false)
       }
@@ -830,9 +832,14 @@ function ApiKeysTab({
               <button
                 type="button"
                 onClick={handleRemoveKey}
-                disabled={removingKey}
-                className="flex h-8 w-8 items-center justify-center rounded-lg border border-destructive/50 bg-destructive/10 text-destructive hover:bg-destructive/20 disabled:opacity-60"
+                disabled={removingKey || apiKeyModificationLocked}
+                className={`flex h-8 w-8 items-center justify-center rounded-lg border text-destructive disabled:opacity-60 ${
+                  apiKeyModificationLocked
+                    ? "cursor-not-allowed border-muted bg-muted/50 text-muted-foreground"
+                    : "border-destructive/50 bg-destructive/10 hover:bg-destructive/20"
+                }`}
                 aria-label={t("settings.removeKey")}
+                title={apiKeyModificationLocked ? "API key changes disabled during daily fee calculation (10:00–10:30 UTC)" : t("settings.removeKey")}
               >
                 <Trash2 className="h-4 w-4" />
               </button>
