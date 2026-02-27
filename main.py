@@ -937,10 +937,13 @@ NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
 
 
 # --- CORS: explicitly allow frontend origins so browser can reach backend ---
+# Include 3003 so when frontend runs on 3003 (e.g. port 3000 occupied), API calls are allowed
 _cors_origins = [
     "http://127.0.0.1:3000",
     "http://localhost:3000",
     "http://0.0.0.0:3000",
+    "http://127.0.0.1:3003",
+    "http://localhost:3003",
 ]
 if os.getenv("CORS_ORIGINS"):
     _cors_origins.extend(o.strip() for o in os.getenv("CORS_ORIGINS").split(",") if o.strip())
