@@ -1,8 +1,9 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { useSearchParams } from "next/navigation"
-import { DollarSign, Activity, TrendingUp, Settings, BarChart3, CreditCard, Terminal } from "lucide-react"
+import { useSearchParams, useRouter } from "next/navigation"
+import { useSession } from "next-auth/react"
+import { DollarSign, Activity, TrendingUp, Settings, BarChart3, CreditCard, Terminal, UserPlus } from "lucide-react"
 import { Sidebar } from "@/components/dashboard/sidebar"
 import { Header } from "@/components/dashboard/header"
 import { ProfitCenter } from "@/components/dashboard/profit-center"
@@ -10,20 +11,33 @@ import { LiveStatus } from "@/components/dashboard/live-status"
 import { MarketStatus } from "@/components/dashboard/market-status"
 import { TrueROI } from "@/components/dashboard/true-roi"
 import { Subscription } from "@/components/dashboard/subscription"
+import { ReferralUsdt } from "@/components/dashboard/referral-usdt"
 import { TerminalView } from "@/components/dashboard/terminal-view"
 import { SettingsPage } from "@/components/dashboard/settings"
 import { useT } from "@/lib/i18n"
 import { DateRangeProvider } from "@/lib/date-range-context"
 import { CurrentUserProvider } from "@/lib/current-user-context"
 
+const ADMIN_EMAIL = (typeof process !== "undefined" && process.env.NEXT_PUBLIC_ADMIN_EMAIL) || "ngaiwanchoi@gmail.com"
+
 export default function DashboardPage() {
   const searchParams = useSearchParams()
+  const router = useRouter()
+  const { data: session, status: sessionStatus } = useSession()
   const [activePage, setActivePage] = useState("profit-center")
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mounted, setMounted] = useState(false)
   const t = useT()
 
   useEffect(() => setMounted(true), [])
+
+  useEffect(() => {
+    if (!mounted || sessionStatus !== "authenticated" || !session?.user?.email) return
+    const email = (session.user.email || "").trim().toLowerCase()
+    if (email === ADMIN_EMAIL.trim().toLowerCase()) {
+      router.replace("/admin")
+    }
+  }, [mounted, sessionStatus, session?.user?.email, router])
 
   useEffect(() => {
     if (searchParams?.get("page") === "subscription") setActivePage("subscription")
@@ -57,6 +71,7 @@ export default function DashboardPage() {
           {activePage === "market-status" && <MarketStatus />}
           {activePage === "true-roi" && <TrueROI />}
           {activePage === "subscription" && <Subscription />}
+          {activePage === "referral-usdt" && <ReferralUsdt />}
           {activePage === "terminal" && <TerminalView />}
           {activePage === "settings" && <SettingsPage />}
         </main>
@@ -84,6 +99,7 @@ function MobileNav({
     { id: "market-status", labelKey: "sidebar.marketStatus", Icon: BarChart3 },
     { id: "true-roi", labelKey: "nav.roi", Icon: TrendingUp },
     { id: "subscription", labelKey: "sidebar.subscription", Icon: CreditCard },
+    { id: "referral-usdt", labelKey: "sidebar.referralUsdt", Icon: UserPlus },
     { id: "terminal", labelKey: "sidebar.terminal", Icon: Terminal },
     { id: "settings", labelKey: "nav.settings", Icon: Settings },
   ]

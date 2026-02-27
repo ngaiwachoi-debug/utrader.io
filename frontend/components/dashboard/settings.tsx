@@ -1,13 +1,12 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, useRef, useMemo } from "react"
 import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
 import { toast } from "sonner"
 import { useSession } from "next-auth/react"
 import { useT } from "@/lib/i18n"
 import {
-  DollarSign,
   Clock,
   Calendar,
   Link2,
@@ -15,7 +14,6 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
-  Bell,
   Mail,
   MessageSquare,
   AlertTriangle,
@@ -30,43 +28,124 @@ import {
 } from "lucide-react"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
+import {
+  calculateTotalBudget,
+  calculateUsedTokens,
+  calculateUsagePercentage,
+  formatRenewalDate,
+} from "@/lib/calculateTokenUsage"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+const TOKEN_BALANCE_POLL_MS = 30_000
+const TOKEN_BALANCE_CACHE_MS = 10_000
 
-type SettingsTab = "lending" | "notifications" | "api-keys" | "community"
+type TokenBalanceState = {
+  tokens_remaining: number
+  purchased_tokens: number
+  last_gross_usd_used: number
+  updated_at: string | null
+}
+
+type SettingsTab = "general" | "notifications" | "api-keys" | "community"
 
 export function SettingsPage() {
   const t = useT()
   const userId = useCurrentUserId()
   const { data: session, status } = useSession()
   const signedIn = status === "authenticated" && !!session?.user
-  const [activeTab, setActiveTab] = useState<SettingsTab>("lending")
+  const [activeTab, setActiveTab] = useState<SettingsTab>("general")
   const [showSecret, setShowSecret] = useState(false)
-  const [enableLending, setEnableLending] = useState(true)
-  const [customLimit, setCustomLimit] = useState(false)
   const [darkMode, setDarkMode] = useState(true)
   const [dailyEmail, setDailyEmail] = useState(false)
 
+  // USDT withdrawal address (from referral-info)
+  const [usdtWithdrawAddress, setUsdtWithdrawAddress] = useState<string>("")
+  const [usdtAddressSaving, setUsdtAddressSaving] = useState(false)
+
+  // Account & Membership: plan and renewal (from user-status)
   const [planTier, setPlanTier] = useState<string>("Trial User")
-  const [planName, setPlanName] = useState<string>("Expert Plan")
-  const [lendingLimit, setLendingLimit] = useState<number>(250000)
-  const [rebalanceMinutes, setRebalanceMinutes] = useState<number>(3)
-  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
-  const [tokensUsed, setTokensUsed] = useState<number | null>(null)
-  const [initialTokenCredit, setInitialTokenCredit] = useState<number | null>(null)
-  const [usedAmount, setUsedAmount] = useState<number>(0)
+  const [planName, setPlanName] = useState<string>("Trial Plan")
+  const [proExpiry, setProExpiry] = useState<string | null>(null)
+
+  // Token Usage: from /api/v1/users/me/token-balance
+  const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
+  const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
+  const [tokenBalanceError, setTokenBalanceError] = useState<string | null>(null)
+  const tokenBalanceLastFetch = useRef<number>(0)
+
+  const fetchTokenBalance = async () => {
+    const token = await getBackendToken()
+    if (!token) {
+      setTokenBalanceLoading(false)
+      return
+    }
+    const now = Date.now()
+    if (tokenBalance != null && now - tokenBalanceLastFetch.current < TOKEN_BALANCE_CACHE_MS) {
+      return
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, {
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.status === 401) {
+        setTokenBalanceError(null)
+        return
+      }
+      if (res.status === 429) {
+        setTokenBalanceError(t("settings.rateLimitToken"))
+        setTokenBalanceLoading(false)
+        return
+      }
+      if (res.status >= 500) {
+        setTokenBalanceError(t("settings.tokenDataContactSupport"))
+        setTokenBalanceLoading(false)
+        return
+      }
+      if (!res.ok) {
+        setTokenBalanceError(t("settings.tokenUsageFailed"))
+        setTokenBalanceLoading(false)
+        return
+      }
+      const data = await res.json()
+      if (process.env.NODE_ENV === "development") {
+        console.log("[TokenUsage] Fetched token data:", data)
+      }
+      tokenBalanceLastFetch.current = now
+      setTokenBalance({
+        tokens_remaining: Number(data.tokens_remaining) ?? 0,
+        purchased_tokens: Number(data.purchased_tokens) ?? 0,
+        last_gross_usd_used: Number(data.last_gross_usd_used) ?? 0,
+        updated_at: data.updated_at ?? null,
+      })
+      setTokenBalanceError(null)
+    } catch (e) {
+      if (process.env.NODE_ENV === "development") {
+        console.error("[TokenUsage] Failed to fetch:", e)
+      }
+      setTokenBalanceError(t("settings.tokenUsageFailed"))
+    } finally {
+      setTokenBalanceLoading(false)
+    }
+  }
 
   useEffect(() => {
     if (userId == null) {
       setPlanTier("Trial User")
-      setPlanName("Expert Plan")
-      setLendingLimit(250000)
-      setRebalanceMinutes(3)
-      setTokensRemaining(null)
-      setTokensUsed(null)
-      setInitialTokenCredit(null)
+      setPlanName("Trial Plan")
+      setProExpiry(null)
+      setTokenBalance(null)
+      setTokenBalanceLoading(false)
+      setTokenBalanceError(null)
       return
     }
+    fetchTokenBalance()
+    const interval = setInterval(fetchTokenBalance, TOKEN_BALANCE_POLL_MS)
+    return () => clearInterval(interval)
+  }, [userId])
+
+  useEffect(() => {
+    if (userId == null) return
     const fetchUserStatus = async () => {
       try {
         const token = await getBackendToken()
@@ -74,50 +153,90 @@ export function SettingsPage() {
         const res = await fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers })
         if (!res.ok) return
         const data = await res.json()
-
         setPlanTier((data.plan_tier ?? "trial").toUpperCase() + " User")
         const tier = (data.plan_tier ?? "trial").toLowerCase()
         if (tier === "pro") setPlanName("Pro Plan")
         else if (tier === "expert") setPlanName("Expert Plan")
         else if (tier === "guru") setPlanName("Guru Plan")
         else setPlanName("Trial Plan")
-
-        setLendingLimit(Number(data.lending_limit) ?? 0)
-        setRebalanceMinutes(Number(data.rebalance_interval) ?? 0)
-        const tr = data.tokens_remaining
-        setTokensRemaining(typeof tr === "number" ? tr : tr != null ? Number(tr) : null)
-        const tu = data.tokens_used
-        setTokensUsed(typeof tu === "number" ? tu : tu != null ? Number(tu) : null)
-        const itc = data.initial_token_credit
-        setInitialTokenCredit(typeof itc === "number" ? itc : itc != null ? Number(itc) : null)
-        setUsedAmount(Number(data.used_amount) ?? 0)
+        setProExpiry(data.pro_expiry ?? null)
       } catch (e) {
-        console.error("Failed to fetch user status", e)
+        if (process.env.NODE_ENV === "development") console.error("Failed to fetch user status", e)
       }
     }
     fetchUserStatus()
   }, [userId])
 
+  useEffect(() => {
+    if (userId == null) return
+    const fetchRef = async () => {
+      try {
+        const token = await getBackendToken()
+        if (!token) return
+        const res = await fetch(`${API_BASE}/api/v1/user/referral-info`, { headers: { Authorization: `Bearer ${token}` } })
+        if (res.ok) {
+          const data = await res.json()
+          setUsdtWithdrawAddress((data.usdt_withdraw_address ?? "").trim())
+        }
+      } catch {
+        // ignore
+      }
+    }
+    fetchRef()
+  }, [userId])
+
+  const saveUsdtAddress = async () => {
+    const token = await getBackendToken()
+    if (!token) return
+    setUsdtAddressSaving(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/user/usdt-withdraw-address`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ address: usdtWithdrawAddress.trim() }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        toast.error(typeof data.detail === "string" ? data.detail : "Failed to save address")
+        return
+      }
+      toast.success("USDT withdrawal address saved.")
+    } catch {
+      toast.error("Failed to save")
+    } finally {
+      setUsdtAddressSaving(false)
+    }
+  }
+
   const tabs: { id: SettingsTab; labelKey: string }[] = [
-    { id: "lending", labelKey: "settings.tabs.lending" },
+    { id: "general", labelKey: "settings.tabs.general" },
     { id: "notifications", labelKey: "settings.tabs.notifications" },
     { id: "api-keys", labelKey: "settings.tabs.apiKeys" },
     { id: "community", labelKey: "settings.tabs.community" },
   ]
+
+  // Calculated token usage (memoized)
+  const tokenUsage = useMemo(() => {
+    if (tokenBalance == null) return null
+    const totalBudget = calculateTotalBudget(tokenBalance.purchased_tokens)
+    const used = calculateUsedTokens(totalBudget, tokenBalance.tokens_remaining)
+    const pct = calculateUsagePercentage(used, totalBudget)
+    return { totalBudget, used, pct, remaining: tokenBalance.tokens_remaining }
+  }, [tokenBalance])
 
   return (
     <div className="flex flex-col gap-6">
       {/* Page Title */}
       <h1 className="text-2xl font-bold text-foreground">{t("settings.title")}</h1>
 
-      {/* Account & Membership Card */}
+      {/* Account & Membership Card – restructured: Current Plan, Rebalancing, Token Usage %, Tokens Remaining, Next Renewal */}
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-4">
           <h2 className="text-lg font-semibold text-foreground">{t("settings.accountMembership")}</h2>
           <p className="text-xs text-muted-foreground">{t("settings.accountMembershipDesc")}</p>
         </div>
 
-        {/* User Info – current session; empty when logged out */}
+        {/* User Info – current session */}
         {signedIn && (session?.user?.name || session?.user?.email) && (
           <div className="flex items-center gap-4 mb-6">
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-orange-500 text-lg font-bold text-foreground">
@@ -137,22 +256,20 @@ export function SettingsPage() {
           </div>
         )}
 
-        {/* Plan Details */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 mb-6">
+        {/* Plan Details: Current Plan, Rebalancing Frequency, Token Usage %, Tokens Remaining, Next Renewal Date */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5 mb-6">
           <div className="flex items-center gap-3">
-            <DollarSign className="h-4 w-4 text-muted-foreground" />
+            <BarChart3 className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-xs font-semibold text-foreground">{t("settings.lendingLimit")}</p>
-              <p className="text-xs text-muted-foreground">
-                ${lendingLimit.toLocaleString()}
-              </p>
+              <p className="text-xs font-semibold text-foreground">Current Plan</p>
+              <p className="text-xs text-muted-foreground">{planName}</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
             <Clock className="h-4 w-4 text-muted-foreground" />
             <div>
               <p className="text-xs font-semibold text-foreground">{t("settings.rebalancingFrequency")}</p>
-              <p className="text-xs text-muted-foreground">{t("settings.everyMinutes", { n: rebalanceMinutes })}</p>
+              <p className="text-xs text-muted-foreground">{t("settings.every30Minutes")}</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -160,16 +277,25 @@ export function SettingsPage() {
             <div>
               <p className="text-xs font-semibold text-foreground">{t("settings.tokenUsage")}</p>
               <p className="text-xs text-muted-foreground">
-                {tokensUsed != null ? `${tokensUsed} tokens used` : "—"}
+                {tokenUsage != null ? `${Math.round(tokenUsage.pct)}% Used` : "—"}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <BarChart3 className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs font-semibold text-foreground">{t("settings.tokensRemaining")}</p>
+              <p className="text-xs text-muted-foreground">
+                {tokenUsage != null ? `${Math.round(tokenUsage.remaining)} Tokens` : tokenBalanceLoading ? "…" : "—"}
               </p>
             </div>
           </div>
           <div className="flex items-center gap-3">
             <Calendar className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-xs font-semibold text-foreground">{t("settings.tokensRemaining")}</p>
+              <p className="text-xs font-semibold text-foreground">Next Renewal Date</p>
               <p className="text-xs text-muted-foreground">
-                {tokensRemaining != null ? `${Math.round(tokensRemaining)} tokens` : "—"}
+                {formatRenewalDate(proExpiry) === "No renewal date (Free Plan)" ? t("settings.noRenewalDate") : formatRenewalDate(proExpiry)}
               </p>
             </div>
           </div>
@@ -179,24 +305,44 @@ export function SettingsPage() {
           {t("settings.tokenUsageExplanation")}
         </p>
 
-        {/* Lending Usage */}
+        {/* Token Usage section (replaces Lending Usage) – progress bar from /api/v1/users/me/token-balance */}
         <div>
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-foreground">{t("settings.lendingUsage")}</span>
-            <span className="text-xs font-medium text-emerald">
-              {lendingLimit > 0 ? `${((usedAmount / lendingLimit) * 100).toFixed(1)}%` : "0%"}
-            </span>
-          </div>
-          <div className="h-2 w-full rounded-full bg-secondary">
-            <div
-              className="h-2 rounded-full bg-emerald transition-all duration-500"
-              style={{ width: lendingLimit > 0 ? `${Math.min(100, (usedAmount / lendingLimit) * 100)}%` : "0%" }}
-            />
-          </div>
-          <div className="flex items-center justify-between mt-1.5">
-            <span className="text-xs text-muted-foreground">${usedAmount.toLocaleString()}</span>
-            <span className="text-xs text-muted-foreground">${lendingLimit.toLocaleString()}</span>
-          </div>
+          <span className="text-xs font-medium text-foreground">{t("settings.tokenUsageSection")}</span>
+          {tokenBalanceError && (
+            <p className="mt-2 text-xs text-destructive">{tokenBalanceError}</p>
+          )}
+          {!tokenBalanceError && tokenBalanceLoading && tokenBalance == null && (
+            <div className="mt-2 h-2 w-full rounded bg-secondary animate-pulse" style={{ borderRadius: 4 }} />
+          )}
+          {!tokenBalanceError && !tokenBalanceLoading && tokenUsage != null && tokenUsage.totalBudget === 0 && (
+            <p className="mt-2 text-center text-xs text-muted-foreground">{t("settings.noTokensAvailable")}</p>
+          )}
+          {!tokenBalanceError && !tokenBalanceLoading && tokenUsage != null && tokenUsage.totalBudget > 0 && (
+            <>
+              <div className="mt-2 relative w-full h-2 rounded overflow-hidden bg-secondary" style={{ height: 8, borderRadius: 4 }}>
+                <div
+                  className="absolute inset-y-0 left-0 rounded transition-all duration-500"
+                  style={{
+                    width: `${Math.min(100, Math.max(0, tokenUsage.pct))}%`,
+                    borderRadius: 4,
+                    background:
+                      tokenUsage.pct <= 50 ? "#10b981" : tokenUsage.pct <= 80 ? "#f59e0b" : "#ef4444",
+                  }}
+                />
+                <span className="absolute inset-0 flex items-center justify-center text-xs font-medium text-white" style={{ textShadow: "0 0 1px rgba(0,0,0,0.5)" }}>
+                  {Math.round(tokenUsage.pct)}% Used
+                </span>
+              </div>
+              <div className="flex items-center justify-between mt-1.5">
+                <span className="text-xs text-muted-foreground">
+                  {t("settings.tokensUsedRemaining", { used: Math.round(tokenUsage.used), remaining: Math.round(tokenUsage.remaining) })}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {t("settings.totalBudget", { total: Math.round(tokenUsage.totalBudget) })}
+                </span>
+              </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -219,7 +365,16 @@ export function SettingsPage() {
 
       {/* Tab Content */}
       <div className="rounded-xl border border-border bg-card p-5">
-        {activeTab === "lending" && <LendingTab enableLending={enableLending} setEnableLending={setEnableLending} customLimit={customLimit} setCustomLimit={setCustomLimit} darkMode={darkMode} setDarkMode={setDarkMode} />}
+        {activeTab === "general" && (
+          <GeneralTab
+            darkMode={darkMode}
+            setDarkMode={setDarkMode}
+            usdtWithdrawAddress={usdtWithdrawAddress}
+            setUsdtWithdrawAddress={setUsdtWithdrawAddress}
+            onSaveUsdtAddress={saveUsdtAddress}
+            usdtAddressSaving={usdtAddressSaving}
+          />
+        )}
         {activeTab === "notifications" && <NotificationsTab dailyEmail={dailyEmail} setDailyEmail={setDailyEmail} />}
         {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} userId={userId} />}
         {activeTab === "community" && <CommunityTab />}
@@ -228,80 +383,74 @@ export function SettingsPage() {
   )
 }
 
-/* ===================== LENDING TAB ===================== */
-function LendingTab({
-  enableLending,
-  setEnableLending,
-  customLimit,
-  setCustomLimit,
+/* ===================== GENERAL TAB (lending controls removed) ===================== */
+function GeneralTab({
   darkMode,
   setDarkMode,
+  usdtWithdrawAddress,
+  setUsdtWithdrawAddress,
+  onSaveUsdtAddress,
+  usdtAddressSaving,
 }: {
-  enableLending: boolean
-  setEnableLending: (v: boolean) => void
-  customLimit: boolean
-  setCustomLimit: (v: boolean) => void
   darkMode: boolean
   setDarkMode: (v: boolean) => void
+  usdtWithdrawAddress: string
+  setUsdtWithdrawAddress: (v: string) => void
+  onSaveUsdtAddress: () => Promise<void>
+  usdtAddressSaving: boolean
 }) {
   return (
     <div className="flex flex-col gap-6">
       <div>
-        <h3 className="text-lg font-semibold text-foreground">Lending Configuration</h3>
-        <p className="text-xs text-muted-foreground">Configure your lending settings and risk parameters</p>
+        <h3 className="text-lg font-semibold text-foreground">General Settings</h3>
+        <p className="text-xs text-muted-foreground">Preferences for the dashboard</p>
       </div>
 
-      {/* Lending Controls */}
-      <div>
-        <h4 className="text-sm font-semibold text-foreground mb-4">Lending Controls</h4>
-        <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-foreground">Enable Lending</p>
-              <p className="text-xs text-muted-foreground">Turn on automatic lending for your available funds</p>
-            </div>
-            <ToggleSwitch checked={enableLending} onChange={setEnableLending} />
-          </div>
-          <div className="ml-4 flex items-center justify-between border-l-2 border-border pl-4">
-            <div>
-              <p className="text-sm font-medium text-foreground">Custom Lending Limit</p>
-              <p className="text-xs text-muted-foreground">Set a maximum amount for lending operations</p>
-            </div>
-            <ToggleSwitch checked={customLimit} onChange={setCustomLimit} />
+      <div className="flex flex-col gap-4">
+        <div>
+          <label className="text-sm font-medium text-foreground">USDT Withdrawal Address</label>
+          <p className="text-xs text-muted-foreground mb-1">TRC20 (T...) or ERC20 (0x...). Used for USDT Credit withdrawal requests.</p>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={usdtWithdrawAddress}
+              onChange={(e) => setUsdtWithdrawAddress(e.target.value)}
+              placeholder="T... or 0x..."
+              className="mt-1 flex-1 rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground font-mono outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+            />
+            <button
+              type="button"
+              onClick={onSaveUsdtAddress}
+              disabled={usdtAddressSaving}
+              className="mt-1 rounded-lg bg-emerald px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-emerald/90 disabled:opacity-50"
+            >
+              {usdtAddressSaving ? "Saving…" : "Save"}
+            </button>
           </div>
         </div>
-      </div>
-
-      <div className="h-px bg-border" />
-
-      {/* General Settings */}
-      <div>
-        <h4 className="text-sm font-semibold text-foreground mb-4">General Settings</h4>
-        <div className="flex flex-col gap-4">
+        <div>
+          <label className="text-sm font-medium text-foreground">Base Currency</label>
+          <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
+            <option>USD</option>
+            <option>USDt</option>
+          </select>
+        </div>
+        <div>
+          <label className="text-sm font-medium text-foreground">Time Zone</label>
+          <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
+            <option>UTC</option>
+            <option>EST</option>
+            <option>PST</option>
+            <option>CET</option>
+            <option>JST</option>
+          </select>
+        </div>
+        <div className="flex items-center justify-between">
           <div>
-            <label className="text-sm font-medium text-foreground">Base Currency</label>
-            <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
-              <option>USD</option>
-              <option>USDt</option>
-            </select>
+            <p className="text-sm font-medium text-foreground">Dark Mode</p>
+            <p className="text-xs text-muted-foreground">Enable dark mode for the dashboard</p>
           </div>
-          <div>
-            <label className="text-sm font-medium text-foreground">Time Zone</label>
-            <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
-              <option>UTC</option>
-              <option>EST</option>
-              <option>PST</option>
-              <option>CET</option>
-              <option>JST</option>
-            </select>
-          </div>
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-foreground">Dark Mode</p>
-              <p className="text-xs text-muted-foreground">Enable dark mode for the dashboard</p>
-            </div>
-            <ToggleSwitch checked={darkMode} onChange={setDarkMode} />
-          </div>
+          <ToggleSwitch checked={darkMode} onChange={setDarkMode} />
         </div>
       </div>
     </div>

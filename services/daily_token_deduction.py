@@ -4,6 +4,10 @@ Daily token deduction (post-Bitfinex API call at 10:15 UTC).
 Uses daily_gross_profit_usd from user_profit_snapshot (stored at 09:40 UTC).
 Formula: new_tokens_remaining = tokens_remaining - daily_gross_profit (1:1 USD);
 if new_tokens_remaining < 0 set to 0; if daily_gross_profit <= 0 do not deduct.
+
+Used tokens (display): used_tokens = int(gross_profit_usd × TOKENS_PER_USDT_GROSS) with TOKENS_PER_USDT_GROSS = 10.
+Referral: only purchased tokens (not free 150) trigger L1/L2/L3 USDT Credit rewards.
+We consume free tokens first; purchased_burned = max(0, daily_gross - free_remaining).
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +15,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 import models
+from services.referral_rewards import apply_referral_rewards
+
+TOKENS_PER_USDT_GROSS = 10  # used_tokens = gross_profit_usd × TOKENS_PER_USDT_GROSS (documented for consistency)
 
 
 def apply_deduction_rule(tokens_remaining: float, daily_gross_profit: float) -> Tuple[float, bool]:
@@ -29,23 +36,26 @@ def run_daily_token_deduction(db: Session) -> Tuple[List[Dict[str, Any]], Option
     """
     For each user with token balance and profit snapshot, deduct daily gross profit
     from tokens_remaining (1:1 USD), update last_gross_usd_used and updated_at.
+    Persists each deduction to deduction_log (with email and account_switch_note).
 
     Returns (list of deduction log entries, error_message if failed).
     """
     log_entries: List[Dict[str, Any]] = []
     try:
-        # Users who have both user_token_balance and user_profit_snapshot
+        # Users who have both user_token_balance and user_profit_snapshot; join User for email
         rows = (
-            db.query(models.UserTokenBalance, models.UserProfitSnapshot)
+            db.query(models.UserTokenBalance, models.UserProfitSnapshot, models.User)
             .join(
                 models.UserProfitSnapshot,
                 models.UserTokenBalance.user_id == models.UserProfitSnapshot.user_id,
             )
+            .join(models.User, models.User.id == models.UserTokenBalance.user_id)
             .all()
         )
         now_utc = datetime.utcnow()
-        for token_row, snap in rows:
+        for token_row, snap, user in rows:
             user_id = token_row.user_id
+            email = getattr(user, "email", None) or ""
             daily_gross = getattr(snap, "daily_gross_profit_usd", None)
             if daily_gross is None:
                 daily_gross = 0.0
@@ -58,18 +68,46 @@ def run_daily_token_deduction(db: Session) -> Tuple[List[Dict[str, Any]], Option
 
             tokens_deducted = daily_gross  # 1:1 USD per requirement
 
+            purchased = float(token_row.purchased_tokens or 0)
+            free_remaining = max(0.0, tokens_before - purchased)
+            purchased_burned = max(0.0, daily_gross - free_remaining)
+            if purchased_burned > 0:
+                apply_referral_rewards(db, user_id, purchased_burned)
+
             token_row.tokens_remaining = new_tokens
             token_row.last_gross_usd_used = daily_gross
             token_row.updated_at = now_utc
 
+            gross_profit_usd = float(getattr(snap, "gross_profit_usd", None) or 0)
+            total_used_tokens = int(gross_profit_usd * TOKENS_PER_USDT_GROSS) if gross_profit_usd else 0
+            account_switch_note = getattr(snap, "account_switch_note", None)
+
             log_entries.append({
                 "user_id": user_id,
+                "email": email,
                 "gross_profit": daily_gross,
                 "tokens_deducted": tokens_deducted,
                 "tokens_remaining_before": tokens_before,
                 "tokens_remaining_after": new_tokens,
                 "timestamp": now_utc.isoformat() + "Z",
+                "total_used_tokens": total_used_tokens,
+                "account_switch_note": account_switch_note,
             })
+
+            if hasattr(models, "DeductionLog"):
+                db.add(models.DeductionLog(
+                    user_id=user_id,
+                    email=email or None,
+                    timestamp_utc=now_utc,
+                    daily_gross_profit_usd=daily_gross,
+                    tokens_deducted=tokens_deducted,
+                    total_used_tokens=float(total_used_tokens),
+                    tokens_remaining_after=new_tokens,
+                    account_switch_note=account_switch_note,
+                ))
+            if getattr(snap, "account_switch_note", None) is not None:
+                snap.account_switch_note = None
+
         db.commit()
         return log_entries, None
     except Exception as e:

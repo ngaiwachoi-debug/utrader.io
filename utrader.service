@@ -1,0 +1,24 @@
+# systemd unit: uTrader backend (uvicorn). 09:40 snapshot + 10:15 deduction run in-process.
+# Install: sudo cp utrader.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Enable on boot: sudo systemctl enable utrader
+# Start: sudo systemctl start utrader
+# Status: sudo systemctl status utrader
+# Logs: journalctl -u utrader -f
+# Replace YOUR_DEPLOY_USER, YOUR_DEPLOY_GROUP, /path/to/buildnew with real values.
+
+[Unit]
+Description=uTrader API (FastAPI + 09:40/10:15 schedulers)
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_DEPLOY_USER
+Group=YOUR_DEPLOY_GROUP
+WorkingDirectory=/path/to/buildnew
+EnvironmentFile=/path/to/buildnew/.env
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

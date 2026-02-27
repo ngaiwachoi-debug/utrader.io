@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Column, Date, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import BigInteger, Column, Date, Integer, String, Float, DateTime, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -11,6 +11,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=True)
 
     # SaaS subscription configuration
     plan_tier = Column(String, default="trial")  # trial / pro / expert / guru
@@ -21,6 +22,7 @@ class User(Base):
     # Referrals
     referral_code = Column(String, unique=True, index=True, nullable=True)
     referred_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    usdt_withdraw_address = Column(String(255), nullable=True)
 
     # Lifecycle status – used by the kill switch
     status = Column(String, default="active")  # active / expired
@@ -54,6 +56,7 @@ class APIVault(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=True)
     last_tested_at = Column(DateTime, nullable=True)
     last_test_balance = Column(Float, nullable=True)
+    keys_updated_at = Column(DateTime, nullable=True)  # set when API keys are saved; used to detect Bitfinex account change
 
     user = relationship("User", back_populates="vault")
 
@@ -120,6 +123,8 @@ class UserProfitSnapshot(Base):
     daily_gross_profit_usd = Column(Float, default=0.0)  # gross profit for that UTC day
     last_daily_cumulative_gross = Column(Float, nullable=True)  # cumulative gross at last daily snapshot
     last_daily_snapshot_date = Column(Date, nullable=True)  # UTC date of that snapshot
+    last_vault_updated_at = Column(DateTime, nullable=True)  # vault.keys_updated_at at last 09:40 run; detect account switch
+    account_switch_note = Column(Text, nullable=True)  # set at 09:40 when Bitfinex account changed; read at 10:15 for DeductionLog then cleared
 
 
 class UserTokenBalance(Base):
@@ -136,3 +141,104 @@ class UserTokenBalance(Base):
     last_gross_usd_used = Column(Float, default=0.0)  # gross_profit_usd at last token calc
     purchased_tokens = Column(Float, default=0.0)  # tokens bought via Add tokens (1 USD = 100)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserUsdtCredit(Base):
+    """Withdrawable USDT balance per user (Token2)."""
+    __tablename__ = "user_usdt_credit"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    usdt_credit = Column(Float, default=0.0)  # current withdrawable balance
+    total_earned = Column(Float, default=0.0)
+    total_withdrawn = Column(Float, default=0.0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UsdtHistory(Base):
+    """History of USDT credit changes (admin adjust, withdrawal, referral earnings, etc.)."""
+    __tablename__ = "usdt_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    amount = Column(Float, nullable=False)  # positive = credit, negative = debit
+    reason = Column(String(64), nullable=True)  # admin_adjust, withdrawal, referral_earnings, etc.
+    created_at = Column(DateTime, default=datetime.utcnow)
+    admin_email = Column(String(255), nullable=True)
+
+
+class WithdrawalRequest(Base):
+    """User withdrawal request; admin approve/reject."""
+    __tablename__ = "withdrawal_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    amount = Column(Float, nullable=False)
+    address = Column(String(255), nullable=False)
+    status = Column(String(32), default="pending")  # pending | approved | rejected
+    created_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
+    processed_by = Column(String(255), nullable=True)
+    rejection_note = Column(String(500), nullable=True)
+
+
+class ReferralReward(Base):
+    """Immutable log of referral rewards (L1/L2/L3 USDT Credit per purchased token burn)."""
+    __tablename__ = "referral_rewards"
+
+    id = Column(Integer, primary_key=True, index=True)
+    burning_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    level_1_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    level_2_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    level_3_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reward_l1 = Column(Float, default=0.0)
+    reward_l2 = Column(Float, default=0.0)
+    reward_l3 = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DeductionLog(Base):
+    """Persisted token deduction log (10:15 UTC). used_tokens = gross_profit_usd × TOKENS_PER_USDT_GROSS (10)."""
+    __tablename__ = "deduction_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    email = Column(String(255), nullable=True)
+    timestamp_utc = Column(DateTime, nullable=False)
+    daily_gross_profit_usd = Column(Float, default=0.0)
+    tokens_deducted = Column(Float, default=0.0)  # 1:1 USD for that day
+    total_used_tokens = Column(Float, nullable=True)  # int(gross_profit_usd * 10) at snapshot time
+    tokens_remaining_after = Column(Float, nullable=True)
+    account_switch_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AdminNotification(Base):
+    """Global or per-user announcement."""
+    __tablename__ = "admin_notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    content = Column(Text, nullable=True)
+    type = Column(String(32), default="info")  # info | warning | announcement
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # null = all users
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AdminSetting(Base):
+    """Key-value platform config (registration bonus, min withdrawal, etc.)."""
+    __tablename__ = "admin_settings"
+
+    key = Column(String(128), primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdminAuditLog(Base):
+    """Persistent audit log (no delete)."""
+    __tablename__ = "admin_audit_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts = Column(DateTime, default=datetime.utcnow, nullable=False)
+    email = Column(String(255), nullable=False)
+    action = Column(String(64), nullable=False)
+    detail = Column(Text, nullable=True)  # JSON string

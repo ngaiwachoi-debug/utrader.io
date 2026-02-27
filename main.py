@@ -4,15 +4,49 @@ from datetime import datetime, timedelta
 import json
 import logging
 import os
+import re
+import secrets
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# #region agent log
+def _debug_log(location: str, message: str, data: dict) -> None:
+    try:
+        import sys
+        import urllib.request
+        payload = {"sessionId": "1b4a77", "location": location, "message": message, "data": data, "timestamp": int(datetime.utcnow().timestamp() * 1000)}
+        line = json.dumps(payload) + "\n"
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-1b4a77.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        sys.stderr.write("[debug] " + line)
+        # Also send to ingest so backend logs appear in session log file
+        def _post():
+            try:
+                body = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    "http://127.0.0.1:7697/ingest/7a2fbc25-d656-4da7-8da6-75a34780f2db",
+                    data=body,
+                    headers={"Content-Type": "application/json", "X-Debug-Session-Id": "1b4a77"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=2)
+            except Exception:
+                pass
+        t = threading.Thread(target=_post, daemon=True)
+        t.start()
+    except Exception:
+        pass
+# #endregion
 
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
@@ -40,10 +74,48 @@ DAILY_DEDUCTION_UTC_MINUTE = 15
 DEDUCTION_RETRY_INTERVAL_SEC = 300  # 5 minutes
 DEDUCTION_MAX_RETRIES = 3
 
+# Exclusive admin: only this email can access /admin/* (set ADMIN_EMAIL in env to override)
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "ngaiwanchoi@gmail.com").strip().lower()
+
 # API failure log for admin panel (in-memory, last N entries)
 API_FAILURES_MAX = 200
 _api_failures: List[Dict[str, Any]] = []
 _api_failures_lock = asyncio.Lock()
+
+# Deduction log for admin (in-memory, last N runs); each entry has user_id, date, tokens_deducted, etc.
+DEDUCTION_LOGS_MAX = 5000
+_deduction_logs: List[Dict[str, Any]] = []
+_deduction_logs_lock = threading.Lock()
+
+# Admin audit log (immutable append-only; no delete). Each entry: ts, email, action, detail.
+ADMIN_AUDIT_MAX = 2000
+_admin_audit_logs: List[Dict[str, Any]] = []
+_admin_audit_lock = threading.Lock()
+
+
+def _admin_audit(email: str, action: str, detail: Optional[Dict[str, Any]] = None) -> None:
+    ts = datetime.utcnow()
+    entry = {
+        "ts": ts.isoformat() + "Z",
+        "email": email,
+        "action": action,
+        "detail": detail or {},
+    }
+    with _admin_audit_lock:
+        _admin_audit_logs.append(entry)
+        while len(_admin_audit_logs) > ADMIN_AUDIT_MAX:
+            _admin_audit_logs.pop(0)
+    try:
+        db = database.SessionLocal()
+        db.add(models.AdminAuditLog(ts=ts, email=email, action=action, detail=json.dumps(detail or {})))
+        db.commit()
+        db.close()
+    except Exception:
+        try:
+            db.rollback()
+            db.close()
+        except Exception:
+            pass
 
 
 async def _record_api_failure(context: str, user_id: Optional[int], error: str) -> str:
@@ -140,26 +212,62 @@ async def _run_daily_gross_profit_scheduler() -> None:
                 for attempt in range(3):
                     try:
                         result, rate_limited, _ = await _refresh_user_lending_snapshot(uid, db)
+                        # #region agent log
+                        _debug_log("main.py:scheduler_9:40", "after _refresh", {"user_id": uid, "gross_profit": result.gross_profit, "rate_limited": rate_limited, "hypothesisId": "H3"})
+                        # #endregion
                         if not rate_limited:
                             cache_data = result.model_dump()
                             cache_data.pop("trades", None)
                             await bitfinex_cache.set_cached(uid, bitfinex_cache.KEY_LENDING, cache_data)
                             # Store daily_gross_profit_usd for 10:15 token deduction (same UTC day)
                             snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                            vault = db.query(models.APIVault).filter(models.APIVault.user_id == uid).first()
                             if snap and hasattr(snap, "daily_gross_profit_usd"):
                                 today_utc = datetime.utcnow().date()
                                 yesterday_utc = today_utc - timedelta(days=1)
                                 current = float(result.gross_profit)
                                 last_cum = getattr(snap, "last_daily_cumulative_gross", None)
                                 last_date = getattr(snap, "last_daily_snapshot_date", None)
-                                if last_date == yesterday_utc and last_cum is not None:
-                                    daily = current - last_cum
-                                else:
+                                vault_updated = getattr(vault, "keys_updated_at", None) if vault else None
+                                last_vault_seen = getattr(snap, "last_vault_updated_at", None)
+
+                                def _dt_ts(d):
+                                    if d is None:
+                                        return 0
+                                    return d.timestamp() if hasattr(d, "timestamp") and callable(getattr(d, "timestamp")) else 0
+
+                                account_switched = (
+                                    vault_updated is not None
+                                    and (last_vault_seen is None or _dt_ts(vault_updated) > _dt_ts(last_vault_seen))
+                                )
+                                if account_switched:
                                     daily = current
-                                snap.daily_gross_profit_usd = daily
-                                snap.last_daily_cumulative_gross = current
-                                snap.last_daily_snapshot_date = today_utc
-                                db.commit()
+                                    snap.daily_gross_profit_usd = daily
+                                    snap.last_daily_cumulative_gross = current
+                                    snap.last_daily_snapshot_date = today_utc
+                                    snap.last_vault_updated_at = vault_updated
+                                    snap.account_switch_note = "Bitfinex account switched – new ledger data pulled"
+                                    db.commit()
+                                    user_for_alert = db.query(models.User).filter(models.User.id == uid).first()
+                                    alert_email = user_for_alert.email if user_for_alert else None
+                                    logger.warning(
+                                        "Bitfinex account switched: user_id=%s email=%s – daily deductions now use new account; baseline reset.",
+                                        uid, alert_email,
+                                    )
+                                    await _alert_admins_deduction_failure(
+                                        f"User {alert_email or uid} (ID: {uid}) switched Bitfinex accounts – daily deductions now use new ledger."
+                                    )
+                                else:
+                                    if last_date == yesterday_utc and last_cum is not None:
+                                        daily = current - last_cum
+                                    else:
+                                        daily = current
+                                    snap.daily_gross_profit_usd = daily
+                                    snap.last_daily_cumulative_gross = current
+                                    snap.last_daily_snapshot_date = today_utc
+                                    if hasattr(snap, "account_switch_note"):
+                                        snap.account_switch_note = None
+                                    db.commit()
                         print(f"[scheduler] user_id={uid} gross_profit={result.gross_profit}")
                         err_msg = None
                         break
@@ -214,6 +322,11 @@ async def _run_daily_token_deduction_scheduler() -> None:
                         entry["tokens_remaining_after"],
                         entry["timestamp"],
                     )
+                with _deduction_logs_lock:
+                    for e in log_entries:
+                        _deduction_logs.append(e)
+                        while len(_deduction_logs) > DEDUCTION_LOGS_MAX:
+                            _deduction_logs.pop(0)
                 if not log_entries:
                     logger.info("Daily token deduction: no users to deduct")
                 last_error = None
@@ -251,6 +364,16 @@ async def _alert_admins_deduction_failure(message: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup: verify Redis (NEW Upstash server) is reachable
+    redis_url = os.getenv("REDIS_URL", "")
+    if redis_url.strip().lower().startswith("rediss://"):
+        try:
+            pool = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+            await pool.ping()
+            host = _redis_host_from_url(redis_url)
+            logger.info("Connected to Redis server at %s (queue + deduction)", host)
+        except Exception as e:
+            logger.warning("Redis startup check failed (queue may be unavailable): %s", e)
     # Start in-process daily 09:40 UTC gross profit refresh (dev and prod; no cron needed)
     scheduler_task = asyncio.create_task(_run_daily_gross_profit_scheduler())
     deduction_task = asyncio.create_task(_run_daily_token_deduction_scheduler())
@@ -287,31 +410,46 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Data-Source", "X-Source-DB", "X-DB-Snapshot-Gross"],
 )
 
 
-# --- Redis / ARQ ---
-REDIS_CONNECT_TIMEOUT = 5.0  # seconds; avoid hanging the request if Redis is down
+# --- Redis / ARQ (migrated to NEW Upstash server; REDIS_URL in .env, rediss:// only) ---
+REDIS_CONNECT_TIMEOUT = 5.0  # seconds; fail fast if Redis unreachable
+
+
+def _redis_host_from_url(url: str) -> str:
+    """Extract host for logging (no credentials)."""
+    if not url:
+        return "unknown"
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        return p.hostname or p.netloc or "unknown"
+    except Exception:
+        return "unknown"
 
 
 async def get_redis():
+    """Create Redis pool from REDIS_URL (.env). Uses rediss:// with SSL for Upstash."""
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    return await create_pool(RedisSettings.from_dsn(redis_url))
+    settings = RedisSettings.from_dsn(redis_url)
+    return await create_pool(settings)
 
 
 async def get_redis_or_raise():
-    """Get Redis with timeout; raises HTTPException 503 if unavailable."""
+    """Get Redis with timeout; raises HTTPException 503 if unavailable (REDIS_URL in .env, e.g. Upstash)."""
     try:
         return await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=503,
-            detail="Queue service unavailable. Make sure Redis is running (e.g. redis-server) and REDIS_URL is set.",
+            detail="Queue service unavailable. Check REDIS_URL in .env and Redis server reachability.",
         )
     except Exception:
         raise HTTPException(
             status_code=503,
-            detail="Queue service unavailable. Make sure Redis is running (e.g. redis-server) and REDIS_URL is set.",
+            detail="Queue service unavailable. Check REDIS_URL in .env and Redis server reachability.",
         )
 
 
@@ -384,8 +522,7 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
         rebalance_interval=30,
         referred_by=referrer.id if referrer else None,
     )
-    # Simple referral code: user email hash suffix
-    new_user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
+    new_user.referral_code = _generate_referral_code(db)
 
     db.add(new_user)
     db.commit()
@@ -448,11 +585,32 @@ async def get_current_user(
     raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
 
+def _validate_usdt_address(addr: str) -> bool:
+    """Basic validation for USDT wallet (TRC20 T..., or ERC20 0x...)."""
+    if not addr or len(addr) > 255:
+        return False
+    s = addr.strip()
+    if re.match(r"^T[1-9A-HJ-NP-Za-km-z]{33}$", s):
+        return True
+    if re.match(r"^0x[a-fA-F0-9]{40}$", s):
+        return True
+    return False
+
+
+def _generate_referral_code(db: Session) -> str:
+    """Generate unique 8-char alphanumeric referral code."""
+    for _ in range(50):
+        code = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(8))
+        if not db.query(models.User).filter(models.User.referral_code == code).first():
+            return code
+    return f"ref{secrets.token_hex(3)}"  # fallback
+
+
 def get_admin_user(current_user: models.User = Depends(get_current_user)) -> models.User:
     """
-    Restrict admin endpoints to a single Gmail account.
+    Restrict admin endpoints to the exclusive admin email (ADMIN_EMAIL).
     """
-    if current_user.email != "ngaiwachoi@gmail.com":
+    if (current_user.email or "").strip().lower() != ADMIN_EMAIL:
         raise HTTPException(status_code=403, detail="Not authorized.")
     return current_user
 
@@ -473,7 +631,7 @@ class StatsResponse(BaseModel):
 # Bitfinex charges 15% on margin funding income for the lender (see bitfinex.com/fees).
 BITFINEX_LENDER_FEE_PCT = 0.15
 
-# Token (credit) system: 1 USDT gross profit = 10 tokens used.
+# Token (credit) system: used_tokens = int(gross_profit_usd × TOKENS_PER_USDT_GROSS). Gross Profit = USD; Used Tokens = USD × 10.
 TOKENS_PER_USDT_GROSS = 10
 FREE_TIER_TOKENS = 100
 PLAN_TOKEN_CREDITS = {
@@ -493,6 +651,7 @@ class LendingStatsResponse(BaseModel):
     trades: Optional[List["FundingTradeRecord"]] = None
     total_trades_count: Optional[int] = None  # cumulative trades synced (for display when trades list not full)
     calculation_breakdown: Optional["CalculationBreakdown"] = None
+    db_snapshot_gross: Optional[float] = None  # set when ?source=db so client can verify backend DB read
 
 
 class FundingTradeRecord(BaseModel):
@@ -548,6 +707,7 @@ class UserStatusResponse(BaseModel):
     tokens_used: int = 0
     initial_token_credit: int = 0
     gross_profit_usd: float = 0.0
+    pro_expiry: Optional[str] = None  # ISO 8601 UTC; null for free plan (Settings "Next Renewal Date")
 
 
 class TokenBalanceResponse(BaseModel):
@@ -555,6 +715,39 @@ class TokenBalanceResponse(BaseModel):
     tokens_used: int
     initial_credit: int
     gross_profit_usd: float
+
+
+class TokenBalanceV1Response(BaseModel):
+    """GET /api/v1/users/me/token-balance: real-time balance from user_token_balance (after daily deduction)."""
+    tokens_remaining: float
+    purchased_tokens: float
+    last_gross_usd_used: float
+    updated_at: Optional[str] = None  # UTC ISO 8601; null if never updated
+
+
+# In-memory rate limit for token-balance API: 10 requests per minute per user
+_token_balance_rl: Dict[int, List[float]] = {}
+_token_balance_rl_lock = asyncio.Lock()
+TOKEN_BALANCE_RL_MAX = 10
+TOKEN_BALANCE_RL_WINDOW_SEC = 60.0
+
+
+async def _token_balance_rate_limit(user_id: int) -> None:
+    """Raise 429 if user exceeds 10 requests per minute."""
+    import time
+    now = time.monotonic()
+    async with _token_balance_rl_lock:
+        if user_id not in _token_balance_rl:
+            _token_balance_rl[user_id] = []
+        times = _token_balance_rl[user_id]
+        cutoff = now - TOKEN_BALANCE_RL_WINDOW_SEC
+        times[:] = [t for t in times if t > cutoff]
+        if len(times) >= TOKEN_BALANCE_RL_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded: 10 requests per minute",
+            )
+        times.append(now)
 
 
 class AdminUserOut(BaseModel):
@@ -565,6 +758,21 @@ class AdminUserOut(BaseModel):
     rebalance_interval: int
     pro_expiry: Optional[datetime]
     status: str
+    tokens_remaining: Optional[float] = None
+    bot_status: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class DeductionLogEntry(BaseModel):
+    user_id: int
+    email: Optional[str] = None
+    gross_profit: float
+    tokens_deducted: float
+    tokens_remaining_before: Optional[float] = None
+    tokens_remaining_after: Optional[float] = None
+    total_used_tokens: Optional[float] = None
+    timestamp: str
+    account_switch_note: Optional[str] = None
 
 
 class AdminUserUpdate(BaseModel):
@@ -572,6 +780,7 @@ class AdminUserUpdate(BaseModel):
     pro_expiry: Optional[datetime] = None
     lending_limit: Optional[float] = None
     rebalance_interval: Optional[int] = None
+    tokens_remaining: Optional[float] = None
 
 
 class ApiFailureOut(BaseModel):
@@ -586,6 +795,109 @@ class AdminRetryBody(BaseModel):
     """Retry a failed API call: by failure id or by user_id."""
     failure_id: Optional[str] = None
     user_id: Optional[int] = None
+
+
+class AdminAuditEntry(BaseModel):
+    ts: str
+    email: str
+    action: str
+    detail: Dict[str, Any]
+
+
+class AdminApiKeyRow(BaseModel):
+    user_id: int
+    email: str
+    has_keys: bool
+    key_masked: Optional[str] = None
+    last_tested_at: Optional[str] = None
+
+
+class BulkTokenItem(BaseModel):
+    user_id: int
+    amount: float
+
+
+class BulkTokenBody(BaseModel):
+    items: List[BulkTokenItem]
+
+
+class AdminUsdtCreditRow(BaseModel):
+    user_id: int
+    email: str
+    usdt_credit: float
+    total_earned: float
+    total_withdrawn: float
+    locked_pending: float = 0.0
+
+
+class UsdtAdjustBody(BaseModel):
+    amount: float  # + add, - deduct
+
+
+class WithdrawalRow(BaseModel):
+    id: int
+    user_id: int
+    email: str
+    amount: float
+    address: str
+    status: str
+    created_at: str
+    processed_at: Optional[str] = None
+    processed_by: Optional[str] = None
+    rejection_note: Optional[str] = None
+
+
+class ReferralRow(BaseModel):
+    user_id: int
+    email: str
+    referral_code: Optional[str] = None
+    referrer_id: Optional[int] = None
+    referrer_email: Optional[str] = None
+    downline_count: int
+    referral_earnings: float
+
+
+class ReferralTreeOut(BaseModel):
+    user_id: int
+    email: str
+    level1_upline: Optional[Dict[str, Any]] = None
+    level2_upline: Optional[Dict[str, Any]] = None
+    level3_upline: Optional[Dict[str, Any]] = None
+    downline_count: int
+
+
+class NotificationSendBody(BaseModel):
+    title: str
+    content: Optional[str] = None
+    type: str = "info"
+    target_user_id: Optional[int] = None  # null = all users
+
+
+class AdminSettingOut(BaseModel):
+    key: str
+    value: str
+
+
+class AdminSettingsUpdateBody(BaseModel):
+    registration_bonus_tokens: Optional[int] = None
+    min_withdrawal_usdt: Optional[float] = None
+    daily_deduction_utc_hour: Optional[int] = None
+    bot_auto_start: Optional[bool] = None
+    referral_system_enabled: Optional[bool] = None
+    withdrawal_enabled: Optional[bool] = None
+    maintenance_mode: Optional[bool] = None
+
+
+class UserOverviewOut(BaseModel):
+    user: Dict[str, Any]
+    token_balance: Optional[Dict[str, Any]] = None
+    usdt_credit: Optional[Dict[str, Any]] = None
+    profit_snapshot: Optional[Dict[str, Any]] = None
+    referral: Optional[Dict[str, Any]] = None
+    api_key_status: Optional[Dict[str, Any]] = None
+    withdrawals: List[Dict[str, Any]]
+    deduction_history: List[Dict[str, Any]]
+    audit_entries: List[Dict[str, Any]]
 
 
 # --- Google Auth Endpoint ---
@@ -624,9 +936,11 @@ async def get_all_bot_stats(
         if raw_data:
             all_engines.append(json.loads(raw_data))
 
+    # Fixed: Consider DB bot_status so UI shows Running/Starting immediately (no lag until worker writes heartbeats)
+    active = len(all_engines) > 0 or (bot_status in ("running", "starting"))
     if not all_engines:
         return {
-            "active": False,
+            "active": active,
             "engines": [],
             "total_loaned": "0.00",
             "bot_status": bot_status or "stopped",
@@ -635,7 +949,7 @@ async def get_all_bot_stats(
     total_val = sum(float(str(e["loaned"]).replace(",", "")) for e in all_engines)
 
     return {
-        "active": True,
+        "active": active,
         "engines": all_engines,
         "total_loaned": f"{total_val:,.2f}",
         "bot_status": bot_status or "running",
@@ -714,6 +1028,12 @@ async def connect_exchange(
     }
 
 
+@app.get("/api/version")
+async def api_version():
+    """No-auth endpoint to verify which backend is running (gross-profit DB fallback support)."""
+    return {"version": "gross-profit-db-fallback", "source_db_supported": True}
+
+
 @app.get("/api/me")
 async def get_current_user_info(
     current_user: models.User = Depends(get_current_user),
@@ -748,8 +1068,70 @@ async def get_api_keys_status(
         "key_preview": "••••••••" if has_keys else None,
         "created_at": created_at,
         "last_tested_at": last_tested_at,
-        "last_test_balance": float(last_test_balance) if last_test_balance is not None else None,
+        "last_test_balance": last_test_balance,
     }
+
+
+async def _get_current_user_for_token_balance(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(database.get_db),
+) -> models.User:
+    """Requires JWT; raises 401 with detail 'Not authenticated' if missing/invalid (token balance API spec)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        return await get_current_user(authorization=authorization, db=db)
+    except HTTPException as e:
+        if e.status_code == 401:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        raise
+
+
+@app.get("/api/v1/users/me/token-balance", response_model=TokenBalanceV1Response)
+async def get_my_token_balance_v1(
+    current_user: models.User = Depends(_get_current_user_for_token_balance),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Real-time token balance from user_token_balance (after daily deduction).
+    JWT required. Rate limit: 10 requests per minute per user.
+    """
+    try:
+        await _token_balance_rate_limit(current_user.id)
+    except HTTPException:
+        raise
+
+    try:
+        row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == current_user.id).first()
+        if not row:
+            logger.info("token_balance_api user_id=%s tokens_remaining=0 (no row)", current_user.id)
+            return TokenBalanceV1Response(
+                tokens_remaining=0.0,
+                purchased_tokens=0.0,
+                last_gross_usd_used=0.0,
+                updated_at=None,
+            )
+        tokens_remaining = float(row.tokens_remaining or 0)
+        purchased_tokens = float(row.purchased_tokens or 0)
+        last_gross_usd_used = float(row.last_gross_usd_used or 0)
+        updated_at = None
+        if getattr(row, "updated_at", None) and row.updated_at:
+            updated_at = row.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        logger.info("token_balance_api user_id=%s tokens_remaining=%s", current_user.id, tokens_remaining)
+        return TokenBalanceV1Response(
+            tokens_remaining=tokens_remaining,
+            purchased_tokens=purchased_tokens,
+            last_gross_usd_used=last_gross_usd_used,
+            updated_at=updated_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("token_balance_api user_id=%s error=%s", current_user.id, e)
+        raise HTTPException(status_code=500, detail="Internal error retrieving token balance.")
 
 
 @app.post("/api/keys/test")
@@ -1020,6 +1402,7 @@ async def _validate_and_save_bitfinex_keys(payload, current_user, db):
     vault.encrypted_secret = security.encrypt_key(payload.bfx_secret)
     if payload.gemini_key:
         vault.encrypted_gemini_key = security.encrypt_key(payload.gemini_key)
+    vault.keys_updated_at = datetime.utcnow()
 
     db.commit()
     return balance, {"message": "Exchange connected and trial activated."}
@@ -1119,6 +1502,7 @@ async def connect_exchange_update_by_email(
     vault.encrypted_secret = security.encrypt_key(payload.bfx_secret)
     if payload.gemini_key is not None:
         vault.encrypted_gemini_key = security.encrypt_key(payload.gemini_key) if payload.gemini_key else None
+    vault.keys_updated_at = datetime.utcnow()
     db.commit()
     await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
@@ -1211,8 +1595,11 @@ async def _clear_arq_job_keys(redis, job_id: str) -> None:
 
 
 async def _enqueue_bot_task(redis, user_id: int) -> bool:
-    """Enqueue run_bot_task for user_id. Returns True if enqueued, False if already running/queued."""
+    """Enqueue run_bot_task for user_id. Returns True if enqueued, False if already running/queued.
+    Fixed: Clear ARQ keys before enqueue so re-enqueue after stop always works (ARQ blocks same job_id until result key is gone).
+    """
     job_id = f"bot_user_{user_id}"
+    await _clear_arq_job_keys(redis, job_id)  # Clear before enqueue to avoid "duplicate job_id" when re-starting after stop
     job = await redis.enqueue_job("run_bot_task", user_id, _job_id=job_id)
     if job is not None:
         return True
@@ -1234,16 +1621,27 @@ async def start_bot(
         db.commit()
         raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
 
+    status_before = getattr(current_user, "bot_status", None) or "stopped"
     redis = await get_redis_or_raise()
     enqueued = await _enqueue_bot_task(redis, current_user.id)
     if enqueued:
         try:
             current_user.bot_status = "starting"
             db.commit()
+            logger.info("start_bot user_id=%s action=start enqueued=True bot_status_before=%s bot_status_after=starting", current_user.id, status_before)
+            return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
         except Exception:
             db.rollback()
-        return {"status": "success", "message": f"Bot queued for user {current_user.id}"}
-    return {"status": "success", "message": "Bot already running or queued."}
+            logger.warning("start_bot user_id=%s db commit failed", current_user.id)
+            return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
+    # Idempotent: already running or queued — return success, no duplicate job
+    try:
+        current_user.bot_status = current_user.bot_status or "starting"
+        db.commit()
+    except Exception:
+        db.rollback()
+    logger.info("start_bot user_id=%s action=start enqueued=False (already running/queued) bot_status=%s", current_user.id, getattr(current_user, "bot_status", None))
+    return {"status": "success", "message": "Bot already running or queued.", "bot_status": getattr(current_user, "bot_status", None) or "running"}
 
 
 @app.post("/stop-bot")
@@ -1252,28 +1650,24 @@ async def stop_bot(
     db: Session = Depends(database.get_db),
 ):
     from arq.jobs import Job
+    status_before = getattr(current_user, "bot_status", None) or "stopped"
     redis = await get_redis_or_raise()
     job_id = f"bot_user_{current_user.id}"
     job = Job(job_id=job_id, redis=redis)
+    aborted = False
     try:
         aborted = await job.abort()
         await _clear_arq_job_keys(redis, job_id)  # so next Start enqueues reliably
-        try:
-            current_user.bot_status = "stopped"
-            db.commit()
-        except Exception:
-            db.rollback()
-        if aborted:
-            return {"status": "success", "message": "Shutdown signal sent"}
     except Exception:
-        pass
-    await _clear_arq_job_keys(redis, job_id)
+        await _clear_arq_job_keys(redis, job_id)
     try:
         current_user.bot_status = "stopped"
         db.commit()
     except Exception:
         db.rollback()
-    return {"status": "error", "message": "No active bot found"}
+    # Idempotent: always return success when bot is stopped (no orphaned jobs)
+    logger.info("stop_bot user_id=%s action=stop aborted=%s bot_status_before=%s bot_status_after=stopped", current_user.id, aborted, status_before)
+    return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
 
 
 # Legacy-style control endpoints that address bots by numeric user_id directly.
@@ -1289,6 +1683,7 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
             db.commit()
             raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
 
+        status_before = getattr(user, "bot_status", None) or "stopped"
         redis = await get_redis_or_raise()
         enqueued = await _enqueue_bot_task(redis, user.id)
         if enqueued:
@@ -1297,8 +1692,14 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
                 db.commit()
             except Exception:
                 db.rollback()
-            return {"status": "success", "message": f"Bot queued for user {user.id}"}
-        return {"status": "success", "message": "Bot already running or queued."}
+            logger.info("start_bot_for_user user_id=%s enqueued=True bot_status_before=%s bot_status_after=starting", user_id, status_before)
+            return {"status": "success", "message": f"Bot queued for user {user.id}", "bot_status": "starting"}
+        try:
+            db.refresh(user)
+        except Exception:
+            pass
+        logger.info("start_bot_for_user user_id=%s enqueued=False (already running/queued)", user_id)
+        return {"status": "success", "message": "Bot already running or queued.", "bot_status": getattr(user, "bot_status", None) or "running"}
     except HTTPException:
         raise
     except Exception as e:
@@ -1312,21 +1713,29 @@ async def stop_bot_for_user(user_id: int, db: Session = Depends(database.get_db)
     job_id = f"bot_user_{user_id}"
     job = Job(job_id=job_id, redis=redis)
     user = db.query(models.User).filter(models.User.id == user_id).first()
+    status_before = getattr(user, "bot_status", None) if user else None
+    aborted = False
     try:
         aborted = await job.abort()
         await _clear_arq_job_keys(redis, job_id)
-        if user and hasattr(user, "bot_status"):
-            user.bot_status = "stopped"
-            db.commit()
-        if aborted:
-            return {"status": "success", "message": "Shutdown signal sent"}
     except Exception:
-        pass
-    await _clear_arq_job_keys(redis, job_id)
+        await _clear_arq_job_keys(redis, job_id)
     if user and hasattr(user, "bot_status"):
         user.bot_status = "stopped"
         db.commit()
-    return {"status": "error", "message": "No active bot found"}
+    logger.info("stop_bot_for_user user_id=%s aborted=%s bot_status_before=%s bot_status_after=stopped", user_id, aborted, status_before)
+    return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
+
+
+@app.post("/dev/run-daily-deduction")
+def dev_run_daily_deduction(db: Session = Depends(database.get_db)):
+    """Dev-only: run daily token deduction once (same logic as 10:15 UTC scheduler). Set ALLOW_DEV_CONNECT=1."""
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    log_entries, err = run_daily_token_deduction(db)
+    if err:
+        raise HTTPException(status_code=500, detail=err)
+    return {"status": "success", "count": len(log_entries), "entries": log_entries}
 
 
 # --- Stats Endpoint ---
@@ -1667,6 +2076,9 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
     Compute gross profit from Bitfinex: prefer ledgers (Margin Funding Payment from registration to latest),
     then fall back to funding trades. Persist to user_profit_snapshot and return (result, rate_limited, trade_records).
     """
+    # #region agent log
+    _debug_log("main.py:_refresh_user_lending_snapshot", "entry", {"user_id": user_id, "hypothesisId": "H5"})
+    # #endregion
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user or not user.vault:
         return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0), False, []
@@ -1696,6 +2108,9 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
                 bitfinex_fee=round(fees_ledgers, 2),
                 net_profit=round(net_ledgers, 2),
             )
+            # #region agent log
+            _debug_log("main.py:_refresh_user_lending_snapshot", "ledgers path", {"user_id": user_id, "gross_profit": result.gross_profit, "hypothesisId": "H5"})
+            # #endregion
             if snap:
                 snap.gross_profit_usd = result.gross_profit
                 snap.net_profit_usd = result.net_profit
@@ -1816,6 +2231,9 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
             records = _trades_with_interest_usd(trades, ticker_prices)
 
     # Persist snapshot
+    # #region agent log
+    _debug_log("main.py:_refresh_user_lending_snapshot", "trades path persist", {"user_id": user_id, "gross_profit": result.gross_profit, "hypothesisId": "H3"})
+    # #endregion
     if snap:
         snap.gross_profit_usd = result.gross_profit
         snap.net_profit_usd = result.net_profit
@@ -1865,6 +2283,7 @@ async def get_lending_stats(
     user_id: int,
     response: Response,
     db: Session = Depends(database.get_db),
+    source: Optional[str] = Query(None, description="If 'db', return persisted snapshot only (bypass cache)."),
 ):
     """
     Gross profit = sum of interest from Bitfinex funding trades between registration date and latest.
@@ -1872,19 +2291,84 @@ async def get_lending_stats(
     """
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user or not user.vault:
+        # #region agent log
+        _debug_log("main.py:get_lending_stats", "no user or vault", {"user_id": user_id, "has_user": user is not None, "has_vault": bool(user and getattr(user, "vault", None)), "hypothesisId": "H2"})
+        # #endregion
         return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+
+    # Load DB snapshot once for cache-hit override and for fallback on miss (raw SQL so optional columns e.g. daily_gross_* are not required)
+    try:
+        row = db.execute(
+            text("SELECT gross_profit_usd, net_profit_usd, bitfinex_fee_usd FROM user_profit_snapshot WHERE user_id = :uid"),
+            {"uid": user_id},
+        ).fetchone()
+    except Exception:
+        row = None
+    fallback_gross = float(row[0]) if row and row[0] is not None else None
+    fallback_net = float(row[1]) if row and row[1] is not None else None
+    fallback_fee = float(row[2]) if row and row[2] is not None else None
+    _debug_log("main.py:get_lending_stats", "snapshot state", {"user_id": user_id, "has_snap": row is not None, "fallback_gross": fallback_gross, "hypothesisId": "H2"})
+
+    # Force DB source for verification: bypass cache and return persisted snapshot when available
+    if source == "db":
+        response.headers["X-Source-DB"] = "true"
+        response.headers["X-DB-Snapshot-Gross"] = str(fallback_gross if fallback_gross is not None else "none")
+        db_snap = float(fallback_gross) if fallback_gross is not None else None  # in body so client can verify without CORS headers
+        if fallback_gross is not None and fallback_gross > 0:
+            response.headers["X-Data-Source"] = "db"
+            return LendingStatsResponse(
+                gross_profit=round(fallback_gross, 2),
+                bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+                net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                db_snapshot_gross=db_snap,
+            )
+        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap)
 
     cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_LENDING)
     if cached is not None:
         data, from_cache = cached
         if from_cache and data is not None:
+            # #region agent log
+            _debug_log("main.py:get_lending_stats", "cache hit", {"user_id": user_id, "gross_profit": data.get("gross_profit"), "hypothesisId": "H1"})
+            # #endregion
+            # Override cached 0 with persisted snapshot when available (H1: cache had wrong/zero value)
+            cached_gross = data.get("gross_profit")
+            if (cached_gross is None or cached_gross == 0) and fallback_gross is not None and fallback_gross > 0:
+                _debug_log("main.py:get_lending_stats", "cache hit override with db", {"user_id": user_id, "gross_profit": fallback_gross, "hypothesisId": "H1"})
+                response.headers["X-Data-Source"] = "db"
+                return LendingStatsResponse(
+                    gross_profit=round(fallback_gross, 2),
+                    bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+                    net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                )
             response.headers["X-Data-Source"] = "cache"
             exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_LENDING)
             if exp is not None:
                 response.headers["X-Cache-Expires-At"] = str(int(exp))
             return LendingStatsResponse(**data)
 
+    # #region agent log
+    _debug_log("main.py:get_lending_stats", "cache miss", {"user_id": user_id, "hypothesisId": "H1"})
+    # #endregion
+
+    # On cache miss, return persisted snapshot when available so first load after restart shows DB value without calling Bitfinex
+    if fallback_gross is not None and fallback_gross > 0:
+        response.headers["X-Data-Source"] = "db"
+        out = LendingStatsResponse(
+            gross_profit=round(fallback_gross, 2),
+            bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+            net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+        )
+        cache_data = out.model_dump()
+        cache_data.pop("trades", None)
+        cache_data.pop("calculation_breakdown", None)
+        await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
+        return out
+
     if await bitfinex_cache.is_in_cooldown(user_id, bitfinex_cache.KEY_LENDING):
+        if fallback_gross is not None:
+            response.headers["X-Data-Source"] = "db"
+            return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
         response.headers["X-Data-Source"] = "cache"
         response.headers["X-Rate-Limited"] = "true"
         response.headers["Retry-After"] = "60"
@@ -1892,7 +2376,16 @@ async def get_lending_stats(
 
     try:
         result, rate_limited, _ = await _refresh_user_lending_snapshot(user_id, db)
-    except Exception:
+        # #region agent log
+        _debug_log("main.py:get_lending_stats", "after _refresh", {"user_id": user_id, "gross_profit": result.gross_profit, "rate_limited": rate_limited, "hypothesisId": "H2"})
+        # #endregion
+    except Exception as e:
+        # #region agent log
+        _debug_log("main.py:get_lending_stats", "_refresh exception", {"user_id": user_id, "error": str(e), "hypothesisId": "H2"})
+        # #endregion
+        if fallback_gross is not None:
+            response.headers["X-Data-Source"] = "db"
+            return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
         result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
         rate_limited = False
     if rate_limited:
@@ -1901,12 +2394,29 @@ async def get_lending_stats(
         if cached is not None:
             data, _ = cached
             if data is not None:
+                # #region agent log
+                _debug_log("main.py:get_lending_stats", "rate_limited return cached", {"user_id": user_id, "gross_profit": data.get("gross_profit"), "hypothesisId": "H2"})
+                # #endregion
                 response.headers["X-Data-Source"] = "cache"
                 response.headers["X-Rate-Limited"] = "true"
                 response.headers["Retry-After"] = "60"
                 return LendingStatsResponse(**data)
+        if fallback_gross is not None:
+            response.headers["X-Data-Source"] = "db"
+            response.headers["X-Rate-Limited"] = "true"
+            return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
         response.headers["X-Rate-Limited"] = "true"
         response.headers["Retry-After"] = "60"
+    # Use persisted DB value when API returned 0 but we have a saved gross (e.g. after restart or API failure)
+    if (result.gross_profit == 0 or result.gross_profit is None) and fallback_gross is not None and fallback_gross > 0:
+        response.headers["X-Data-Source"] = "db"
+        out = LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
+        cache_data = out.model_dump()
+        cache_data.pop("trades", None)
+        cache_data.pop("calculation_breakdown", None)
+        await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
+        _debug_log("main.py:get_lending_stats", "return db fallback", {"user_id": user_id, "gross_profit": fallback_gross, "hypothesisId": "H2"})
+        return out
     cache_data = result.model_dump()
     cache_data.pop("trades", None)
     cache_data.pop("calculation_breakdown", None)
@@ -1915,6 +2425,9 @@ async def get_lending_stats(
     exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_LENDING)
     if exp is not None:
         response.headers["X-Cache-Expires-At"] = str(int(exp))
+    # #region agent log
+    _debug_log("main.py:get_lending_stats", "return live", {"user_id": user_id, "gross_profit": result.gross_profit, "hypothesisId": "H1"})
+    # #endregion
     return result
 
 
@@ -1965,8 +2478,19 @@ async def refresh_lending_stats(
     """
     Force refresh gross profit from Bitfinex for the current user (e.g. on login/dashboard load).
     Invalidates lending cache then recomputes from funding trades since registration.
+    Falls back to persisted user_profit_snapshot when API fails or returns 0.
     """
     await bitfinex_cache.invalidate(current_user.id, bitfinex_cache.KEY_LENDING)
+    try:
+        row = db.execute(
+            text("SELECT gross_profit_usd, net_profit_usd, bitfinex_fee_usd FROM user_profit_snapshot WHERE user_id = :uid"),
+            {"uid": current_user.id},
+        ).fetchone()
+    except Exception:
+        row = None
+    fallback_gross = float(row[0]) if row and row[0] is not None else None
+    fallback_net = float(row[1]) if row and row[1] is not None else None
+    fallback_fee = float(row[2]) if row and row[2] is not None else None
     try:
         result, rate_limited, records = await _refresh_user_lending_snapshot(current_user.id, db)
     except Exception:
@@ -1979,6 +2503,15 @@ async def refresh_lending_stats(
         cache_data = result.model_dump()
         cache_data.pop("trades", None)
         await bitfinex_cache.set_cached(current_user.id, bitfinex_cache.KEY_LENDING, cache_data)
+    # Use DB fallback when API returned 0 but we have persisted gross (e.g. after API failure)
+    if (result.gross_profit == 0 or result.gross_profit is None) and fallback_gross is not None and fallback_gross > 0:
+        return LendingStatsResponse(
+            gross_profit=round(fallback_gross, 2),
+            bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+            net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+            trades=[],
+            calculation_breakdown=None,
+        )
     return LendingStatsResponse(
         gross_profit=result.gross_profit,
         bitfinex_fee=result.bitfinex_fee,
@@ -2201,6 +2734,9 @@ def get_user_status(
     except ProgrammingError:
         pass
 
+    pro_expiry_iso = None
+    if getattr(user, "pro_expiry", None) and user.pro_expiry:
+        pro_expiry_iso = user.pro_expiry.strftime("%Y-%m-%dT%H:%M:%SZ")
     return UserStatusResponse(
         plan_tier=user.plan_tier or "trial",
         lending_limit=float(user.lending_limit or 0.0),
@@ -2212,6 +2748,7 @@ def get_user_status(
         tokens_used=tokens_used,
         initial_token_credit=int(initial_credit) + int(purchased),
         gross_profit_usd=round(gross, 2),
+        pro_expiry=pro_expiry_iso,
     )
 
 
@@ -2221,6 +2758,7 @@ def list_users(
     db: Session = Depends(database.get_db),
 ):
     users = db.query(models.User).all()
+    balances = {b.user_id: float(b.tokens_remaining or 0) for b in db.query(models.UserTokenBalance).all()}
     return [
         AdminUserOut(
             id=u.id,
@@ -2230,6 +2768,9 @@ def list_users(
             rebalance_interval=int(u.rebalance_interval or 0),
             pro_expiry=u.pro_expiry,
             status=u.status or "active",
+            tokens_remaining=balances.get(u.id),
+            bot_status=getattr(u, "bot_status", None) or "stopped",
+            created_at=u.created_at.isoformat() + "Z" if getattr(u, "created_at", None) and u.created_at else None,
         )
         for u in users
     ]
@@ -2239,7 +2780,7 @@ def list_users(
 def update_user(
     user_id: int,
     payload: AdminUserUpdate,
-    _: models.User = Depends(get_admin_user),
+    admin_user: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -2271,8 +2812,21 @@ def update_user(
     if payload.pro_expiry is not None:
         user.pro_expiry = payload.pro_expiry
 
+    if payload.tokens_remaining is not None:
+        val = float(payload.tokens_remaining)
+        if val < 0:
+            raise HTTPException(status_code=400, detail="tokens_remaining cannot be negative.")
+        row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+        if row:
+            row.tokens_remaining = val
+        else:
+            db.add(models.UserTokenBalance(user_id=user_id, tokens_remaining=val))
+
     db.commit()
     db.refresh(user)
+    _admin_audit(admin_user.email or "", "update_user", {"user_id": user_id, "plan_tier": payload.plan_tier, "tokens_remaining": payload.tokens_remaining})
+    bal = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    tokens_remaining = float(bal.tokens_remaining) if bal else None
     return AdminUserOut(
         id=user.id,
         email=user.email,
@@ -2281,6 +2835,9 @@ def update_user(
         rebalance_interval=int(user.rebalance_interval or 0),
         pro_expiry=user.pro_expiry,
         status=user.status or "active",
+        tokens_remaining=tokens_remaining,
+        bot_status=getattr(user, "bot_status", None) or "stopped",
+        created_at=user.created_at.isoformat() + "Z" if getattr(user, "created_at", None) and user.created_at else None,
     )
 
 
@@ -2324,6 +2881,1159 @@ async def retry_api_failure(
     except Exception as e:
         await _record_api_failure("admin_retry", user_id, str(e))
         raise HTTPException(status_code=502, detail=f"Retry failed: {e}")
+
+
+# --- Admin: User export CSV ---
+@app.get("/admin/users/export")
+def admin_export_users(
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Export users as CSV (admin only)."""
+    import csv
+    import io
+    users = db.query(models.User).all()
+    balances = {b.user_id: float(b.tokens_remaining or 0) for b in db.query(models.UserTokenBalance).all()}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "email", "plan_tier", "lending_limit", "rebalance_interval", "pro_expiry", "status", "tokens_remaining", "bot_status", "created_at"])
+    for u in users:
+        w.writerow([
+            u.id,
+            u.email or "",
+            u.plan_tier or "trial",
+            float(u.lending_limit or 0),
+            int(u.rebalance_interval or 0),
+            u.pro_expiry.isoformat() if u.pro_expiry else "",
+            u.status or "active",
+            balances.get(u.id, ""),
+            getattr(u, "bot_status", None) or "stopped",
+            u.created_at.isoformat() if getattr(u, "created_at", None) and u.created_at else "",
+        ])
+    buf.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=users_export.csv"},
+    )
+
+
+# --- Admin: Bot control ---
+@app.post("/admin/bot/start/{user_id}")
+async def admin_bot_start(
+    user_id: int,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Admin-only: start bot for any user."""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user or not user.vault:
+        raise HTTPException(status_code=404, detail="User or API keys not found.")
+    if user.pro_expiry and user.pro_expiry < datetime.utcnow():
+        user.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=402, detail="Subscription expired.")
+    redis = await get_redis_or_raise()
+    enqueued = await _enqueue_bot_task(redis, user_id)
+    if enqueued:
+        try:
+            user.bot_status = "starting"
+            db.commit()
+        except Exception:
+            db.rollback()
+        _admin_audit(admin_user.email or "", "bot_start", {"user_id": user_id})
+        return {"status": "success", "message": f"Bot queued for user {user_id}", "bot_status": "starting"}
+    return {"status": "success", "message": "Bot already running or queued.", "bot_status": getattr(user, "bot_status", None) or "running"}
+
+
+@app.post("/admin/bot/stop/{user_id}")
+async def admin_bot_stop(
+    user_id: int,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Admin-only: stop bot for any user."""
+    from arq.jobs import Job
+    redis = await get_redis_or_raise()
+    job_id = f"bot_user_{user_id}"
+    job = Job(job_id=job_id, redis=redis)
+    aborted = False
+    try:
+        aborted = await job.abort()
+        await _clear_arq_job_keys(redis, job_id)
+    except Exception:
+        await _clear_arq_job_keys(redis, job_id)
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user and hasattr(user, "bot_status"):
+        user.bot_status = "stopped"
+        db.commit()
+    _admin_audit(admin_user.email or "", "bot_stop", {"user_id": user_id})
+    return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
+
+
+@app.get("/admin/bot/logs/{user_id}")
+async def admin_bot_logs(
+    user_id: int,
+    _: models.User = Depends(get_admin_user),
+):
+    """Admin-only: terminal logs for any user."""
+    try:
+        redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+    except (asyncio.TimeoutError, Exception):
+        return {"lines": []}
+    try:
+        key = f"terminal_logs:{user_id}"
+        lines = await asyncio.wait_for(redis.lrange(key, 0, -1), timeout=5.0)
+    except (asyncio.TimeoutError, Exception):
+        return {"lines": []}
+    decoded = [line.decode("utf-8") if isinstance(line, bytes) else line for line in (lines or [])]
+    return {"lines": decoded}
+
+
+@app.post("/admin/arq/restart")
+async def admin_arq_restart(_: models.User = Depends(get_admin_user)):
+    """Admin: signal ARQ restart (no-op in API; worker must be restarted externally). Returns OK."""
+    return {"ok": True, "message": "ARQ worker must be restarted externally (e.g. systemd or process manager)."}
+
+
+# --- Admin: Deduction oversight ---
+@app.get("/admin/deduction/logs", response_model=List[DeductionLogEntry])
+def admin_deduction_logs(
+    limit: int = Query(100, ge=1, le=500),
+    start_date: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Recent deduction log entries (newest first). Persisted in deduction_log; optional start_date/end_date filter."""
+    try:
+        q = db.query(models.DeductionLog).order_by(models.DeductionLog.timestamp_utc.desc())
+        if start_date:
+            q = q.filter(models.DeductionLog.timestamp_utc >= datetime.fromisoformat(start_date + "T00:00:00"))
+        if end_date:
+            q = q.filter(models.DeductionLog.timestamp_utc <= datetime.fromisoformat(end_date + "T23:59:59.999999"))
+        rows = q.limit(limit).all()
+        return [
+            DeductionLogEntry(
+                user_id=r.user_id,
+                email=r.email,
+                gross_profit=r.daily_gross_profit_usd or 0,
+                tokens_deducted=r.tokens_deducted or 0,
+                tokens_remaining_after=r.tokens_remaining_after,
+                total_used_tokens=r.total_used_tokens,
+                timestamp=r.timestamp_utc.isoformat() + "Z" if r.timestamp_utc else "",
+                account_switch_note=r.account_switch_note,
+            )
+            for r in rows
+        ]
+    except Exception:
+        with _deduction_logs_lock:
+            copy = list(_deduction_logs)
+        copy.reverse()
+        if start_date:
+            copy = [e for e in copy if (e.get("timestamp") or "")[:10] >= start_date]
+        if end_date:
+            copy = [e for e in copy if (e.get("timestamp") or "")[:10] <= end_date]
+        out = copy[:limit]
+        return [
+            DeductionLogEntry(
+                user_id=e["user_id"],
+                email=e.get("email"),
+                gross_profit=e.get("gross_profit", 0),
+                tokens_deducted=e.get("tokens_deducted", 0),
+                tokens_remaining_before=e.get("tokens_remaining_before"),
+                tokens_remaining_after=e.get("tokens_remaining_after"),
+                total_used_tokens=e.get("total_used_tokens"),
+                timestamp=e.get("timestamp", ""),
+                account_switch_note=e.get("account_switch_note"),
+            )
+            for e in out
+        ]
+
+
+@app.post("/admin/deduction/trigger")
+def admin_deduction_trigger(
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Admin: run daily token deduction manually."""
+    log_entries, err = run_daily_token_deduction(db)
+    if err:
+        raise HTTPException(status_code=500, detail=err)
+    with _deduction_logs_lock:
+        for e in log_entries:
+            _deduction_logs.append(e)
+            while len(_deduction_logs) > DEDUCTION_LOGS_MAX:
+                _deduction_logs.pop(0)
+    _admin_audit(admin_user.email or "", "deduction_trigger", {"count": len(log_entries)})
+    return {"status": "success", "count": len(log_entries), "entries": log_entries}
+
+
+@app.post("/admin/deduction/rollback/{user_id}/{date}")
+def admin_deduction_rollback(
+    user_id: int,
+    date: str,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Admin: add back tokens for a user for a given date (YYYY-MM-DD). Uses deduction_log (DB) or in-memory log."""
+    entries: List[Dict[str, Any]] = []
+    try:
+        day_start = datetime.fromisoformat(date + "T00:00:00")
+        day_end = datetime.fromisoformat(date + "T23:59:59.999999")
+        db_rows = (
+            db.query(models.DeductionLog)
+            .filter(
+                models.DeductionLog.user_id == user_id,
+                models.DeductionLog.timestamp_utc >= day_start,
+                models.DeductionLog.timestamp_utc <= day_end,
+            )
+            .all()
+        )
+        if db_rows:
+            entries = [{"tokens_deducted": float(r.tokens_deducted or 0)} for r in db_rows]
+    except Exception:
+        pass
+    if not entries:
+        with _deduction_logs_lock:
+            entries = [e for e in _deduction_logs if e.get("user_id") == user_id and (e.get("timestamp") or "").startswith(date)]
+    if not entries:
+        raise HTTPException(status_code=404, detail=f"No deduction entries for user_id={user_id} and date={date}")
+    total_add_back = sum(e.get("tokens_deducted", 0) for e in entries)
+    row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="User has no token balance row.")
+    row.tokens_remaining = float(row.tokens_remaining or 0) + total_add_back
+    db.commit()
+    _admin_audit(admin_user.email or "", "deduction_rollback", {"user_id": user_id, "date": date, "tokens_added_back": total_add_back})
+    return {"status": "success", "user_id": user_id, "date": date, "tokens_added_back": total_add_back, "new_tokens_remaining": float(row.tokens_remaining)}
+
+
+# --- Admin: System health ---
+@app.get("/admin/health")
+async def admin_health(_: models.User = Depends(get_admin_user)):
+    """Basic health: Redis and DB connectivity."""
+    health: Dict[str, Any] = {"redis": "unknown", "db": "unknown"}
+    try:
+        redis = await asyncio.wait_for(get_redis(), timeout=2.0)
+        await redis.ping()
+        health["redis"] = "ok"
+    except Exception as e:
+        health["redis"] = f"error: {type(e).__name__}"
+    try:
+        db = database.SessionLocal()
+        db.execute(text("SELECT 1"))
+        db.close()
+        health["db"] = "ok"
+    except Exception as e:
+        health["db"] = f"error: {type(e).__name__}"
+    return health
+
+
+@app.get("/admin/logs/errors", response_model=List[ApiFailureOut])
+async def admin_logs_errors(
+    limit: int = Query(100, ge=1, le=200),
+    _: models.User = Depends(get_admin_user),
+):
+    """Error log (same as api-failures). Filter by severity not implemented; use limit."""
+    raw = await _get_api_failures(limit=limit)
+    return [ApiFailureOut(id=e["id"], ts=e["ts"], context=e["context"], user_id=e.get("user_id"), error=e["error"]) for e in raw]
+
+
+# --- Admin: API Keys ---
+def _mask_key(key: str) -> str:
+    if not key or len(key) < 9:
+        return "****"
+    return key[:4] + "****" + key[-4:]
+
+
+@app.get("/admin/api-keys", response_model=List[AdminApiKeyRow])
+def admin_list_api_keys(
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    users = db.query(models.User).all()
+    out = []
+    for u in users:
+        vault = db.query(models.APIVault).filter(models.APIVault.user_id == u.id).first()
+        has_keys = vault is not None
+        key_masked = None
+        last_tested_at = None
+        if vault:
+            try:
+                keys = vault.get_keys()
+                key_masked = _mask_key((keys.get("bfx_key") or "")[:20])
+            except Exception:
+                key_masked = "****"
+            if getattr(vault, "last_tested_at", None):
+                last_tested_at = vault.last_tested_at.isoformat() + "Z"
+        out.append(AdminApiKeyRow(user_id=u.id, email=u.email or "", has_keys=has_keys, key_masked=key_masked, last_tested_at=last_tested_at))
+    return out
+
+
+@app.get("/admin/api-keys/{user_id}", response_model=AdminApiKeyRow)
+def admin_get_api_key(
+    user_id: int,
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="User has no API keys.")
+    key_masked = "****"
+    last_tested_at = None
+    try:
+        keys = vault.get_keys()
+        key_masked = _mask_key((keys.get("bfx_key") or "")[:20])
+    except Exception:
+        pass
+    if getattr(vault, "last_tested_at", None):
+        last_tested_at = vault.last_tested_at.isoformat() + "Z"
+    return AdminApiKeyRow(user_id=user_id, email=user.email or "", has_keys=True, key_masked=key_masked, last_tested_at=last_tested_at)
+
+
+@app.post("/admin/api-keys/{user_id}/reset")
+def admin_reset_api_keys(
+    user_id: int,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="User has no API keys.")
+    db.delete(vault)
+    db.commit()
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user and hasattr(user, "bot_status"):
+        user.bot_status = "stopped"
+        db.commit()
+    _admin_audit(admin_user.email or "", "api_keys_reset", {"user_id": user_id})
+    return {"ok": True, "message": "API keys cleared."}
+
+
+# --- Admin: Subscriptions / Plan ---
+@app.get("/admin/subscriptions", response_model=List[AdminUserOut])
+def admin_list_subscriptions(
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    return list_users(_=_, db=db)
+
+
+@app.get("/admin/subscriptions/{user_id}")
+def admin_get_subscription(
+    user_id: int,
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {
+        "user_id": user_id,
+        "email": user.email,
+        "plan_tier": user.plan_tier or "trial",
+        "pro_expiry": user.pro_expiry.isoformat() if user.pro_expiry else None,
+    }
+
+
+class SetPlanBody(BaseModel):
+    plan_tier: str
+    lending_limit: Optional[float] = None
+    rebalance_interval: Optional[int] = None
+
+
+class ExtendExpiryBody(BaseModel):
+    days: int  # positive = extend, negative = reduce
+
+
+@app.post("/admin/users/{user_id}/set-plan", response_model=AdminUserOut)
+def admin_set_plan(
+    user_id: int,
+    body: SetPlanBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    user.plan_tier = (body.plan_tier or "trial").lower()
+    if body.lending_limit is not None:
+        user.lending_limit = body.lending_limit
+    if body.rebalance_interval is not None:
+        user.rebalance_interval = body.rebalance_interval
+    db.commit()
+    db.refresh(user)
+    _admin_audit(admin_user.email or "", "set_plan", {"user_id": user_id, "plan_tier": user.plan_tier})
+    balances = {b.user_id: float(b.tokens_remaining or 0) for b in db.query(models.UserTokenBalance).all()}
+    return _admin_user_out(user, balances.get(user.id))
+
+
+@app.post("/admin/users/{user_id}/extend-expiry")
+def admin_extend_expiry(
+    user_id: int,
+    body: ExtendExpiryBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    from datetime import timedelta
+    base = user.pro_expiry or datetime.utcnow()
+    user.pro_expiry = base + timedelta(days=body.days)
+    if user.pro_expiry < datetime.utcnow():
+        user.status = "expired"
+    else:
+        user.status = "active"
+    db.commit()
+    _admin_audit(admin_user.email or "", "extend_expiry", {"user_id": user_id, "days": body.days, "new_expiry": user.pro_expiry.isoformat()})
+    return {"ok": True, "pro_expiry": user.pro_expiry.isoformat()}
+
+
+def _admin_user_out(user: models.User, tokens_remaining: Optional[float]) -> AdminUserOut:
+    return AdminUserOut(
+        id=user.id,
+        email=user.email or "",
+        plan_tier=user.plan_tier or "trial",
+        lending_limit=float(user.lending_limit or 0),
+        rebalance_interval=int(user.rebalance_interval or 0),
+        pro_expiry=user.pro_expiry,
+        status=user.status or "active",
+        tokens_remaining=tokens_remaining,
+        bot_status=getattr(user, "bot_status", None) or "stopped",
+        created_at=user.created_at.isoformat() + "Z" if getattr(user, "created_at", None) and user.created_at else None,
+    )
+
+
+# --- Admin: Bulk token adjustment ---
+@app.post("/admin/tokens/bulk-add")
+def admin_bulk_add_tokens(
+    body: BulkTokenBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    success = 0
+    failed = 0
+    for item in body.items:
+        if item.amount <= 0:
+            failed += 1
+            continue
+        row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == item.user_id).first()
+        if row:
+            row.tokens_remaining = float(row.tokens_remaining or 0) + item.amount
+        else:
+            db.add(models.UserTokenBalance(user_id=item.user_id, tokens_remaining=item.amount))
+        db.commit()
+        success += 1
+        _admin_audit(admin_user.email or "", "bulk_token_add", {"user_id": item.user_id, "amount": item.amount})
+    return {"ok": True, "success_count": success, "failed_count": failed}
+
+
+# --- Admin: USDT Credit ---
+def _get_or_create_usdt_credit(user_id: int, db: Session) -> models.UserUsdtCredit:
+    row = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == user_id).first()
+    if row:
+        return row
+    row = models.UserUsdtCredit(user_id=user_id, usdt_credit=0.0, total_earned=0.0, total_withdrawn=0.0)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.get("/admin/usdt-credit", response_model=List[AdminUsdtCreditRow])
+def admin_list_usdt_credit(
+    user_id: Optional[int] = Query(None),
+    email: Optional[str] = Query(None),
+    min_balance: Optional[float] = Query(None),
+    max_balance: Optional[float] = Query(None),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    q = db.query(models.User, models.UserUsdtCredit).outerjoin(
+        models.UserUsdtCredit, models.User.id == models.UserUsdtCredit.user_id
+    )
+    if user_id is not None:
+        q = q.filter(models.User.id == user_id)
+    if email:
+        q = q.filter(models.User.email.ilike(f"%{email}%"))
+    rows = q.all()
+    pending_by_user: Dict[int, float] = {}
+    for r in db.query(models.WithdrawalRequest).filter(models.WithdrawalRequest.status == "pending").all():
+        pending_by_user[r.user_id] = pending_by_user.get(r.user_id, 0.0) + float(r.amount)
+    out = []
+    for user, uc in rows:
+        if uc is None:
+            uc_balance, uc_earned, uc_withdrawn = 0.0, 0.0, 0.0
+        else:
+            uc_balance = float(uc.usdt_credit or 0)
+            uc_earned = float(uc.total_earned or 0)
+            uc_withdrawn = float(uc.total_withdrawn or 0)
+        locked = pending_by_user.get(user.id, 0.0)
+        if min_balance is not None and uc_balance < min_balance:
+            continue
+        if max_balance is not None and uc_balance > max_balance:
+            continue
+        out.append(AdminUsdtCreditRow(user_id=user.id, email=user.email or "", usdt_credit=uc_balance, total_earned=uc_earned, total_withdrawn=uc_withdrawn, locked_pending=locked))
+    return out
+
+
+@app.get("/admin/usdt-credit/{user_id}")
+def admin_get_usdt_credit(
+    user_id: int,
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    uc = _get_or_create_usdt_credit(user_id, db)
+    return {
+        "user_id": user_id,
+        "email": user.email,
+        "usdt_credit": float(uc.usdt_credit or 0),
+        "total_earned": float(uc.total_earned or 0),
+        "total_withdrawn": float(uc.total_withdrawn or 0),
+    }
+
+
+@app.post("/admin/usdt-credit/{user_id}/adjust")
+def admin_adjust_usdt_credit(
+    user_id: int,
+    body: UsdtAdjustBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    uc = _get_or_create_usdt_credit(user_id, db)
+    new_balance = float(uc.usdt_credit or 0) + body.amount
+    if new_balance < 0:
+        raise HTTPException(status_code=400, detail="Resulting balance cannot be negative.")
+    uc.usdt_credit = new_balance
+    if body.amount > 0:
+        uc.total_earned = float(uc.total_earned or 0) + body.amount
+    else:
+        uc.total_withdrawn = float(uc.total_withdrawn or 0) + abs(body.amount)
+    db.add(models.UsdtHistory(user_id=user_id, amount=body.amount, reason="admin_adjust", admin_email=admin_user.email))
+    db.commit()
+    _admin_audit(admin_user.email or "", "usdt_adjust", {"user_id": user_id, "amount": body.amount, "new_balance": new_balance})
+    return {"ok": True, "usdt_credit": new_balance}
+
+
+@app.get("/admin/usdt-history")
+def admin_usdt_history(
+    user_id: Optional[int] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    q = db.query(models.UsdtHistory).order_by(models.UsdtHistory.created_at.desc())
+    if user_id is not None:
+        q = q.filter(models.UsdtHistory.user_id == user_id)
+    rows = q.limit(limit).all()
+    return [
+        {"id": r.id, "user_id": r.user_id, "amount": r.amount, "reason": r.reason, "created_at": r.created_at.isoformat() + "Z" if r.created_at else None, "admin_email": r.admin_email}
+        for r in rows
+    ]
+
+
+# --- Admin: Withdrawals (and /admin/usdt-withdrawals alias) ---
+@app.get("/admin/withdrawals", response_model=List[WithdrawalRow])
+@app.get("/admin/usdt-withdrawals", response_model=List[WithdrawalRow])
+def admin_list_withdrawals(
+    status: Optional[str] = Query(None),
+    user_id: Optional[int] = Query(None),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    q = db.query(models.WithdrawalRequest).order_by(models.WithdrawalRequest.created_at.desc())
+    if status:
+        q = q.filter(models.WithdrawalRequest.status == status)
+    if user_id is not None:
+        q = q.filter(models.WithdrawalRequest.user_id == user_id)
+    rows = q.all()
+    out = []
+    for r in rows:
+        user = db.query(models.User).filter(models.User.id == r.user_id).first()
+        out.append(WithdrawalRow(
+            id=r.id,
+            user_id=r.user_id,
+            email=user.email if user else "",
+            amount=r.amount,
+            address=r.address,
+            status=r.status,
+            created_at=r.created_at.isoformat() + "Z" if r.created_at else None,
+            processed_at=r.processed_at.isoformat() + "Z" if r.processed_at else None,
+            processed_by=getattr(r, "processed_by", None),
+            rejection_note=getattr(r, "rejection_note", None),
+        ))
+    return out
+
+
+@app.post("/admin/withdrawals/{wid}/approve")
+@app.post("/admin/usdt-withdrawals/{wid}/approve")
+def admin_approve_withdrawal(
+    wid: int,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    w = db.query(models.WithdrawalRequest).filter(models.WithdrawalRequest.id == wid).first()
+    if not w or w.status != "pending":
+        raise HTTPException(status_code=404, detail="Withdrawal not found or not pending.")
+    uc = _get_or_create_usdt_credit(w.user_id, db)
+    if float(uc.usdt_credit or 0) < w.amount:
+        raise HTTPException(status_code=400, detail="Insufficient USDT credit.")
+    uc.usdt_credit = float(uc.usdt_credit or 0) - w.amount
+    uc.total_withdrawn = float(uc.total_withdrawn or 0) + w.amount
+    w.status = "approved"
+    w.processed_at = datetime.utcnow()
+    w.processed_by = admin_user.email
+    db.add(models.UsdtHistory(user_id=w.user_id, amount=-w.amount, reason="withdrawal", admin_email=admin_user.email))
+    db.commit()
+    _admin_audit(admin_user.email or "", "withdrawal_approve", {"withdrawal_id": wid, "user_id": w.user_id, "amount": w.amount})
+    return {"ok": True}
+
+
+class WithdrawalRejectBody(BaseModel):
+    rejection_note: Optional[str] = None
+
+
+@app.post("/admin/withdrawals/{wid}/reject")
+@app.post("/admin/usdt-withdrawals/{wid}/reject")
+def admin_reject_withdrawal(
+    wid: int,
+    body: Optional[WithdrawalRejectBody] = None,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    w = db.query(models.WithdrawalRequest).filter(models.WithdrawalRequest.id == wid).first()
+    if not w or w.status != "pending":
+        raise HTTPException(status_code=404, detail="Withdrawal not found or not pending.")
+    w.status = "rejected"
+    w.processed_at = datetime.utcnow()
+    w.processed_by = admin_user.email
+    if body and body.rejection_note is not None:
+        w.rejection_note = (body.rejection_note or "")[:500]
+    db.commit()
+    _admin_audit(admin_user.email or "", "withdrawal_reject", {"withdrawal_id": wid, "user_id": w.user_id, "rejection_note": getattr(w, "rejection_note", None)})
+    return {"ok": True}
+
+
+# --- User: Referral & USDT Credit (spec endpoints) ---
+@app.get("/api/v1/user/referral-info")
+def user_referral_info(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """Referral code, upline info, total USDT Credit earned from referrals, saved USDT address."""
+    uc = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == current_user.id).first()
+    total_earned = float(uc.total_earned or 0) if uc else 0.0
+    level1 = db.query(models.User).filter(models.User.id == current_user.referred_by).first() if current_user.referred_by else None
+    return {
+        "referral_code": current_user.referral_code or "",
+        "referrer_id": current_user.referred_by,
+        "referrer_email": level1.email if level1 else None,
+        "total_usdt_credit_earned": total_earned,
+        "usdt_withdraw_address": (current_user.usdt_withdraw_address or "").strip() or None,
+    }
+
+
+@app.get("/api/v1/user/referral-reward-history")
+def user_referral_reward_history(
+    limit: int = Query(50, ge=1, le=200),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """List reward history for current user (earned as L1/L2/L3 from downline token burns)."""
+    rows = (
+        db.query(models.ReferralReward, models.User)
+        .join(models.User, models.User.id == models.ReferralReward.burning_user_id)
+        .filter(
+            (models.ReferralReward.level_1_id == current_user.id)
+            | (models.ReferralReward.level_2_id == current_user.id)
+            | (models.ReferralReward.level_3_id == current_user.id)
+        )
+        .order_by(models.ReferralReward.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    out = []
+    for rr, burning_user in rows:
+        if rr.level_1_id == current_user.id:
+            amount = float(rr.reward_l1 or 0)
+            level = 1
+        elif rr.level_2_id == current_user.id:
+            amount = float(rr.reward_l2 or 0)
+            level = 2
+        else:
+            amount = float(rr.reward_l3 or 0)
+            level = 3
+        if amount <= 0:
+            continue
+        out.append({
+            "created_at": rr.created_at.isoformat() + "Z" if rr.created_at else None,
+            "burning_user_id": rr.burning_user_id,
+            "downline_email": burning_user.email if burning_user else None,
+            "amount_usdt_credit": amount,
+            "level": level,
+        })
+    return out
+
+
+@app.get("/api/v1/user/usdt-credit")
+def user_usdt_credit(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """Current USDT Credit balance and locked (pending withdrawal) amount."""
+    uc = _get_or_create_usdt_credit(current_user.id, db)
+    balance = float(uc.usdt_credit or 0)
+    pending_rows = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+        models.WithdrawalRequest.status == "pending",
+    ).all()
+    locked = sum(float(r.amount) for r in pending_rows)
+    return {
+        "usdt_credit": balance,
+        "locked_pending": locked,
+        "available": max(0.0, balance - locked),
+    }
+
+
+class UsdtWithdrawAddressBody(BaseModel):
+    address: str
+
+
+@app.post("/api/v1/user/usdt-withdraw-address")
+def user_save_usdt_address(
+    body: UsdtWithdrawAddressBody,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """Save/update USDT withdrawal address (TRC20 or ERC20 format)."""
+    addr = (body.address or "").strip()
+    if not _validate_usdt_address(addr):
+        raise HTTPException(status_code=400, detail="Invalid USDT wallet address (TRC20 T... or ERC20 0x...).")
+    current_user.usdt_withdraw_address = addr
+    db.commit()
+    return {"ok": True, "address": addr}
+
+
+class UsdtWithdrawBody(BaseModel):
+    amount: float
+
+
+@app.post("/api/v1/user/usdt-withdraw")
+def user_usdt_withdraw(
+    body: UsdtWithdrawBody,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """Submit withdrawal request (uses saved address; one pending at a time; locks funds)."""
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive.")
+    row = db.query(models.AdminSetting).filter(models.AdminSetting.key == "withdrawal_enabled").first()
+    if row and row.value and row.value.lower() == "false":
+        raise HTTPException(status_code=403, detail="Withdrawals are currently disabled.")
+    min_row = db.query(models.AdminSetting).filter(models.AdminSetting.key == "min_withdrawal_usdt").first()
+    min_usdt = float(min_row.value) if min_row and min_row.value else 1.0
+    if body.amount < min_usdt:
+        raise HTTPException(status_code=400, detail=f"Minimum withdrawal is {min_usdt} USDT Credit.")
+    addr = (current_user.usdt_withdraw_address or "").strip()
+    if not addr or not _validate_usdt_address(addr):
+        raise HTTPException(status_code=400, detail="Please set a valid USDT withdrawal address in Settings first.")
+    uc = _get_or_create_usdt_credit(current_user.id, db)
+    pending_rows = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+        models.WithdrawalRequest.status == "pending",
+    ).all()
+    locked = sum(float(r.amount) for r in pending_rows)
+    available = float(uc.usdt_credit or 0) - locked
+    if body.amount > available:
+        raise HTTPException(status_code=400, detail="Insufficient available USDT Credit (including locked pending).")
+    existing = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+        models.WithdrawalRequest.status == "pending",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You already have a pending withdrawal. Wait for admin approval or rejection.")
+    w = models.WithdrawalRequest(user_id=current_user.id, amount=body.amount, address=addr, status="pending")
+    db.add(w)
+    db.commit()
+    db.refresh(w)
+    return {"ok": True, "id": w.id, "status": "pending", "amount": body.amount, "to_address": addr}
+
+
+@app.get("/api/v1/user/usdt-withdraw-history")
+def user_usdt_withdraw_history(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """List user's withdrawal requests (status, amount, date, address, rejection_note)."""
+    rows = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+    ).order_by(models.WithdrawalRequest.created_at.desc()).limit(100).all()
+    return [
+        {
+            "id": r.id,
+            "amount": r.amount,
+            "to_address": r.address,
+            "status": r.status,
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+            "processed_at": r.processed_at.isoformat() + "Z" if r.processed_at else None,
+            "rejection_note": r.rejection_note,
+        }
+        for r in rows
+    ]
+
+
+# --- User: Create withdrawal request (legacy; uses body address) ---
+class WithdrawalRequestCreate(BaseModel):
+    amount: float
+    address: Optional[str] = None
+
+
+@app.post("/api/v1/withdrawal-request")
+def create_withdrawal_request(
+    body: WithdrawalRequestCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """User submits a withdrawal request. Uses saved address if body.address omitted; one pending at a time."""
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive.")
+    row = db.query(models.AdminSetting).filter(models.AdminSetting.key == "withdrawal_enabled").first()
+    if row and row.value and row.value.lower() == "false":
+        raise HTTPException(status_code=403, detail="Withdrawals are currently disabled.")
+    min_row = db.query(models.AdminSetting).filter(models.AdminSetting.key == "min_withdrawal_usdt").first()
+    min_usdt = float(min_row.value) if min_row and min_row.value else 1.0
+    if body.amount < min_usdt:
+        raise HTTPException(status_code=400, detail=f"Minimum withdrawal is {min_usdt} USDT.")
+    addr = (body.address or "").strip() if body.address else (current_user.usdt_withdraw_address or "").strip()
+    if not addr:
+        raise HTTPException(status_code=400, detail="Set USDT withdrawal address in Settings or provide address.")
+    if not _validate_usdt_address(addr):
+        raise HTTPException(status_code=400, detail="Invalid USDT wallet address.")
+    uc = _get_or_create_usdt_credit(current_user.id, db)
+    pending_rows = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+        models.WithdrawalRequest.status == "pending",
+    ).all()
+    locked = sum(float(r.amount) for r in pending_rows)
+    available = float(uc.usdt_credit or 0) - locked
+    if body.amount > available:
+        raise HTTPException(status_code=400, detail="Insufficient available USDT Credit.")
+    existing = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+        models.WithdrawalRequest.status == "pending",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="One pending withdrawal at a time.")
+    w = models.WithdrawalRequest(user_id=current_user.id, amount=body.amount, address=addr, status="pending")
+    db.add(w)
+    db.commit()
+    db.refresh(w)
+    return {"ok": True, "id": w.id, "status": "pending", "amount": body.amount}
+
+
+# --- Admin: Referrals ---
+@app.get("/admin/referrals", response_model=List[ReferralRow])
+def admin_list_referrals(
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    users = db.query(models.User).all()
+    uc_map = {uc.user_id: float(uc.total_earned or 0) for uc in db.query(models.UserUsdtCredit).all()}
+    ref_earnings = {}  # placeholder: no separate referral_earnings column; use 0 or usdt from referrals
+    out = []
+    for u in users:
+        referrer = db.query(models.User).filter(models.User.id == u.referred_by).first() if u.referred_by else None
+        downline = db.query(models.User).filter(models.User.referred_by == u.id).count()
+        out.append(ReferralRow(
+            user_id=u.id,
+            email=u.email or "",
+            referral_code=u.referral_code,
+            referrer_id=u.referred_by,
+            referrer_email=referrer.email if referrer else None,
+            downline_count=downline,
+            referral_earnings=ref_earnings.get(u.id, 0.0),
+        ))
+    return out
+
+
+@app.get("/admin/referrals/{user_id}/tree", response_model=ReferralTreeOut)
+def admin_referral_tree(
+    user_id: int,
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    level1 = db.query(models.User).filter(models.User.id == user.referred_by).first() if user.referred_by else None
+    level2 = db.query(models.User).filter(models.User.id == level1.referred_by).first() if level1 and level1.referred_by else None
+    level3 = db.query(models.User).filter(models.User.id == level2.referred_by).first() if level2 and level2.referred_by else None
+    downline = db.query(models.User).filter(models.User.referred_by == user_id).count()
+    return ReferralTreeOut(
+        user_id=user_id,
+        email=user.email or "",
+        level1_upline={"user_id": level1.id, "email": level1.email} if level1 else None,
+        level2_upline={"user_id": level2.id, "email": level2.email} if level2 else None,
+        level3_upline={"user_id": level3.id, "email": level3.email} if level3 else None,
+        downline_count=downline,
+    )
+
+
+# --- Admin: Notifications ---
+@app.post("/admin/notifications/send")
+def admin_send_notification(
+    body: NotificationSendBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    n = models.AdminNotification(
+        title=body.title,
+        content=body.content or "",
+        type=body.type or "info",
+        target_user_id=body.target_user_id,
+    )
+    db.add(n)
+    db.commit()
+    _admin_audit(admin_user.email or "", "notification_send", {"title": body.title, "target_user_id": body.target_user_id})
+    return {"ok": True, "id": n.id}
+
+
+@app.get("/admin/notifications")
+def admin_list_notifications(
+    limit: int = Query(50, ge=1, le=200),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    rows = db.query(models.AdminNotification).order_by(models.AdminNotification.created_at.desc()).limit(limit).all()
+    return [
+        {"id": r.id, "title": r.title, "content": r.content, "type": r.type, "target_user_id": r.target_user_id, "created_at": r.created_at.isoformat() + "Z" if r.created_at else None}
+        for r in rows
+    ]
+
+
+# --- Admin: Settings ---
+def _get_setting(db: Session, key: str, default: str) -> str:
+    row = db.query(models.AdminSetting).filter(models.AdminSetting.key == key).first()
+    return row.value if row and row.value else default
+
+
+@app.get("/admin/settings", response_model=List[AdminSettingOut])
+def admin_get_settings(
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    keys = [
+        "registration_bonus_tokens", "min_withdrawal_usdt", "daily_deduction_utc_hour",
+        "bot_auto_start", "referral_system_enabled", "withdrawal_enabled", "maintenance_mode",
+    ]
+    out = []
+    for k in keys:
+        default = {"registration_bonus_tokens": "150", "min_withdrawal_usdt": "10", "daily_deduction_utc_hour": "10",
+                   "bot_auto_start": "true", "referral_system_enabled": "true", "withdrawal_enabled": "true", "maintenance_mode": "false"}.get(k, "")
+        out.append(AdminSettingOut(key=k, value=_get_setting(db, k, default)))
+    return out
+
+
+@app.post("/admin/settings/update")
+def admin_update_settings(
+    body: AdminSettingsUpdateBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    updates = []
+    if body.registration_bonus_tokens is not None:
+        updates.append(("registration_bonus_tokens", str(body.registration_bonus_tokens)))
+    if body.min_withdrawal_usdt is not None:
+        updates.append(("min_withdrawal_usdt", str(body.min_withdrawal_usdt)))
+    if body.daily_deduction_utc_hour is not None:
+        updates.append(("daily_deduction_utc_hour", str(body.daily_deduction_utc_hour)))
+    if body.bot_auto_start is not None:
+        updates.append(("bot_auto_start", "true" if body.bot_auto_start else "false"))
+    if body.referral_system_enabled is not None:
+        updates.append(("referral_system_enabled", "true" if body.referral_system_enabled else "false"))
+    if body.withdrawal_enabled is not None:
+        updates.append(("withdrawal_enabled", "true" if body.withdrawal_enabled else "false"))
+    if body.maintenance_mode is not None:
+        updates.append(("maintenance_mode", "true" if body.maintenance_mode else "false"))
+    for k, v in updates:
+        row = db.query(models.AdminSetting).filter(models.AdminSetting.key == k).first()
+        if row:
+            row.value = v
+        else:
+            db.add(models.AdminSetting(key=k, value=v))
+    db.commit()
+    _admin_audit(admin_user.email or "", "settings_update", {"keys": [u[0] for u in updates]})
+    return {"ok": True}
+
+
+# --- Admin: Persistent audit logs (with filters and export) ---
+@app.get("/admin/audit-logs", response_model=List[AdminAuditEntry])
+def admin_audit_logs(
+    limit: int = Query(100, ge=1, le=500),
+    action: Optional[str] = Query(None),
+    email: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Persistent audit log with filters. Falls back to in-memory if DB table empty."""
+    try:
+        q = db.query(models.AdminAuditLog).order_by(models.AdminAuditLog.ts.desc())
+        if action:
+            q = q.filter(models.AdminAuditLog.action == action)
+        if email:
+            q = q.filter(models.AdminAuditLog.email.ilike(f"%{email}%"))
+        if start_date:
+            q = q.filter(models.AdminAuditLog.ts >= datetime.fromisoformat(start_date.replace("Z", "+00:00")))
+        if end_date:
+            q = q.filter(models.AdminAuditLog.ts <= datetime.fromisoformat(end_date.replace("Z", "+00:00")))
+        rows = q.limit(limit).all()
+        if rows:
+            return [
+                AdminAuditEntry(ts=r.ts.isoformat() + "Z" if r.ts else "", email=r.email or "", action=r.action or "", detail=json.loads(r.detail) if r.detail else {})
+                for r in rows
+            ]
+    except Exception:
+        pass
+    with _admin_audit_lock:
+        copy = list(_admin_audit_logs)
+    copy.reverse()
+    if action:
+        copy = [e for e in copy if e.get("action") == action]
+    if email:
+        copy = [e for e in copy if email.lower() in (e.get("email") or "").lower()]
+    if start_date:
+        copy = [e for e in copy if (e.get("ts") or "") >= start_date]
+    if end_date:
+        copy = [e for e in copy if (e.get("ts") or "") <= end_date]
+    return [AdminAuditEntry(**e) for e in copy[:limit]]
+
+
+@app.get("/admin/audit-logs/export")
+def admin_audit_logs_export(
+    action: Optional[str] = Query(None),
+    email: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    limit: int = Query(1000, ge=1, le=5000),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Export audit logs as CSV."""
+    import csv
+    import io
+    try:
+        q = db.query(models.AdminAuditLog).order_by(models.AdminAuditLog.ts.desc())
+        if action:
+            q = q.filter(models.AdminAuditLog.action == action)
+        if email:
+            q = q.filter(models.AdminAuditLog.email.ilike(f"%{email}%"))
+        if start_date:
+            q = q.filter(models.AdminAuditLog.ts >= datetime.fromisoformat(start_date.replace("Z", "+00:00")))
+        if end_date:
+            q = q.filter(models.AdminAuditLog.ts <= datetime.fromisoformat(end_date.replace("Z", "+00:00")))
+        rows = q.limit(limit).all()
+        if not rows:
+            with _admin_audit_lock:
+                copy = list(_admin_audit_logs)
+            copy.reverse()
+            rows = [type("R", (), {"ts": e.get("ts"), "email": e.get("email"), "action": e.get("action"), "detail": json.dumps(e.get("detail") or {})})() for e in copy[:limit]]
+    except Exception:
+        with _admin_audit_lock:
+            copy = list(_admin_audit_logs)
+        copy.reverse()
+        rows = [type("R", (), {"ts": e.get("ts"), "email": e.get("email"), "action": e.get("action"), "detail": json.dumps(e.get("detail") or {})})() for e in copy[:limit]]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["ts", "email", "action", "detail"])
+    for r in rows:
+        ts = r.ts.isoformat() + "Z" if hasattr(r.ts, "isoformat") else r.ts
+        w.writerow([ts, getattr(r, "email", ""), getattr(r, "action", ""), getattr(r, "detail", "")])
+    buf.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=audit_logs.csv"})
+
+
+# --- Admin: User detail overview ---
+@app.get("/admin/users/{user_id}/overview", response_model=UserOverviewOut)
+def admin_user_overview(
+    user_id: int,
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
+    created_at = getattr(user, "created_at", None) or (vault.created_at if vault else None)
+    user_dict = {
+        "id": user.id,
+        "email": user.email,
+        "plan_tier": user.plan_tier or "trial",
+        "pro_expiry": user.pro_expiry.isoformat() if user.pro_expiry else None,
+        "status": user.status,
+        "bot_status": getattr(user, "bot_status", None),
+        "referral_code": user.referral_code,
+        "referred_by": user.referred_by,
+        "created_at": created_at.isoformat() + "Z" if created_at else None,
+    }
+    token_balance = None
+    tb = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    if tb:
+        token_balance = {"tokens_remaining": tb.tokens_remaining, "purchased_tokens": tb.purchased_tokens, "last_gross_usd_used": tb.last_gross_usd_used, "updated_at": tb.updated_at.isoformat() + "Z" if tb.updated_at else None}
+    usdt_credit = None
+    uc = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == user_id).first()
+    if uc:
+        usdt_credit = {"usdt_credit": uc.usdt_credit, "total_earned": uc.total_earned, "total_withdrawn": uc.total_withdrawn}
+    profit_snapshot = None
+    ps = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    if ps:
+        profit_snapshot = {"gross_profit_usd": ps.gross_profit_usd, "daily_gross_profit_usd": ps.daily_gross_profit_usd, "updated_at": ps.updated_at.isoformat() + "Z" if ps.updated_at else None}
+    referral = None
+    level1 = db.query(models.User).filter(models.User.id == user.referred_by).first() if user.referred_by else None
+    downline = db.query(models.User).filter(models.User.referred_by == user_id).count()
+    referral = {"referrer_id": user.referred_by, "referrer_email": level1.email if level1 else None, "downline_count": downline}
+    api_key_status = None
+    vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
+    if vault:
+        api_key_status = {"has_keys": True, "last_tested_at": vault.last_tested_at.isoformat() + "Z" if getattr(vault, "last_tested_at", None) else None}
+    else:
+        api_key_status = {"has_keys": False}
+    withdrawals = []
+    for w in db.query(models.WithdrawalRequest).filter(models.WithdrawalRequest.user_id == user_id).order_by(models.WithdrawalRequest.created_at.desc()).limit(50).all():
+        withdrawals.append({"id": w.id, "amount": w.amount, "address": w.address, "status": w.status, "created_at": w.created_at.isoformat() + "Z" if w.created_at else None, "processed_at": w.processed_at.isoformat() + "Z" if w.processed_at else None, "rejection_note": getattr(w, "rejection_note", None)})
+    deduction_history = []
+    with _deduction_logs_lock:
+        deduction_history = [e for e in _deduction_logs if e.get("user_id") == user_id][-50:]
+    audit_entries = []
+    try:
+        for a in db.query(models.AdminAuditLog).order_by(models.AdminAuditLog.ts.desc()).limit(200).all():
+            if not a.detail:
+                continue
+            try:
+                d = json.loads(a.detail)
+                if d.get("user_id") == user_id:
+                    audit_entries.append({"ts": a.ts.isoformat() + "Z" if a.ts else "", "email": a.email, "action": a.action, "detail": d})
+            except Exception:
+                if str(user_id) in (a.detail or ""):
+                    audit_entries.append({"ts": a.ts.isoformat() + "Z" if a.ts else "", "email": a.email, "action": a.action, "detail": a.detail})
+    except Exception:
+        pass
+    audit_entries = audit_entries[:30]
+    return UserOverviewOut(user=user_dict, token_balance=token_balance, usdt_credit=usdt_credit, profit_snapshot=profit_snapshot, referral=referral, api_key_status=api_key_status, withdrawals=withdrawals, deduction_history=deduction_history, audit_entries=audit_entries)
 
 
 def _aggregate_lent_per_currency(credits_data: Any) -> dict:

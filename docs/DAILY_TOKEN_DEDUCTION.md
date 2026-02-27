@@ -1,33 +1,36 @@
-# Daily Token Deduction (10:15 UTC)
+# Daily Token Deduction & Bitfinex Account Changes
 
-Automated daily token deduction based on **daily gross profit** (stored at 09:40 UTC from the Bitfinex refresh).
+## Rules
 
-## Flow
+1. **Daily deduction (10:15 UTC)** runs every day for all users with a vault and token balance, even if they change their Bitfinex account mid-cycle.
+2. **Unit clarity**: Gross Profit = USD; Used Tokens = `int(gross_profit_usd × 10)` (see `TOKENS_PER_USDT_GROSS = 10` in `main.py`).
+3. **Account change**: When a user updates their Bitfinex API keys (new account), the 09:40 UTC job detects it via `api_vault.keys_updated_at`, resets the daily baseline to the new account’s gross profit, and logs/alert; 10:15 UTC then deducts only from the new account’s daily gross (1:1 USD → tokens deducted). Existing token balance is preserved.
 
-1. **09:40 UTC** – Daily gross profit refresh runs; for each user, `user_profit_snapshot.daily_gross_profit_usd` is set (delta from previous day’s cumulative gross).
-2. **10:15 UTC** – Deduction job runs:
-   - For each user with `user_token_balance` and `user_profit_snapshot`:
-   - If `daily_gross_profit_usd <= 0`: skip (no deduction).
-   - Else: `new_tokens_remaining = tokens_remaining - daily_gross_profit` (1:1 USD); clamp to 0.
-   - Update `last_gross_usd_used` and `updated_at`.
+## Consistency (Gross Profit vs Used Tokens)
 
-## Behaviour
+- **Formula**: `used_tokens = int(gross_profit_usd × TOKENS_PER_USDT_GROSS)` with `TOKENS_PER_USDT_GROSS = 10`.
+- **Example**: Gross Profit 72.20 USD → Used Tokens = 722 (not 739). A snapshot showing 73.9 USD would yield 739 tokens; that indicates the snapshot needs reconciliation to the actual Margin Funding Payment sum (e.g. 72.20).
 
-- **Formula**: `new_tokens_remaining = tokens_remaining - daily_gross_profit`; if &lt; 0 then set to 0.
-- **Negative profit**: no deduction (balance unchanged).
-- **Retries**: 3 attempts, 5 minutes apart, on failure.
-- **Alerts**: On final failure, an entry is added to the API failures list; if `DEDUCTION_ALERT_WEBHOOK_URL` is set (Slack incoming webhook), a message is sent (requires `aiohttp` if using webhook).
+## Reconciling snapshot to correct Gross Profit (e.g. 72.20)
 
-## Database
+To fix a user’s displayed Gross Profit and Used Tokens to match the real Bitfinex data (e.g. sum of Margin Funding Payment entries = 72.201934 → 72.20):
 
-- **Migration**: Run `migrations/add_daily_gross_to_user_profit_snapshot.sql` to add `daily_gross_profit_usd`, `last_daily_cumulative_gross`, `last_daily_snapshot_date` to `user_profit_snapshot`.
+```bash
+python scripts/seed_gross_profit_snapshot.py choiwangai@gmail.com 72.20
+```
 
-## Running
+After this, Gross Profit shows 72.20 USD and Used Tokens = 722.
 
-- **With API**: When `uvicorn main:app` is running, the 10:15 job is scheduled in-process; no cron needed.
-- **Without API**: Run `python scripts/daily_token_deduction_1015utc.py` via cron at 10:15 UTC, e.g. `15 10 * * * cd /path/to/buildnew && python scripts/daily_token_deduction_1015utc.py`.
+## Persisted logs and admin API
 
-## Tests
+- **Deduction logs** are stored in the `deduction_log` table (user_id, email, timestamp_utc, daily_gross_profit_usd, tokens_deducted, total_used_tokens, account_switch_note, etc.).
+- **GET /admin/deduction/logs** returns persisted entries (with optional `start_date` / `end_date`). Each entry includes `email` and `account_switch_note` when the user had switched Bitfinex accounts.
+- **Account switch**: When the 09:40 job detects a new `keys_updated_at`, it sets `account_switch_note` on the snapshot and logs a warning; admins are alerted via `DEDUCTION_ALERT_WEBHOOK_URL` (e.g. Slack).
 
-- **Unit**: `python tests/test_daily_token_deduction.py` or `pytest tests/test_daily_token_deduction.py -v`
-- **Cases**: (1) tokens_remaining=2000, profit=500 → 1500; (2) tokens_remaining=100, profit=200 → 0; (3) profit=-50 → unchanged.
+## Migration
+
+Run once to add deduction_log and vault/snapshot tracking columns:
+
+```bash
+psql $DATABASE_URL -f migrations/add_deduction_log_and_vault_tracking.sql
+```

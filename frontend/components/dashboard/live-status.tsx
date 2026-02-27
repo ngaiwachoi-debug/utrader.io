@@ -265,6 +265,7 @@ export function LiveStatus() {
         credentials: "include",
         headers,
       })
+      const data = res.ok ? await res.json().catch(() => ({})) : null
       if (!res.ok) {
         const text = await res.text()
         let msg: string
@@ -275,8 +276,13 @@ export function LiveStatus() {
           msg = text || t("liveStatus.startFailed")
         }
         setError(msg || t("liveStatus.startFailed"))
+      } else {
+        // Fixed: immediate UI update from response (no wait for 5s polling)
+        if (data && (data.bot_status === "running" || data.bot_status === "starting")) {
+          setBotActive(true)
+        }
+        await refreshStatus()
       }
-      await refreshStatus()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")
@@ -306,8 +312,11 @@ export function LiveStatus() {
         } catch {
           setError(text || "Stop failed")
         }
+      } else {
+        // Fixed: immediate UI update (backend now returns success for idempotent stop)
+        setBotActive(false)
+        await refreshStatus()
       }
-      await refreshStatus()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")

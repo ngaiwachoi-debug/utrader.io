@@ -1,5 +1,21 @@
 # Verify Dev Login and Gross Profit (68.93)
 
+## 0. Ensure the correct backend is running (Gross Profit DB fallback)
+
+The Gross Profit fix (DB fallback, `?source=db`, seed script) only works when the **backend process** is the one from this project. If you see **$0.00** in Profit Center:
+
+1. **Check which backend is serving**  
+   Open in the browser: `http://127.0.0.1:8000/api/version`  
+   - If you see `{"version":"gross-profit-db-fallback","source_db_supported":true}` → this backend has the fix; proceed to seed/refresh.  
+   - If you get connection refused or a different response → start the backend from this project (see §2) and ensure nothing else is using port 8000.
+
+2. **Seed the snapshot** (so DB has a value to show after restart/cache miss):  
+   From project root: `python scripts/seed_gross_profit_snapshot.py choiwangai@gmail.com 72.20`
+
+3. **Restart the backend** from the **project root** (e.g. `python -m uvicorn main:app --host 127.0.0.1 --port 8000`) so it loads the code that reads the snapshot and supports `?source=db`.
+
+4. Reload Profit Center; Gross Profit should show the persisted value (e.g. 72.20).
+
 ## 1. Backend env
 
 In the same terminal (or `.env` in project root) where you start the API, set:

@@ -157,7 +157,33 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         setLendingDataSource(src === "cache" ? "cache" : "live")
         setLendingRateLimited(lendingRes.headers.get("X-Rate-Limited") === "true")
         if (lendingRes.ok) {
-          const lendingData = await lendingRes.json()
+          let lendingData = await lendingRes.json()
+          // #region agent log
+          fetch("http://127.0.0.1:7697/ingest/7a2fbc25-d656-4da7-8da6-75a34780f2db", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "1b4a77" }, body: JSON.stringify({ sessionId: "1b4a77", location: "profit-center.tsx:lending", message: "lending response", data: { userId, status: lendingRes.status, gross_profit: lendingData?.gross_profit, hypothesisId: "H4" }, timestamp: Date.now() }) }).catch(() => {})
+          // #endregion
+          // If normal response has zero gross profit, try persisted DB snapshot (works even when cache/API returned 0)
+          if (typeof lendingData?.gross_profit === "number" && lendingData.gross_profit === 0) {
+            const localBase = "http://127.0.0.1:8000"
+            let dbRes = await fetch(`${API_BASE}/stats/${userId}/lending?source=db`, { credentials: "include", headers })
+            let dbData = dbRes.ok ? await dbRes.json() : null
+            // #region agent log (db_snapshot_gross in body = backend has new code and DB read value)
+            fetch("http://127.0.0.1:7697/ingest/7a2fbc25-d656-4da7-8da6-75a34780f2db", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "1b4a77" }, body: JSON.stringify({ sessionId: "1b4a77", location: "profit-center.tsx:source=db", message: "source=db response", data: { userId, status: dbRes.status, gross_profit: dbData?.gross_profit, db_snapshot_gross: dbData?.db_snapshot_gross }, timestamp: Date.now() }) }).catch(() => {})
+            // #endregion
+            // If API_BASE returned 0 and is not local, try local backend (correct backend may be on 127.0.0.1:8000)
+            const apiBaseNorm = API_BASE.replace(/\/$/, "")
+            if ((!dbData?.gross_profit || dbData.gross_profit === 0) && apiBaseNorm !== localBase) {
+              const localRes = await fetch(`${localBase}/stats/${userId}/lending?source=db`, { credentials: "include", headers })
+              const localData = localRes.ok ? await localRes.json() : null
+              if (localData?.gross_profit > 0) {
+                dbData = localData
+                dbRes = localRes
+              }
+            }
+            if (dbRes.ok && typeof dbData?.gross_profit === "number" && dbData.gross_profit > 0) {
+              lendingData = dbData
+              setLendingDataSource("db")
+            }
+          }
           setGrossProfit(typeof lendingData.gross_profit === "number" ? lendingData.gross_profit : 0)
           setNetProfit(typeof lendingData.net_profit === "number" ? lendingData.net_profit : 0)
           const trades = Array.isArray(lendingData.trades) ? lendingData.trades : []
@@ -257,7 +283,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
           className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground hover:bg-secondary disabled:opacity-50"
         >
           <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-          {refreshing ? "Refreshing…" : "Refresh from server"}
+          {refreshing ? "Refreshing…" : "Refresh Gross Profit"}
         </button>
       </div>
 

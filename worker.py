@@ -72,6 +72,7 @@ async def run_bot_task(ctx, user_id: int):
         vault = user.vault
         keys = vault.get_keys()
 
+        # State sync: DB bot_status so /bot-stats and UI show Running immediately
         try:
             user.bot_status = "running"
             db.commit()
@@ -145,6 +146,7 @@ async def run_bot_task(ctx, user_id: int):
     except Exception as e:
         print(f"[CRITICAL] Worker failed for User {user_id}: {e}")
     finally:
+        # State sync: always set stopped on exit (abort, cancel, or exception) so Start/Stop buttons stay in sync
         try:
             u = db.query(models.User).filter(models.User.id == user_id).first()
             if u and hasattr(u, "bot_status"):
@@ -156,6 +158,7 @@ async def run_bot_task(ctx, user_id: int):
         print(f"[INFO] Cleanup complete for User {user_id}")
 
 
+# Migrated to NEW Upstash Redis; REDIS_URL from .env (rediss:// only, no old account references)
 REDIS_URL = os.getenv("REDIS_URL")
 
 

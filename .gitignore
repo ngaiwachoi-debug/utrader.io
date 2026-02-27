@@ -1,4 +1,7 @@
-﻿node_modules/
+node_modules/
 .next/
 .env*
 __pycache__/
+.deduction_test_out.txt
+debug*.log
+.cursor/debug*.log
