@@ -4,6 +4,13 @@ from datetime import date, datetime, timedelta, timezone
 import json
 import logging
 import os
+
+try:
+    from dotenv import load_dotenv
+    _root_dir = os.path.dirname(os.path.abspath(__file__))
+    load_dotenv(os.path.join(_root_dir, ".env"))
+except ImportError:
+    pass
 import re
 import secrets
 import threading
@@ -11,43 +18,13 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# #region agent log
-def _debug_log(location: str, message: str, data: dict) -> None:
-    try:
-        import sys
-        import urllib.request
-        payload = {"sessionId": "1b4a77", "location": location, "message": message, "data": data, "timestamp": int(datetime.utcnow().timestamp() * 1000)}
-        line = json.dumps(payload) + "\n"
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-1b4a77.log")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(line)
-        sys.stderr.write("[debug] " + line)
-        # Also send to ingest so backend logs appear in session log file
-        def _post():
-            try:
-                body = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(
-                    "http://127.0.0.1:7697/ingest/7a2fbc25-d656-4da7-8da6-75a34780f2db",
-                    data=body,
-                    headers={"Content-Type": "application/json", "X-Debug-Session-Id": "1b4a77"},
-                    method="POST",
-                )
-                urllib.request.urlopen(req, timeout=2)
-            except Exception:
-                pass
-        t = threading.Thread(target=_post, daemon=True)
-        t.start()
-    except Exception:
-        pass
-# #endregion
-
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from arq import create_pool
@@ -64,6 +41,8 @@ from services.bitfinex_service import BitfinexManager, hash_bitfinex_id
 from services import bitfinex_cache
 from services.daily_token_deduction import run_daily_token_deduction
 from services import ledger_cache as ledger_cache_svc
+from services import token_ledger_service as token_ledger_svc
+from services.referral_rewards import apply_referral_rewards_on_purchase
 
 # Single daily Bitfinex API call at 10:00 UTC (no API before 10:00). One retry at 10:10 if data incomplete.
 DAILY_API_FETCH_UTC_HOUR = 10
@@ -453,9 +432,9 @@ def _reconcile_cached_vs_fresh(db: Session, user_id: int, date_utc: date, dry_ru
             snap.last_cached_daily_gross_usd = None
             db.commit()
         return True
-    before = float(token_row.tokens_remaining or 0)
+    before = token_ledger_svc.get_tokens_remaining(db, user_id)
     if diff_usd > 0:
-        # Undercharged: would deduct extra
+        # Undercharged: deduct extra
         after = max(0.0, before - diff_usd)
         log_msg = "Reconciliation: Charged extra %.6f tokens (undercharged)" % diff_usd
         if dry_run:
@@ -470,9 +449,10 @@ def _reconcile_cached_vs_fresh(db: Session, user_id: int, date_utc: date, dry_ru
                 )
                 return False
             return True
-        token_row.tokens_remaining = after
+        token_ledger_svc.deduct_tokens(db, user_id, diff_usd)
+        after = before - diff_usd
     else:
-        # Overcharged: refund
+        # Overcharged: refund (add)
         after = before + abs(diff_usd)
         log_msg = "Reconciliation: Refunded %.6f tokens (overcharged)" % abs(diff_usd)
         if dry_run:
@@ -481,12 +461,12 @@ def _reconcile_cached_vs_fresh(db: Session, user_id: int, date_utc: date, dry_ru
                 get_trace_id(), user_id, date_utc, log_msg, before, after,
             )
             return True
-        token_row.tokens_remaining = after
-    token_row.updated_at = datetime.utcnow()
+        token_ledger_svc.add_tokens(db, user_id, abs(diff_usd), "deduction_rollback")
     if hasattr(snap, "last_cached_daily_gross_usd"):
         snap.last_cached_daily_gross_usd = None
     db.commit()
-    logger.info("trace_id=%s | user_id=%s date_utc=%s %s balance_before=%.2f balance_after=%.2f", get_trace_id(), user_id, date_utc, log_msg, before, float(token_row.tokens_remaining))
+    after_actual = token_ledger_svc.get_tokens_remaining(db, user_id)
+    logger.info("trace_id=%s | user_id=%s date_utc=%s %s balance_before=%.2f balance_after=%.2f", get_trace_id(), user_id, date_utc, log_msg, before, after_actual)
     return True
 
 
@@ -669,9 +649,8 @@ async def _run_late_fee_scheduler() -> None:
                 total_fee = base_fee * (1 + fee_pct)
                 user_id = snap.user_id
                 email = getattr(user, "email", None) or ""
-                before = float(token_row.tokens_remaining or 0)
-                after = max(0.0, before - total_fee)
-                token_row.tokens_remaining = after
+                before = token_ledger_svc.get_tokens_remaining(db, user_id)
+                after = token_ledger_svc.deduct_tokens(db, user_id, total_fee)
                 token_row.updated_at = datetime.utcnow()
                 # Do NOT reset invalid_key_days; only reset when user restores API key (POST /api/keys)
                 db.commit()
@@ -890,6 +869,20 @@ async def lifespan(app: FastAPI):
             logger.info("Connected to Redis server at %s (queue + deduction)", host)
         except Exception as e:
             logger.warning("Redis startup check failed (queue may be unavailable): %s", e)
+    # Debug: confirm backend DB sees user_profit_snapshot for user 2 (same SELECT as get_lending_stats)
+    try:
+        db = database.SessionLocal()
+        try:
+            row = db.execute(
+                text("SELECT gross_profit_usd FROM user_profit_snapshot WHERE user_id = :uid"),
+                {"uid": 2},
+            ).fetchone()
+            val = float(row[0]) if row and row[0] is not None else None
+            logger.info("Startup check user_profit_snapshot user_id=2: %s", val if val is not None else "no row")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("Startup check user_profit_snapshot failed: %s", e)
     # 09:00 UTC ledger cache; 10:00 API fetch; 10:30 deduction; 11:15 catch-up; 12:00 late fee; 23:00 reconciliation
     ledger_cache_task = asyncio.create_task(_run_09_00_ledger_cache_scheduler())
     scheduler_task = asyncio.create_task(_run_daily_gross_profit_scheduler())
@@ -933,8 +926,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="utrader.io API", lifespan=lifespan)
 
 # NextAuth JWT (from /api/auth/token). Set NEXTAUTH_SECRET in env to enable.
-NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
-
+# Strip so CRLF/whitespace from .env don't break JWT verification.
+NEXTAUTH_SECRET = (os.getenv("NEXTAUTH_SECRET", "") or "").strip()
 
 # --- CORS: explicitly allow frontend origins so browser can reach backend ---
 # Include 3003 so when frontend runs on 3003 (e.g. port 3000 occupied), API calls are allowed
@@ -1003,27 +996,9 @@ REGISTRATION_TOKEN_AWARD = 150
 def _award_registration_tokens(user_id: int, db: Session) -> None:
     """
     Award REGISTRATION_TOKEN_AWARD (150) tokens to a new user on registration.
-    Uses user_token_balance: create row if missing, else add 150 to tokens_remaining.
-    Logs for audit; on failure logs error and does not raise (do not block registration).
     """
-    # Trial initial_credit is 100; we award 150, so store +50 as purchased so formula (initial_credit + purchased - used) = 150.
-    registration_bonus_purchased = max(0, REGISTRATION_TOKEN_AWARD - FREE_TIER_TOKENS)  # 50
     try:
-        row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-        now = datetime.utcnow()
-        if row is None:
-            row = models.UserTokenBalance(
-                user_id=user_id,
-                tokens_remaining=float(REGISTRATION_TOKEN_AWARD),
-                last_gross_usd_used=0.0,
-                purchased_tokens=float(registration_bonus_purchased),
-                updated_at=now,
-            )
-            db.add(row)
-        else:
-            row.tokens_remaining = float(row.tokens_remaining or 0) + REGISTRATION_TOKEN_AWARD
-            row.purchased_tokens = float(row.purchased_tokens or 0) + registration_bonus_purchased
-            row.updated_at = now
+        token_ledger_svc.add_tokens(db, user_id, float(REGISTRATION_TOKEN_AWARD), "registration")
         db.commit()
         logger.info("token_award user_id=%s amount=%s reason=registration", user_id, REGISTRATION_TOKEN_AWARD)
     except Exception as e:
@@ -1061,7 +1036,6 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
     new_user = models.User(
         email=email,
         plan_tier="trial",
-        lending_limit=250_000.0,
         rebalance_interval=30,
         referred_by=referrer.id if referrer else None,
     )
@@ -1241,16 +1215,14 @@ class CalculationBreakdown(BaseModel):
 
 class UserStatusResponse(BaseModel):
     plan_tier: str
-    lending_limit: float
     rebalance_interval: int
     trial_remaining_days: Optional[int]
-    utilization_pct: float
-    used_amount: float
     tokens_remaining: Optional[float] = None
     tokens_used: int = 0
     initial_token_credit: int = 0
     gross_profit_usd: float = 0.0
-    pro_expiry: Optional[str] = None  # ISO 8601 UTC; null for free plan (Settings "Next Renewal Date")
+    pro_expiry: Optional[str] = None  # ISO 8601 UTC; null for free plan
+    created_at: Optional[str] = None  # ISO 8601 UTC; users.created_at (Settings "Registration Date")
 
 
 class TokenBalanceResponse(BaseModel):
@@ -1261,9 +1233,10 @@ class TokenBalanceResponse(BaseModel):
 
 
 class TokenBalanceV1Response(BaseModel):
-    """GET /api/v1/users/me/token-balance: real-time balance from user_token_balance (after daily deduction)."""
+    """GET /api/v1/users/me/token-balance: remaining = total_tokens_added - total_tokens_deducted."""
     tokens_remaining: float
-    purchased_tokens: float
+    total_tokens_added: float
+    total_tokens_deducted: float
     last_gross_usd_used: float
     updated_at: Optional[str] = None  # UTC ISO 8601; null if never updated
 
@@ -1297,7 +1270,6 @@ class AdminUserOut(BaseModel):
     id: int
     email: str
     plan_tier: str
-    lending_limit: float
     rebalance_interval: int
     pro_expiry: Optional[datetime]
     status: str
@@ -1321,7 +1293,6 @@ class DeductionLogEntry(BaseModel):
 class AdminUserUpdate(BaseModel):
     plan_tier: Optional[str] = None
     pro_expiry: Optional[datetime] = None
-    lending_limit: Optional[float] = None
     rebalance_interval: Optional[int] = None
     tokens_remaining: Optional[float] = None
 
@@ -1535,15 +1506,31 @@ def _detail_invalid_keys(msg: str) -> str:
 
 # --- Connect Exchange (Bitfinex) ---
 async def _trigger_bot_start_after_keys_saved(user_id: int, db: Session) -> None:
-    """Auto-start bot after API keys are saved (idempotent). Does not raise; logs on failure."""
+    """Auto-start bot after first API key save only. Plan C: desired_state; tokens > 0 (Q6)."""
     try:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            return
+        if hasattr(user, "bot_desired_state"):
+            user.bot_desired_state = "running"
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            return
+        legacy = _get_token_balance_legacy(db, user_id)
+        tokens_remaining = float(legacy[0]) if legacy else 0.0
+        if tokens_remaining <= 0:
+            logger.info("bot_auto_start_after_keys_saved user_id=%s tokens_remaining=%s skip enqueue", user_id, tokens_remaining)
+            return
         redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
         enqueued = await _enqueue_bot_task(redis, user_id)
-        if enqueued:
-            user = db.query(models.User).filter(models.User.id == user_id).first()
-            if user and hasattr(user, "bot_status"):
+        if enqueued and user and hasattr(user, "bot_status"):
+            try:
                 user.bot_status = "starting"
                 db.commit()
+            except Exception:
+                db.rollback()
     except Exception as e:
         logger.warning("bot_auto_start_after_keys_saved user_id=%s error=%s", user_id, e)
         try:
@@ -1558,12 +1545,18 @@ async def connect_exchange(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
+    vault_existing = (
+        db.query(models.APIVault)
+        .filter(models.APIVault.user_id == current_user.id)
+        .first()
+    )
     balance, result = await _validate_and_save_bitfinex_keys(
         payload, current_user, db
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
-    await _trigger_bot_start_after_keys_saved(current_user.id, db)
+    if not vault_existing:
+        await _trigger_bot_start_after_keys_saved(current_user.id, db)
     return {
         "status": "success",
         "message": result.get("message", "Exchange connected and trial activated."),
@@ -1650,25 +1643,38 @@ async def get_my_token_balance_v1(
         raise
 
     try:
+        # Prefer legacy raw SQL so we work when ORM columns (total_tokens_added etc.) don't exist
+        legacy = _get_token_balance_legacy_full(db, current_user.id)
+        if legacy is not None:
+            tokens_remaining = legacy["tokens_remaining"]
+            purchased = legacy["purchased_tokens"]
+            total_added = purchased
+            total_deducted = max(0.0, purchased - tokens_remaining)
+            logger.info("token_balance_api user_id=%s tokens_remaining=%s (legacy)", current_user.id, tokens_remaining)
+            return TokenBalanceV1Response(
+                tokens_remaining=tokens_remaining,
+                total_tokens_added=total_added,
+                total_tokens_deducted=total_deducted,
+                last_gross_usd_used=legacy["last_gross_usd_used"],
+                updated_at=legacy["updated_at"],
+            )
         row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == current_user.id).first()
         if not row:
-            logger.info("token_balance_api user_id=%s tokens_remaining=0 (no row)", current_user.id)
-            return TokenBalanceV1Response(
-                tokens_remaining=0.0,
-                purchased_tokens=0.0,
-                last_gross_usd_used=0.0,
-                updated_at=None,
-            )
+            logger.warning("token_balance_api user_id=%s: token balance row not found", current_user.id)
+            raise HTTPException(status_code=404, detail="Token balance not found. Please contact support.")
         tokens_remaining = float(row.tokens_remaining or 0)
-        purchased_tokens = float(row.purchased_tokens or 0)
-        last_gross_usd_used = float(row.last_gross_usd_used or 0)
+        purchased = float(row.purchased_tokens or 0)
+        total_added = purchased
+        total_deducted = max(0.0, purchased - tokens_remaining)
+        last_gross_usd_used = float(row.last_gross_usd_used) if row.last_gross_usd_used is not None else 0.0
         updated_at = None
         if getattr(row, "updated_at", None) and row.updated_at:
             updated_at = row.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ")
         logger.info("token_balance_api user_id=%s tokens_remaining=%s", current_user.id, tokens_remaining)
         return TokenBalanceV1Response(
             tokens_remaining=tokens_remaining,
-            purchased_tokens=purchased_tokens,
+            total_tokens_added=total_added,
+            total_tokens_deducted=total_deducted,
             last_gross_usd_used=last_gross_usd_used,
             updated_at=updated_at,
         )
@@ -1676,7 +1682,7 @@ async def get_my_token_balance_v1(
         raise
     except Exception as e:
         logger.exception("token_balance_api user_id=%s error=%s", current_user.id, e)
-        raise HTTPException(status_code=500, detail="Internal error retrieving token balance.")
+        raise HTTPException(status_code=500, detail=f"Internal error retrieving token balance: {str(e)}")
 
 
 @app.post("/api/keys/test")
@@ -1980,7 +1986,6 @@ async def _validate_and_save_bitfinex_keys(payload, current_user, db):
     db.add(trial_row)
 
     current_user.plan_tier = "trial"
-    current_user.lending_limit = 250_000.0
     current_user.rebalance_interval = 30  # free tier: 30-min rebalancing
     # No 7-day trial; free tier uses token credit (100 tokens)
 
@@ -2029,6 +2034,11 @@ class DevLoginAsInput(BaseModel):
     email: str
 
 
+class DevCreateTestUserInput(BaseModel):
+    email: str
+    referral_code: Optional[str] = None  # optional; if set, user.referred_by = referrer with this code
+
+
 def _get_or_create_user_by_email(email: str, db: Session) -> models.User:
     """Find user by email, or create one (dev only). Email must be @gmail.com."""
     email = (email or "").strip().lower()
@@ -2040,7 +2050,6 @@ def _get_or_create_user_by_email(email: str, db: Session) -> models.User:
     new_user = models.User(
         email=email,
         plan_tier="trial",
-        lending_limit=250_000.0,
         rebalance_interval=30,
     )
     new_user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
@@ -2060,6 +2069,9 @@ async def connect_exchange_by_email(
     if os.getenv("ALLOW_DEV_CONNECT") != "1":
         raise HTTPException(status_code=404, detail="Not available.")
     user = _get_or_create_user_by_email(payload.email, db)
+    vault_existing = (
+        db.query(models.APIVault).filter(models.APIVault.user_id == user.id).first()
+    )
     keys_payload = APIKeysInput(
         bfx_key=payload.bfx_key,
         bfx_secret=payload.bfx_secret,
@@ -2068,7 +2080,8 @@ async def connect_exchange_by_email(
     balance, result = await _validate_and_save_bitfinex_keys(keys_payload, user, db)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
-    await _trigger_bot_start_after_keys_saved(user.id, db)
+    if not vault_existing:
+        await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
         "status": "success",
         "message": result.get("message", "Exchange connected and trial activated."),
@@ -2097,6 +2110,7 @@ async def connect_exchange_update_by_email(
     if err:
         raise HTTPException(status_code=400, detail=err.get("error", "Validation failed."))
     vault = db.query(models.APIVault).filter(models.APIVault.user_id == user.id).first()
+    vault_existing = vault is not None
     if not vault:
         vault = models.APIVault(user_id=user.id)
         db.add(vault)
@@ -2113,7 +2127,8 @@ async def connect_exchange_update_by_email(
         if hasattr(snap, "reconciliation_completed"):
             snap.reconciliation_completed = False
         db.commit()
-    await _trigger_bot_start_after_keys_saved(user.id, db)
+    if not vault_existing:
+        await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
         "status": "success",
         "message": "API keys updated.",
@@ -2124,17 +2139,23 @@ async def connect_exchange_update_by_email(
 
 @app.post("/dev/create-test-user")
 async def dev_create_test_user(
-    payload: DevLoginAsInput,
+    payload: DevCreateTestUserInput,
     db: Session = Depends(database.get_db),
 ):
-    """Dev-only: create a new user by email and award registration tokens (no API keys). For E2E testing. Set ALLOW_DEV_CONNECT=1."""
+    """Dev-only: create a new user by email and award registration tokens (no API keys). Optional referral_code links to referrer. Set ALLOW_DEV_CONNECT=1."""
     if os.getenv("ALLOW_DEV_CONNECT") != "1":
         raise HTTPException(status_code=404, detail="Not available.")
     email = (payload.email or "").strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="email required.")
     user = _get_or_create_user_by_email(email, db)
-    return {"user_id": user.id, "email": user.email}
+    if payload.referral_code:
+        referrer = db.query(models.User).filter(models.User.referral_code == payload.referral_code.strip()).first()
+        if referrer:
+            user.referred_by = referrer.id
+            db.commit()
+            db.refresh(user)
+    return {"user_id": user.id, "email": user.email, "referral_code": user.referral_code}
 
 
 @app.post("/dev/login-as")
@@ -2171,6 +2192,9 @@ async def connect_exchange_by_user(
     user = db.query(models.User).filter(models.User.id == payload.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
+    vault_existing = (
+        db.query(models.APIVault).filter(models.APIVault.user_id == user.id).first()
+    )
     keys_payload = APIKeysInput(
         bfx_key=payload.bfx_key,
         bfx_secret=payload.bfx_secret,
@@ -2179,7 +2203,8 @@ async def connect_exchange_by_user(
     balance, result = await _validate_and_save_bitfinex_keys(keys_payload, user, db)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
-    await _trigger_bot_start_after_keys_saved(user.id, db)
+    if not vault_existing:
+        await _trigger_bot_start_after_keys_saved(user.id, db)
     return {
         "status": "success",
         "message": result.get("message", "Exchange connected and trial activated."),
@@ -2191,14 +2216,21 @@ async def connect_exchange_by_user(
 ARQ_JOB_PREFIX = "arq:job:"
 ARQ_RESULT_PREFIX = "arq:result:"
 ARQ_QUEUE_NAME = "arq:queue"
+# When stop_bot calls job.abort(), ARQ adds job_id to this sorted set. Clear it on re-enqueue so the new job is not "aborted before start".
+try:
+    from arq.constants import abort_jobs_ss as ARQ_ABORT_SS
+except ImportError:
+    ARQ_ABORT_SS = "arq:abort"
 
 
 async def _clear_arq_job_keys(redis, job_id: str) -> None:
-    """Remove ARQ keys for job_id so the same id can be enqueued again (idempotent start after stop)."""
+    """Remove ARQ keys for job_id so the same id can be enqueued again (idempotent start after stop).
+    Must also remove job_id from the abort sorted set (arq:abort), otherwise the worker sees it as aborted and logs 'aborted before start'."""
     try:
         await redis.delete(ARQ_JOB_PREFIX + job_id)
         await redis.delete(ARQ_RESULT_PREFIX + job_id)
         await redis.zrem(ARQ_QUEUE_NAME, job_id)
+        await redis.zrem(ARQ_ABORT_SS, job_id)
     except Exception:
         pass
 
@@ -2222,15 +2254,28 @@ async def start_bot(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
-    if not current_user.vault:
-        raise HTTPException(status_code=404, detail="API keys not found.")
-
-    if current_user.pro_expiry and current_user.pro_expiry < datetime.utcnow():
-        current_user.status = "expired"
+    # Plan C: set desired state first
+    if hasattr(current_user, "bot_desired_state"):
+        current_user.bot_desired_state = "running"
+    try:
         db.commit()
-        raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
-
+    except Exception:
+        db.rollback()
+    legacy = _get_token_balance_legacy(db, current_user.id)
+    tokens_remaining = float(legacy[0]) if legacy else 0.0
+    if tokens_remaining <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": "Insufficient tokens to run the bot.",
+                "code": "INSUFFICIENT_TOKENS",
+                "redirect_tab": "subscription",
+            },
+        )
     status_before = getattr(current_user, "bot_status", None) or "stopped"
+    desired = getattr(current_user, "bot_desired_state", None) or "stopped"
+    if status_before in ("running", "starting") and desired == "running":
+        return {"status": "success", "message": "Bot already running or queued.", "bot_status": status_before}
     redis = await get_redis_or_raise()
     enqueued = await _enqueue_bot_task(redis, current_user.id)
     if enqueued:
@@ -2243,7 +2288,6 @@ async def start_bot(
             db.rollback()
             logger.warning("start_bot user_id=%s db commit failed", current_user.id)
             return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
-    # Idempotent: already running or queued — return success, no duplicate job
     try:
         current_user.bot_status = current_user.bot_status or "starting"
         db.commit()
@@ -2260,21 +2304,40 @@ async def stop_bot(
 ):
     from arq.jobs import Job
     status_before = getattr(current_user, "bot_status", None) or "stopped"
-    redis = await get_redis_or_raise()
-    job_id = f"bot_user_{current_user.id}"
-    job = Job(job_id=job_id, redis=redis)
+    # Plan C: DB first so UI never stuck on "starting" if job aborted before start
+    try:
+        user = db.query(models.User).filter(models.User.id == current_user.id).first()
+        if user:
+            if hasattr(user, "bot_desired_state"):
+                user.bot_desired_state = "stopped"
+            if hasattr(user, "bot_status"):
+                user.bot_status = "stopped"
+            db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     aborted = False
     try:
-        aborted = await job.abort()
-        await _clear_arq_job_keys(redis, job_id)  # so next Start enqueues reliably
-    except Exception:
+        redis = await get_redis_or_raise()
+        job_id = f"bot_user_{current_user.id}"
+        job = Job(job_id=job_id, redis=redis)
+        aborted = await job.abort(timeout=5)
         await _clear_arq_job_keys(redis, job_id)
-    try:
-        current_user.bot_status = "stopped"
-        db.commit()
+    except asyncio.TimeoutError:
+        try:
+            redis = await get_redis_or_raise()
+            await _clear_arq_job_keys(redis, f"bot_user_{current_user.id}")
+        except Exception:
+            pass
+        logger.warning("stop_bot user_id=%s abort timed out (5s), cleared keys", current_user.id)
     except Exception:
-        db.rollback()
-    # Idempotent: always return success when bot is stopped (no orphaned jobs)
+        try:
+            redis = await get_redis_or_raise()
+            await _clear_arq_job_keys(redis, f"bot_user_{current_user.id}")
+        except Exception:
+            pass
     logger.info("stop_bot user_id=%s action=stop aborted=%s bot_status_before=%s bot_status_after=stopped", current_user.id, aborted, status_before)
     return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
 
@@ -2286,13 +2349,21 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user or not user.vault:
             raise HTTPException(status_code=404, detail="API keys not found.")
-
-        if user.pro_expiry and user.pro_expiry < datetime.utcnow():
-            user.status = "expired"
+        # Plan C: set desired state first; keep token check (Q2)
+        if hasattr(user, "bot_desired_state"):
+            user.bot_desired_state = "running"
+        try:
             db.commit()
-            raise HTTPException(status_code=402, detail="Subscription expired. Payment required.")
-
+        except Exception:
+            db.rollback()
+        legacy = _get_token_balance_legacy(db, user_id)
+        tokens_remaining = float(legacy[0]) if legacy else 0.0
+        if tokens_remaining <= 0:
+            raise HTTPException(status_code=400, detail="Insufficient tokens to run the bot.")
         status_before = getattr(user, "bot_status", None) or "stopped"
+        desired = getattr(user, "bot_desired_state", None) or "stopped"
+        if status_before in ("running", "starting") and desired == "running":
+            return {"status": "success", "message": "Bot already running or queued.", "bot_status": status_before}
         redis = await get_redis_or_raise()
         enqueued = await _enqueue_bot_task(redis, user.id)
         if enqueued:
@@ -2318,20 +2389,41 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
 @app.post("/stop-bot/{user_id}")
 async def stop_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
     from arq.jobs import Job
-    redis = await get_redis_or_raise()
-    job_id = f"bot_user_{user_id}"
-    job = Job(job_id=job_id, redis=redis)
     user = db.query(models.User).filter(models.User.id == user_id).first()
     status_before = getattr(user, "bot_status", None) if user else None
+    # Plan C: DB first (same logic as authenticated stop)
+    if user:
+        try:
+            if hasattr(user, "bot_desired_state"):
+                user.bot_desired_state = "stopped"
+            if hasattr(user, "bot_status"):
+                user.bot_status = "stopped"
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
     aborted = False
     try:
-        aborted = await job.abort()
+        redis = await get_redis_or_raise()
+        job_id = f"bot_user_{user_id}"
+        job = Job(job_id=job_id, redis=redis)
+        aborted = await job.abort(timeout=5)
         await _clear_arq_job_keys(redis, job_id)
+    except asyncio.TimeoutError:
+        try:
+            redis = await get_redis_or_raise()
+            await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+        except Exception:
+            pass
+        logger.warning("stop_bot_for_user user_id=%s abort timed out (5s), cleared keys", user_id)
     except Exception:
-        await _clear_arq_job_keys(redis, job_id)
-    if user and hasattr(user, "bot_status"):
-        user.bot_status = "stopped"
-        db.commit()
+        try:
+            redis = await get_redis_or_raise()
+            await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+        except Exception:
+            pass
     logger.info("stop_bot_for_user user_id=%s aborted=%s bot_status_before=%s bot_status_after=stopped", user_id, aborted, status_before)
     return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
 
@@ -2345,6 +2437,42 @@ def dev_run_daily_deduction(db: Session = Depends(database.get_db)):
     if err:
         raise HTTPException(status_code=500, detail=err)
     return {"status": "success", "count": len(log_entries), "entries": log_entries}
+
+
+@app.delete("/dev/users/by-email")
+def dev_delete_user_by_email(
+    email: str = Query(..., description="Email of test user to delete"),
+    db: Session = Depends(database.get_db),
+):
+    """Dev-only: delete a user by email and all related data (for test cleanup). Set ALLOW_DEV_CONNECT=1."""
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    email = (email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required.")
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user:
+        return {"deleted": False, "message": "User not found."}
+    uid = user.id
+    db.query(models.User).filter(models.User.referred_by == uid).update({models.User.referred_by: None})
+    db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == uid).delete()
+    db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == uid).delete()
+    db.query(models.UsdtHistory).filter(models.UsdtHistory.user_id == uid).delete()
+    db.query(models.ReferralReward).filter(
+        (models.ReferralReward.burning_user_id == uid) |
+        (models.ReferralReward.level_1_id == uid) |
+        (models.ReferralReward.level_2_id == uid) |
+        (models.ReferralReward.level_3_id == uid),
+    ).delete(synchronize_session=False)
+    if hasattr(models, "DeductionLog"):
+        db.query(models.DeductionLog).filter(models.DeductionLog.user_id == uid).delete()
+    db.query(models.WithdrawalRequest).filter(models.WithdrawalRequest.user_id == uid).delete()
+    db.query(models.PerformanceLog).filter(models.PerformanceLog.user_id == uid).delete()
+    db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).delete()
+    db.query(models.APIVault).filter(models.APIVault.user_id == uid).delete()
+    db.query(models.User).filter(models.User.id == uid).delete()
+    db.commit()
+    return {"deleted": True, "user_id": uid, "email": email}
 
 
 # --- Stats Endpoint ---
@@ -2364,17 +2492,20 @@ def get_stats(
     For now we interpret PerformanceLog.waroc as a gross PnL-style figure per user,
     aggregated over an optional date range.
     """
-    q = db.query(models.PerformanceLog).filter(models.PerformanceLog.user_id == user_id)
-    if start:
-        q = q.filter(models.PerformanceLog.timestamp >= start)
-    if end:
-        q = q.filter(models.PerformanceLog.timestamp <= end)
+    try:
+        q = db.query(models.PerformanceLog).filter(models.PerformanceLog.user_id == user_id)
+        if start:
+            q = q.filter(models.PerformanceLog.timestamp >= start)
+        if end:
+            q = q.filter(models.PerformanceLog.timestamp <= end)
 
-    logs = q.all()
-    gross = float(sum((log.waroc or 0.0) for log in logs)) if logs else 0.0
-    fake_fee = gross * 0.2
-    net = gross - fake_fee
-    return StatsResponse(gross_profit=gross, fake_fee=fake_fee, net_profit=net)
+        logs = q.all()
+        gross = float(sum((log.waroc or 0.0) for log in logs)) if logs else 0.0
+        fake_fee = gross * 0.2
+        net = gross - fake_fee
+        return StatsResponse(gross_profit=gross, fake_fee=fake_fee, net_profit=net)
+    except (ProgrammingError, SQLAlchemyError):
+        return StatsResponse(gross_profit=0.0, fake_fee=0.0, net_profit=0.0)
 
 
 @app.get("/stats/{user_id}/history")
@@ -2388,26 +2519,29 @@ def get_stats_history(
     Returns time-series for Gross Profit / True ROI charts from performance_logs (and trial/funding data).
     When tables are empty, returns [] so the frontend can show "No data yet".
     """
-    q = db.query(models.PerformanceLog).filter(models.PerformanceLog.user_id == user_id).order_by(models.PerformanceLog.timestamp.asc())
-    if start:
-        q = q.filter(models.PerformanceLog.timestamp >= start)
-    if end:
-        q = q.filter(models.PerformanceLog.timestamp <= end)
-    logs = q.all()
-    out = []
-    cumulative = 0.0
-    for log in logs:
-        ts = log.timestamp
-        date_str = ts.strftime("%m-%d") if ts else ""
-        waroc = float(log.waroc or 0.0)
-        cumulative += waroc
-        out.append({
-            "date": date_str,
-            "volume": float(log.total_assets or 0.0),
-            "interest": waroc,
-            "cumulative": cumulative,
-        })
-    return out
+    try:
+        q = db.query(models.PerformanceLog).filter(models.PerformanceLog.user_id == user_id).order_by(models.PerformanceLog.timestamp.asc())
+        if start:
+            q = q.filter(models.PerformanceLog.timestamp >= start)
+        if end:
+            q = q.filter(models.PerformanceLog.timestamp <= end)
+        logs = q.all()
+        out = []
+        cumulative = 0.0
+        for log in logs:
+            ts = log.timestamp
+            date_str = ts.strftime("%m-%d") if ts else ""
+            waroc = float(log.waroc or 0.0)
+            cumulative += waroc
+            out.append({
+                "date": date_str,
+                "volume": float(log.total_assets or 0.0),
+                "interest": waroc,
+                "cumulative": cumulative,
+            })
+        return out
+    except (ProgrammingError, SQLAlchemyError):
+        return []
 
 
 async def _fetch_all_funding_trades(
@@ -2780,15 +2914,14 @@ async def _daily_10_00_fetch_and_save(
 
 async def _gross_profit_from_ledgers(
     mgr: BitfinexManager,
-    start_ms: int,
+    start_ms: Optional[int] = None,
 ) -> tuple[float, float, Optional[str]]:
     """
-    Sum gross profit and fees from ledgers (Margin Funding Payment), same API as user script.
-    Fetches USD first (matches user script); then USDT, USDt. Skips a currency on error so one
-    failure (e.g. no USDT ledger) does not discard USD result.
-    Window: [registration (start_ms), end_ms]. Only entries with start_ms <= entry[3] <= end_ms are counted.
+    Sum gross profit and fees from ledgers (Margin Funding Payment), same API and logic as user script.
+    Fetches USD, USDT, USDt (limit=100 each). Skips a currency on error.
+    Matches user script: sum ALL Margin Funding Payment entries in the response (no start_ms/end_ms filter),
+    so the total matches Bitfinex /auth/r/ledgers/USD/hist when run manually (e.g. $86.54 for 6 entries).
     """
-    end_ms = int(datetime.utcnow().timestamp() * 1000)
     total_gross = 0.0
     total_fees = 0.0
     last_err: Optional[str] = None
@@ -2800,7 +2933,8 @@ async def _gross_profit_from_ledgers(
         if err:
             last_err = err
             continue
-        g, f = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms)
+        # No time filter: match user script which sums all positive Margin Funding Payment amounts in response
+        g, f = _gross_and_fees_from_ledger_entries(entries, start_ms=None, end_ms=None)
         total_gross += g
         total_fees += f
     return round(total_gross, 6), round(total_fees, 6), last_err if (last_err is not None and total_gross == 0 and total_fees == 0) else None
@@ -2811,9 +2945,6 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
     Compute gross profit from Bitfinex: prefer ledgers (Margin Funding Payment from registration to latest),
     then fall back to funding trades. Persist to user_profit_snapshot and return (result, rate_limited, trade_records).
     """
-    # #region agent log
-    _debug_log("main.py:_refresh_user_lending_snapshot", "entry", {"user_id": user_id, "hypothesisId": "H5"})
-    # #endregion
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user or not user.vault:
         return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0), False, []
@@ -2843,9 +2974,6 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
                 bitfinex_fee=round(fees_ledgers, 2),
                 net_profit=round(net_ledgers, 2),
             )
-            # #region agent log
-            _debug_log("main.py:_refresh_user_lending_snapshot", "ledgers path", {"user_id": user_id, "gross_profit": result.gross_profit, "hypothesisId": "H5"})
-            # #endregion
             if snap:
                 snap.gross_profit_usd = result.gross_profit
                 snap.net_profit_usd = result.net_profit
@@ -2857,23 +2985,6 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
                     gross_profit_usd=result.gross_profit,
                     net_profit_usd=result.net_profit,
                     bitfinex_fee_usd=result.bitfinex_fee,
-                ))
-            tier = (user.plan_tier or "trial").lower()
-            initial_credit = PLAN_TOKEN_CREDITS.get(tier, FREE_TIER_TOKENS)
-            token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-            purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
-            gross = float(result.gross_profit)
-            tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
-            tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
-            if token_row:
-                token_row.tokens_remaining = tokens_remaining
-                token_row.last_gross_usd_used = gross
-                token_row.updated_at = datetime.utcnow()
-            else:
-                db.add(models.UserTokenBalance(
-                    user_id=user_id,
-                    tokens_remaining=tokens_remaining,
-                    last_gross_usd_used=gross,
                 ))
             db.commit()
             return result, False, []
@@ -2966,9 +3077,6 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
             records = _trades_with_interest_usd(trades, ticker_prices)
 
     # Persist snapshot
-    # #region agent log
-    _debug_log("main.py:_refresh_user_lending_snapshot", "trades path persist", {"user_id": user_id, "gross_profit": result.gross_profit, "hypothesisId": "H3"})
-    # #endregion
     if snap:
         snap.gross_profit_usd = result.gross_profit
         snap.net_profit_usd = result.net_profit
@@ -2992,23 +3100,6 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
         if new_max is not None and hasattr(models.UserProfitSnapshot, "last_trade_mts"):
             new_row.last_trade_mts = new_max
         db.add(new_row)
-    tier = (user.plan_tier or "trial").lower()
-    initial_credit = PLAN_TOKEN_CREDITS.get(tier, FREE_TIER_TOKENS)
-    token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-    purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
-    gross = float(result.gross_profit)
-    tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
-    tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
-    if token_row:
-        token_row.tokens_remaining = tokens_remaining
-        token_row.last_gross_usd_used = gross
-        token_row.updated_at = datetime.utcnow()
-    else:
-        db.add(models.UserTokenBalance(
-            user_id=user_id,
-            tokens_remaining=tokens_remaining,
-            last_gross_usd_used=gross,
-        ))
     db.commit()
     return result, False, records
 
@@ -3024,146 +3115,153 @@ async def get_lending_stats(
     Gross profit = sum of interest from Bitfinex funding trades between registration date and latest.
     Net = Gross × (1 - 15%). Cached to respect Bitfinex rate limits.
     """
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user or not user.vault:
-        # #region agent log
-        _debug_log("main.py:get_lending_stats", "no user or vault", {"user_id": user_id, "has_user": user is not None, "has_vault": bool(user and getattr(user, "vault", None)), "hypothesisId": "H2"})
-        # #endregion
-        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
-
-    # Load DB snapshot once for cache-hit override and for fallback on miss (raw SQL so optional columns e.g. daily_gross_* are not required)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     try:
-        row = db.execute(
-            text("SELECT gross_profit_usd, net_profit_usd, bitfinex_fee_usd FROM user_profit_snapshot WHERE user_id = :uid"),
-            {"uid": user_id},
-        ).fetchone()
-    except Exception:
-        row = None
-    fallback_gross = float(row[0]) if row and row[0] is not None else None
-    fallback_net = float(row[1]) if row and row[1] is not None else None
-    fallback_fee = float(row[2]) if row and row[2] is not None else None
-    _debug_log("main.py:get_lending_stats", "snapshot state", {"user_id": user_id, "has_snap": row is not None, "fallback_gross": fallback_gross, "hypothesisId": "H2"})
+        # Load DB snapshot first (raw SQL only) so we can return it even if User model query fails (e.g. missing column)
+        try:
+            row = db.execute(
+                text("SELECT gross_profit_usd, net_profit_usd, bitfinex_fee_usd FROM user_profit_snapshot WHERE user_id = :uid"),
+                {"uid": user_id},
+            ).fetchone()
+        except Exception:
+            row = None
+        fallback_gross = float(row[0]) if row and row[0] is not None else None
+        fallback_net = float(row[1]) if row and row[1] is not None else None
+        fallback_fee = float(row[2]) if row and row[2] is not None else None
+        # No hardcoded demo: gross comes from user_profit_snapshot (populated by 9:40/10:00 UTC ledger fetch or on-demand _refresh_user_lending_snapshot).
+        response.headers["X-Debug-Fallback-Gross"] = str(fallback_gross) if fallback_gross is not None else "none"
 
-    # Force DB source for verification: bypass cache and return persisted snapshot when available
-    if source == "db":
-        response.headers["X-Source-DB"] = "true"
-        response.headers["X-DB-Snapshot-Gross"] = str(fallback_gross if fallback_gross is not None else "none")
-        db_snap = float(fallback_gross) if fallback_gross is not None else None  # in body so client can verify without CORS headers
-        if fallback_gross is not None and fallback_gross > 0:
-            response.headers["X-Data-Source"] = "db"
-            return LendingStatsResponse(
-                gross_profit=round(fallback_gross, 2),
-                bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
-                net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
-                db_snapshot_gross=db_snap,
-            )
-        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap)
-
-    cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_LENDING)
-    if cached is not None:
-        data, from_cache = cached
-        if from_cache and data is not None:
-            # #region agent log
-            _debug_log("main.py:get_lending_stats", "cache hit", {"user_id": user_id, "gross_profit": data.get("gross_profit"), "hypothesisId": "H1"})
-            # #endregion
-            # Override cached 0 with persisted snapshot when available (H1: cache had wrong/zero value)
-            cached_gross = data.get("gross_profit")
-            if (cached_gross is None or cached_gross == 0) and fallback_gross is not None and fallback_gross > 0:
-                _debug_log("main.py:get_lending_stats", "cache hit override with db", {"user_id": user_id, "gross_profit": fallback_gross, "hypothesisId": "H1"})
+        # Force DB source for verification: bypass cache and return persisted snapshot when available
+        if source == "db":
+            response.headers["X-Source-DB"] = "true"
+            response.headers["X-DB-Snapshot-Gross"] = str(fallback_gross if fallback_gross is not None else "none")
+            db_snap = float(fallback_gross) if fallback_gross is not None else None
+            if fallback_gross is not None and fallback_gross > 0:
                 response.headers["X-Data-Source"] = "db"
                 return LendingStatsResponse(
                     gross_profit=round(fallback_gross, 2),
                     bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
                     net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                    db_snapshot_gross=db_snap,
                 )
-            response.headers["X-Data-Source"] = "cache"
-            exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_LENDING)
-            if exp is not None:
-                response.headers["X-Cache-Expires-At"] = str(int(exp))
-            return LendingStatsResponse(**data)
+            return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap)
 
-    # #region agent log
-    _debug_log("main.py:get_lending_stats", "cache miss", {"user_id": user_id, "hypothesisId": "H1"})
-    # #endregion
+        # User + vault check via raw SQL to avoid User model columns that may be missing (e.g. key_deletions)
+        try:
+            has_vault = db.execute(
+                text("SELECT 1 FROM users u INNER JOIN vaults v ON v.user_id = u.id WHERE u.id = :uid"),
+                {"uid": user_id},
+            ).fetchone() is not None
+        except Exception:
+            has_vault = False
+        if not has_vault:
+            db_snap = float(fallback_gross) if fallback_gross is not None else None
+            if fallback_gross is not None and fallback_gross > 0:
+                response.headers["X-Data-Source"] = "db"
+                return LendingStatsResponse(
+                    gross_profit=round(fallback_gross, 2),
+                    bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+                    net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                    db_snapshot_gross=db_snap,
+                )
+            return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap)
 
-    # On cache miss, return persisted snapshot when available so first load after restart shows DB value without calling Bitfinex
-    if fallback_gross is not None and fallback_gross > 0:
-        response.headers["X-Data-Source"] = "db"
-        out = LendingStatsResponse(
-            gross_profit=round(fallback_gross, 2),
-            bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
-            net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
-        )
-        cache_data = out.model_dump()
-        cache_data.pop("trades", None)
-        cache_data.pop("calculation_breakdown", None)
-        await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
-        return out
-
-    if await bitfinex_cache.is_in_cooldown(user_id, bitfinex_cache.KEY_LENDING):
-        if fallback_gross is not None:
-            response.headers["X-Data-Source"] = "db"
-            return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
-        response.headers["X-Data-Source"] = "cache"
-        response.headers["X-Rate-Limited"] = "true"
-        response.headers["Retry-After"] = "60"
-        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
-
-    try:
-        result, rate_limited, _ = await _refresh_user_lending_snapshot(user_id, db)
-        # #region agent log
-        _debug_log("main.py:get_lending_stats", "after _refresh", {"user_id": user_id, "gross_profit": result.gross_profit, "rate_limited": rate_limited, "hypothesisId": "H2"})
-        # #endregion
-    except Exception as e:
-        # #region agent log
-        _debug_log("main.py:get_lending_stats", "_refresh exception", {"user_id": user_id, "error": str(e), "hypothesisId": "H2"})
-        # #endregion
-        if fallback_gross is not None:
-            response.headers["X-Data-Source"] = "db"
-            return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
-        result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
-        rate_limited = False
-    if rate_limited:
-        await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_LENDING)
         cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_LENDING)
         if cached is not None:
-            data, _ = cached
-            if data is not None:
-                # #region agent log
-                _debug_log("main.py:get_lending_stats", "rate_limited return cached", {"user_id": user_id, "gross_profit": data.get("gross_profit"), "hypothesisId": "H2"})
-                # #endregion
+            data, from_cache = cached
+            if from_cache and data is not None:
+                cached_gross = data.get("gross_profit")
+                if (cached_gross is None or cached_gross == 0) and fallback_gross is not None and fallback_gross > 0:
+                    response.headers["X-Data-Source"] = "db"
+                    return LendingStatsResponse(
+                        gross_profit=round(fallback_gross, 2),
+                        bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+                        net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                    )
                 response.headers["X-Data-Source"] = "cache"
-                response.headers["X-Rate-Limited"] = "true"
-                response.headers["Retry-After"] = "60"
-                return LendingStatsResponse(**data)
-        if fallback_gross is not None:
+                exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_LENDING)
+                if exp is not None:
+                    response.headers["X-Cache-Expires-At"] = str(int(exp))
+                return LendingStatsResponse(**{**data, "db_snapshot_gross": fallback_gross})
+
+        if fallback_gross is not None and fallback_gross > 0:
             response.headers["X-Data-Source"] = "db"
+            db_snap = float(fallback_gross)
+            out = LendingStatsResponse(
+                gross_profit=round(fallback_gross, 2),
+                bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+                net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+                db_snapshot_gross=db_snap,
+            )
+            cache_data = out.model_dump()
+            cache_data.pop("trades", None)
+            cache_data.pop("calculation_breakdown", None)
+            await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
+            return out
+
+        if await bitfinex_cache.is_in_cooldown(user_id, bitfinex_cache.KEY_LENDING):
+            if fallback_gross is not None:
+                response.headers["X-Data-Source"] = "db"
+                return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
+            response.headers["X-Data-Source"] = "cache"
             response.headers["X-Rate-Limited"] = "true"
-            return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
-        response.headers["X-Rate-Limited"] = "true"
-        response.headers["Retry-After"] = "60"
-    # Use persisted DB value when API returned 0 but we have a saved gross (e.g. after restart or API failure)
-    if (result.gross_profit == 0 or result.gross_profit is None) and fallback_gross is not None and fallback_gross > 0:
-        response.headers["X-Data-Source"] = "db"
-        out = LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
-        cache_data = out.model_dump()
+            response.headers["Retry-After"] = "60"
+            db_snap = float(fallback_gross) if fallback_gross is not None else None
+            return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap)
+
+        try:
+            result, rate_limited, _ = await _refresh_user_lending_snapshot(user_id, db)
+        except Exception:
+            if fallback_gross is not None:
+                response.headers["X-Data-Source"] = "db"
+                return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
+            result = LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
+            rate_limited = False
+        if rate_limited:
+            await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_LENDING)
+            cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_LENDING)
+            if cached is not None:
+                data, _ = cached
+                if data is not None:
+                    response.headers["X-Data-Source"] = "cache"
+                    response.headers["X-Rate-Limited"] = "true"
+                    response.headers["Retry-After"] = "60"
+                    return LendingStatsResponse(**data)
+            if fallback_gross is not None:
+                response.headers["X-Data-Source"] = "db"
+                response.headers["X-Rate-Limited"] = "true"
+                return LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
+            response.headers["X-Rate-Limited"] = "true"
+            response.headers["Retry-After"] = "60"
+            db_snap = float(fallback_gross) if fallback_gross is not None else None
+            return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap)
+        if (result.gross_profit == 0 or result.gross_profit is None) and fallback_gross is not None and fallback_gross > 0:
+            response.headers["X-Data-Source"] = "db"
+            out = LendingStatsResponse(gross_profit=round(fallback_gross, 2), bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2), net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2))
+            cache_data = out.model_dump()
+            cache_data.pop("trades", None)
+            cache_data.pop("calculation_breakdown", None)
+            await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
+            return out
+        cache_data = result.model_dump()
         cache_data.pop("trades", None)
         cache_data.pop("calculation_breakdown", None)
         await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
-        _debug_log("main.py:get_lending_stats", "return db fallback", {"user_id": user_id, "gross_profit": fallback_gross, "hypothesisId": "H2"})
-        return out
-    cache_data = result.model_dump()
-    cache_data.pop("trades", None)
-    cache_data.pop("calculation_breakdown", None)
-    await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_LENDING, cache_data)
-    response.headers["X-Data-Source"] = "live"
-    exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_LENDING)
-    if exp is not None:
-        response.headers["X-Cache-Expires-At"] = str(int(exp))
-    # #region agent log
-    _debug_log("main.py:get_lending_stats", "return live", {"user_id": user_id, "gross_profit": result.gross_profit, "hypothesisId": "H1"})
-    # #endregion
-    return result
+        response.headers["X-Data-Source"] = "live"
+        exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_LENDING)
+        if exp is not None:
+            response.headers["X-Cache-Expires-At"] = str(int(exp))
+        return result
+    except (ProgrammingError, SQLAlchemyError):
+        # fallback_gross was set at start of try; return it so dashboard shows value when a later step raises
+        response.headers["X-Debug-Fallback-Gross"] = str(fallback_gross) if fallback_gross is not None else "none"
+        if fallback_gross is not None and fallback_gross > 0:
+            return LendingStatsResponse(
+                gross_profit=round(fallback_gross, 2),
+                bitfinex_fee=round(fallback_fee or fallback_gross * BITFINEX_LENDER_FEE_PCT, 2),
+                net_profit=round(fallback_net or fallback_gross * (1 - BITFINEX_LENDER_FEE_PCT), 2),
+            )
+        return LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
 
 
 @app.get("/api/funding-trades", response_model=FundingTradesResponse)
@@ -3288,40 +3386,21 @@ async def cron_refresh_lending_stats(
 @app.get("/user-token-balance/{user_id}", response_model=TokenBalanceResponse)
 def get_user_token_balance(user_id: int, db: Session = Depends(database.get_db)):
     """
-    Token balance from stored profit snapshot (no Bitfinex call). 1 USDT gross = 10 tokens used.
-    Checked on login and optionally daily; prefer snapshot to minimize API.
+    Token balance: remaining = total_tokens_added - total_tokens_deducted (no Bitfinex call).
     """
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-    tier = (user.plan_tier or "trial").lower()
-    if tier not in PLAN_TOKEN_CREDITS:
-        tier = "trial"
-    initial_credit = PLAN_TOKEN_CREDITS[tier]
     row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-    purchased = float(row.purchased_tokens) if row and row.purchased_tokens is not None else 0.0
-
+    if not row:
+        logger.error("user_token_balance user_id=%s: token balance row not found", user_id)
+        raise HTTPException(status_code=404, detail="Token balance not found. Please contact support.")
+    tokens_remaining = float(row.tokens_remaining or 0)
+    purchased = float(row.purchased_tokens or 0)
+    tokens_used = 0  # not tracked in balance-only schema
     snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
     gross = float(snap.gross_profit_usd) if snap and snap.gross_profit_usd is not None else 0.0
-    tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
-    tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
-
-    if row:
-        row.tokens_remaining = tokens_remaining
-        row.last_gross_usd_used = gross
-        row.updated_at = datetime.utcnow()
-    else:
-        db.add(models.UserTokenBalance(
-            user_id=user_id,
-            tokens_remaining=tokens_remaining,
-            last_gross_usd_used=gross,
-        ))
-    db.commit()
-
     return TokenBalanceResponse(
         tokens_remaining=tokens_remaining,
         tokens_used=tokens_used,
-        initial_credit=int(initial_credit) + int(purchased),
+        initial_credit=int(purchased),
         gross_profit_usd=round(gross, 2),
     )
 
@@ -3425,6 +3504,42 @@ async def get_funding_ledger(symbol: str = Query("fUSD", description="Funding sy
     }
 
 
+def _get_token_balance_legacy(db: Session, user_id: int) -> Optional[tuple]:
+    """Raw SQL for legacy user_token_balance (tokens_remaining, purchased_tokens). Returns (tokens_remaining, purchased_tokens) or None."""
+    try:
+        r = db.execute(
+            text("SELECT tokens_remaining, purchased_tokens FROM user_token_balance WHERE user_id = :uid"),
+            {"uid": user_id},
+        ).fetchone()
+        if r is None:
+            return None
+        return (float(r[0] or 0), float(r[1] or 0))
+    except Exception:
+        return None
+
+
+def _get_token_balance_legacy_full(db: Session, user_id: int) -> Optional[dict]:
+    """Raw SQL for legacy user_token_balance: tokens_remaining, purchased_tokens, last_gross_usd_used, updated_at. Returns dict or None."""
+    try:
+        r = db.execute(
+            text("""
+                SELECT tokens_remaining, purchased_tokens, last_gross_usd_used, updated_at
+                FROM user_token_balance WHERE user_id = :uid
+            """),
+            {"uid": user_id},
+        ).fetchone()
+        if r is None:
+            return None
+        return {
+            "tokens_remaining": float(r[0] or 0),
+            "purchased_tokens": float(r[1] or 0),
+            "last_gross_usd_used": float(r[2] or 0) if r[2] is not None else 0.0,
+            "updated_at": r[3].strftime("%Y-%m-%dT%H:%M:%SZ") if getattr(r[3], "strftime", None) and r[3] else None,
+        }
+    except Exception:
+        return None
+
+
 @app.get("/user-status/{user_id}", response_model=UserStatusResponse)
 def get_user_status(
     user_id: int,
@@ -3437,54 +3552,59 @@ def get_user_status(
     """
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-
-    # Token balance (from stored snapshot, no Bitfinex call). Include purchased_tokens.
-    tier = (user.plan_tier or "trial").lower()
-    initial_credit = PLAN_TOKEN_CREDITS.get(tier, FREE_TIER_TOKENS)
-    token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-    purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
-    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
-    gross = float(snap.gross_profit_usd) if snap and snap.gross_profit_usd is not None else 0.0
-    tokens_used = int(gross * TOKENS_PER_USDT_GROSS)
-    tokens_remaining = max(0.0, float(initial_credit) + purchased - tokens_used)
-
-    # Utilization from latest PerformanceLog, if available (table may lack waroc column).
-    total_assets = 0.0
-    used_amount = 0.0
-    utilization_pct = 0.0
     try:
-        log = (
-            db.query(models.PerformanceLog)
-            .filter(models.PerformanceLog.user_id == user_id)
-            .order_by(models.PerformanceLog.timestamp.desc())
-            .first()
-        )
-        if log and log.total_assets is not None:
-            total_assets = float(log.total_assets)
-        used_amount = min(total_assets, user.lending_limit or 0.0)
-        utilization_pct = (used_amount / user.lending_limit * 100.0) if user.lending_limit else 0.0
-    except ProgrammingError:
-        pass
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
 
-    pro_expiry_iso = None
-    if getattr(user, "pro_expiry", None) and user.pro_expiry:
-        pro_expiry_iso = user.pro_expiry.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return UserStatusResponse(
-        plan_tier=user.plan_tier or "trial",
-        lending_limit=float(user.lending_limit or 0.0),
-        rebalance_interval=int(user.rebalance_interval or 0),
-        trial_remaining_days=None,
-        utilization_pct=utilization_pct,
-        used_amount=used_amount,
-        tokens_remaining=tokens_remaining,
-        tokens_used=tokens_used,
-        initial_token_credit=int(initial_credit) + int(purchased),
-        gross_profit_usd=round(gross, 2),
-        pro_expiry=pro_expiry_iso,
-    )
+        # Prefer legacy raw SQL so we work when ORM columns (total_tokens_added etc.) don't exist
+        legacy = _get_token_balance_legacy(db, user_id)
+        if legacy is not None:
+            tokens_remaining, purchased_tokens = legacy
+            total_added = purchased_tokens
+            tokens_used = 0  # legacy schema may not track deductions in a separate column
+        else:
+            token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+            if not token_row:
+                logger.error("user_status user_id=%s: token balance row not found", user_id)
+                raise HTTPException(status_code=404, detail="Token balance not found. Please contact support.")
+            tokens_remaining = float(token_row.tokens_remaining or 0)
+            total_added = float(token_row.purchased_tokens or 0)
+            tokens_used = 0
+        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+        if not snap:
+            logger.error("user_status user_id=%s: profit snapshot not found", user_id)
+            raise HTTPException(status_code=404, detail="Profit snapshot not found. Please contact support.")
+        if snap.gross_profit_usd is None:
+            logger.error("user_status user_id=%s: gross_profit_usd is NULL in database", user_id)
+            raise HTTPException(status_code=500, detail="Profit data is invalid. Please contact support.")
+        gross = float(snap.gross_profit_usd)
+
+        pro_expiry_iso = None
+        if getattr(user, "pro_expiry", None) and user.pro_expiry:
+            pro_expiry_iso = user.pro_expiry.strftime("%Y-%m-%dT%H:%M:%SZ")
+        created_at_iso = None
+        if getattr(user, "created_at", None) and user.created_at:
+            created_at_iso = user.created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return UserStatusResponse(
+            plan_tier=user.plan_tier or "trial",
+            rebalance_interval=int(user.rebalance_interval or 0),
+            trial_remaining_days=None,
+            tokens_remaining=tokens_remaining,
+            tokens_used=tokens_used,
+            initial_token_credit=int(total_added),
+            gross_profit_usd=round(gross, 2),
+            pro_expiry=pro_expiry_iso,
+            created_at=created_at_iso,
+        )
+    except HTTPException:
+        raise
+    except (ProgrammingError, SQLAlchemyError) as e:
+        logger.exception("user_status user_id=%s database error: %s", user_id, e)
+        raise HTTPException(status_code=500, detail=f"Database error retrieving user status: {str(e)}")
+    except Exception as e:
+        logger.exception("user_status user_id=%s error: %s", user_id, e)
+        raise HTTPException(status_code=500, detail=f"Internal error retrieving user status: {str(e)}")
 
 
 @app.get("/admin/users", response_model=list[AdminUserOut])
@@ -3493,13 +3613,13 @@ def list_users(
     db: Session = Depends(database.get_db),
 ):
     users = db.query(models.User).all()
-    balances = {b.user_id: float(b.tokens_remaining or 0) for b in db.query(models.UserTokenBalance).all()}
+    balance_rows = db.query(models.UserTokenBalance).all()
+    balances = {b.user_id: float(b.tokens_remaining or 0) for b in balance_rows}
     return [
         AdminUserOut(
             id=u.id,
             email=u.email,
             plan_tier=u.plan_tier or "trial",
-            lending_limit=float(u.lending_limit or 0.0),
             rebalance_interval=int(u.rebalance_interval or 0),
             pro_expiry=u.pro_expiry,
             status=u.status or "active",
@@ -3525,24 +3645,16 @@ def update_user(
     if payload.plan_tier is not None:
         tier = payload.plan_tier.lower()
         user.plan_tier = tier
-        # Apply default limits if not explicitly overridden in payload
         if tier == "pro":
-            user.lending_limit = payload.lending_limit or 50_000.0
             user.rebalance_interval = payload.rebalance_interval or 30
         elif tier == "expert":
-            user.lending_limit = payload.lending_limit or 250_000.0
             user.rebalance_interval = payload.rebalance_interval or 3
         elif tier == "guru":
-            user.lending_limit = payload.lending_limit or 1_500_000.0
             user.rebalance_interval = payload.rebalance_interval or 1
         else:
-            user.lending_limit = payload.lending_limit or 250_000.0
             user.rebalance_interval = payload.rebalance_interval or 3
-    else:
-        if payload.lending_limit is not None:
-            user.lending_limit = payload.lending_limit
-        if payload.rebalance_interval is not None:
-            user.rebalance_interval = payload.rebalance_interval
+    elif payload.rebalance_interval is not None:
+        user.rebalance_interval = payload.rebalance_interval
 
     if payload.pro_expiry is not None:
         user.pro_expiry = payload.pro_expiry
@@ -3552,21 +3664,26 @@ def update_user(
         if val < 0:
             raise HTTPException(status_code=400, detail="tokens_remaining cannot be negative.")
         row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-        if row:
-            row.tokens_remaining = val
+        if not row:
+            row = models.UserTokenBalance(
+                user_id=user_id,
+                tokens_remaining=val,
+                purchased_tokens=0.0,
+            )
+            db.add(row)
+            db.flush()
         else:
-            db.add(models.UserTokenBalance(user_id=user_id, tokens_remaining=val))
+            row.tokens_remaining = val
+            row.updated_at = datetime.utcnow()
 
     db.commit()
     db.refresh(user)
     _admin_audit(admin_user.email or "", "update_user", {"user_id": user_id, "plan_tier": payload.plan_tier, "tokens_remaining": payload.tokens_remaining})
-    bal = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-    tokens_remaining = float(bal.tokens_remaining) if bal else None
+    tokens_remaining = token_ledger_svc.get_tokens_remaining(db, user_id)
     return AdminUserOut(
         id=user.id,
         email=user.email,
         plan_tier=user.plan_tier or "trial",
-        lending_limit=float(user.lending_limit or 0.0),
         rebalance_interval=int(user.rebalance_interval or 0),
         pro_expiry=user.pro_expiry,
         status=user.status or "active",
@@ -3628,16 +3745,16 @@ def admin_export_users(
     import csv
     import io
     users = db.query(models.User).all()
-    balances = {b.user_id: float(b.tokens_remaining or 0) for b in db.query(models.UserTokenBalance).all()}
+    balance_rows = db.query(models.UserTokenBalance).all()
+    balances = {b.user_id: float(b.tokens_remaining or 0) for b in balance_rows}
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["id", "email", "plan_tier", "lending_limit", "rebalance_interval", "pro_expiry", "status", "tokens_remaining", "bot_status", "created_at"])
+    w.writerow(["id", "email", "plan_tier", "rebalance_interval", "pro_expiry", "status", "tokens_remaining", "bot_status", "created_at"])
     for u in users:
         w.writerow([
             u.id,
             u.email or "",
             u.plan_tier or "trial",
-            float(u.lending_limit or 0),
             int(u.rebalance_interval or 0),
             u.pro_expiry.isoformat() if u.pro_expiry else "",
             u.status or "active",
@@ -3661,14 +3778,20 @@ async def admin_bot_start(
     admin_user: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
-    """Admin-only: start bot for any user."""
+    """Admin-only: start bot for any user. Plan C: desired state; skip token check (Q2)."""
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user or not user.vault:
         raise HTTPException(status_code=404, detail="User or API keys not found.")
-    if user.pro_expiry and user.pro_expiry < datetime.utcnow():
-        user.status = "expired"
+    if hasattr(user, "bot_desired_state"):
+        user.bot_desired_state = "running"
+    try:
         db.commit()
-        raise HTTPException(status_code=402, detail="Subscription expired.")
+    except Exception:
+        db.rollback()
+    status_before = getattr(user, "bot_status", None) or "stopped"
+    desired = getattr(user, "bot_desired_state", None) or "stopped"
+    if status_before in ("running", "starting") and desired == "running":
+        return {"status": "success", "message": "Bot already running or queued.", "bot_status": status_before}
     redis = await get_redis_or_raise()
     enqueued = await _enqueue_bot_task(redis, user_id)
     if enqueued:
@@ -3688,21 +3811,41 @@ async def admin_bot_stop(
     admin_user: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
-    """Admin-only: stop bot for any user."""
+    """Admin-only: stop bot for any user. Plan C: DB first."""
     from arq.jobs import Job
-    redis = await get_redis_or_raise()
-    job_id = f"bot_user_{user_id}"
-    job = Job(job_id=job_id, redis=redis)
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user:
+        try:
+            if hasattr(user, "bot_desired_state"):
+                user.bot_desired_state = "stopped"
+            if hasattr(user, "bot_status"):
+                user.bot_status = "stopped"
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
     aborted = False
     try:
-        aborted = await job.abort()
+        redis = await get_redis_or_raise()
+        job_id = f"bot_user_{user_id}"
+        job = Job(job_id=job_id, redis=redis)
+        aborted = await job.abort(timeout=5)
         await _clear_arq_job_keys(redis, job_id)
+    except asyncio.TimeoutError:
+        try:
+            redis = await get_redis_or_raise()
+            await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+        except Exception:
+            pass
+        logger.warning("admin_bot_stop user_id=%s abort timed out (5s), cleared keys", user_id)
     except Exception:
-        await _clear_arq_job_keys(redis, job_id)
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if user and hasattr(user, "bot_status"):
-        user.bot_status = "stopped"
-        db.commit()
+        try:
+            redis = await get_redis_or_raise()
+            await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+        except Exception:
+            pass
     _admin_audit(admin_user.email or "", "bot_stop", {"user_id": user_id})
     return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
 
@@ -3836,13 +3979,10 @@ def admin_deduction_rollback(
     if not entries:
         raise HTTPException(status_code=404, detail=f"No deduction entries for user_id={user_id} and date={date}")
     total_add_back = sum(e.get("tokens_deducted", 0) for e in entries)
-    row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="User has no token balance row.")
-    row.tokens_remaining = float(row.tokens_remaining or 0) + total_add_back
+    new_remaining = token_ledger_svc.add_tokens(db, user_id, total_add_back, "deduction_rollback")
     db.commit()
     _admin_audit(admin_user.email or "", "deduction_rollback", {"user_id": user_id, "date": date, "tokens_added_back": total_add_back})
-    return {"status": "success", "user_id": user_id, "date": date, "tokens_added_back": total_add_back, "new_tokens_remaining": float(row.tokens_remaining)}
+    return {"status": "success", "user_id": user_id, "date": date, "tokens_added_back": total_add_back, "new_tokens_remaining": new_remaining}
 
 
 # --- Admin: System health ---
@@ -3978,7 +4118,6 @@ def admin_get_subscription(
 
 class SetPlanBody(BaseModel):
     plan_tier: str
-    lending_limit: Optional[float] = None
     rebalance_interval: Optional[int] = None
 
 
@@ -3997,14 +4136,13 @@ def admin_set_plan(
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
     user.plan_tier = (body.plan_tier or "trial").lower()
-    if body.lending_limit is not None:
-        user.lending_limit = body.lending_limit
     if body.rebalance_interval is not None:
         user.rebalance_interval = body.rebalance_interval
     db.commit()
     db.refresh(user)
     _admin_audit(admin_user.email or "", "set_plan", {"user_id": user_id, "plan_tier": user.plan_tier})
-    balances = {b.user_id: float(b.tokens_remaining or 0) for b in db.query(models.UserTokenBalance).all()}
+    balance_rows = db.query(models.UserTokenBalance).all()
+    balances = {b.user_id: float(b.tokens_remaining or 0) for b in balance_rows}
     return _admin_user_out(user, balances.get(user.id))
 
 
@@ -4035,7 +4173,6 @@ def _admin_user_out(user: models.User, tokens_remaining: Optional[float]) -> Adm
         id=user.id,
         email=user.email or "",
         plan_tier=user.plan_tier or "trial",
-        lending_limit=float(user.lending_limit or 0),
         rebalance_interval=int(user.rebalance_interval or 0),
         pro_expiry=user.pro_expiry,
         status=user.status or "active",
@@ -4058,11 +4195,9 @@ def admin_bulk_add_tokens(
         if item.amount <= 0:
             failed += 1
             continue
-        row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == item.user_id).first()
-        if row:
-            row.tokens_remaining = float(row.tokens_remaining or 0) + item.amount
-        else:
-            db.add(models.UserTokenBalance(user_id=item.user_id, tokens_remaining=item.amount))
+        token_ledger_svc.add_tokens(db, item.user_id, float(item.amount), "admin_bulk_add")
+        usd_value = float(item.amount) / 100.0  # 1 USD = 100 tokens
+        apply_referral_rewards_on_purchase(db, item.user_id, usd_value)
         db.commit()
         success += 1
         _admin_audit(admin_user.email or "", "bulk_token_add", {"user_id": item.user_id, "amount": item.amount})
@@ -4728,7 +4863,15 @@ def admin_user_overview(
     token_balance = None
     tb = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
     if tb:
-        token_balance = {"tokens_remaining": tb.tokens_remaining, "purchased_tokens": tb.purchased_tokens, "last_gross_usd_used": tb.last_gross_usd_used, "updated_at": tb.updated_at.isoformat() + "Z" if tb.updated_at else None}
+        rem = float(tb.tokens_remaining or 0)
+        purchased = float(tb.purchased_tokens or 0)
+        token_balance = {
+            "tokens_remaining": rem,
+            "total_tokens_added": purchased,
+            "total_tokens_deducted": max(0.0, purchased - rem),
+            "last_gross_usd_used": tb.last_gross_usd_used,
+            "updated_at": tb.updated_at.isoformat() + "Z" if tb.updated_at else None,
+        }
     usdt_credit = None
     uc = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == user_id).first()
     if uc:
@@ -5140,9 +5283,33 @@ async def wallet_summary(
     """
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user or not user.vault:
-        raise HTTPException(status_code=404, detail="API keys not found.")
+    try:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user or not user.vault:
+            raise HTTPException(status_code=404, detail="API keys not found.")
+    except (ProgrammingError, SQLAlchemyError):
+        return {
+            "message": "No data yet",
+            "total_usd_all": 0.0,
+            "usd_only": 0.0,
+            "per_currency": {},
+            "per_currency_usd": {},
+            "lent_per_currency": {},
+            "offers_per_currency": {},
+            "lent_per_currency_usd": {},
+            "offers_per_currency_usd": {},
+            "idle_per_currency_usd": {},
+            "total_lent_usd": 0.0,
+            "total_offers_usd": 0.0,
+            "idle_usd": 0.0,
+            "weighted_avg_apr_pct": 0.0,
+            "est_daily_earnings_usd": 0.0,
+            "yield_over_total_pct": 0.0,
+            "credits_count": 0,
+            "offers_count": 0,
+            "credits_detail": [],
+            "offers_detail": [],
+        }
 
     cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
     if cached is not None:
@@ -5226,7 +5393,6 @@ STRIPE_PRICE_WHALES_YEARLY = os.getenv("STRIPE_PRICE_WHALES_YEARLY", "")
 
 # Plan limits and rebalance (minutes) for webhook
 PLAN_REBALANCE_MIN = {"pro": 30, "ai_ultra": 3, "whales": 1}
-PLAN_LENDING_LIMIT = {"pro": 250_000.0, "ai_ultra": 250_000.0, "whales": 1_500_000.0}
 
 # Token award per subscription payment (added to purchased_tokens in webhook)
 PLAN_TOKEN_AWARD_MONTHLY = {"pro": 2000, "ai_ultra": 9000, "whales": 40000}
@@ -5242,19 +5408,21 @@ class CreateCheckoutTokensPayload(BaseModel):
     amount_usd: float  # e.g. 10 → user gets 1000 tokens (1 USD = 100 tokens)
 
 
-# --- Token deposit (Add tokens): USD × 10 = tokens, min $1 (Stripe checkout placeholder) ---
+# --- Token deposit (Add tokens): 1 USD = 100 tokens, min $1 (Stripe checkout or dev bypass) ---
 class TokenDepositPayload(BaseModel):
     usd_amount: float
+    bypass_payment: Optional[bool] = False  # Dev only: when True and ALLOW_DEV_CONNECT=1, credit tokens without Stripe
 
 
 @app.post("/api/v1/tokens/deposit")
 def token_deposit(
     payload: TokenDepositPayload,
     current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
 ):
     """
-    Validate USD amount and compute tokens to award (tokens = round(usd_amount × 10)).
-    Minimum $1. No Stripe checkout yet; returns calculation only.
+    Validate USD amount and compute tokens to award (1 USD = 100 tokens).
+    Minimum $1. When bypass_payment=True and ALLOW_DEV_CONNECT=1, credits tokens immediately (no Stripe).
     """
     usd_amount = payload.usd_amount
     user_id = current_user.id
@@ -5277,9 +5445,27 @@ def token_deposit(
         logger.warning("token_deposit_validation_failed user_id=%s usd_amount=%s error=%s", user_id, usd_amount, msg)
         return JSONResponse(status_code=400, content={"status": "error", "message": msg})
 
-    # int() so $10.99 → 109 tokens (spec); use round() for true nearest-integer if preferred
-    tokens_to_award = int(amount_float * 10)
+    # 1 USD = 100 tokens (same as create-checkout-session-tokens)
+    tokens_to_award = int(amount_float * 100)
     logger.info("token_deposit_calculation user_id=%s usd_amount=%s tokens_to_award=%s", user_id, amount_float, tokens_to_award)
+
+    # Dev bypass: credit tokens without Stripe (ALLOW_DEV_CONNECT=1 and bypass_payment=True)
+    if payload.bypass_payment and os.getenv("ALLOW_DEV_CONNECT") == "1":
+        try:
+            token_ledger_svc.add_tokens(db, user_id, float(tokens_to_award), "deposit_usd")
+            apply_referral_rewards_on_purchase(db, user_id, amount_float)
+            db.commit()
+            logger.info("token_deposit_bypass user_id=%s usd=%s tokens_added=%s", user_id, amount_float, tokens_to_award)
+        except Exception as e:
+            db.rollback()
+            logger.exception("token_deposit_bypass failed: %s", e)
+            return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        return {
+            "status": "success",
+            "usd_amount": amount_float,
+            "tokens_to_award": tokens_to_award,
+            "message": f"{tokens_to_award} tokens added (dev bypass).",
+        }
 
     # TODO: Add Stripe checkout session creation here
     return {
@@ -5402,12 +5588,9 @@ async def stripe_webhook(request: Request):
             if user_id and tokens > 0:
                 db = next(database.get_db())
                 try:
-                    row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-                    if row:
-                        row.purchased_tokens = (row.purchased_tokens or 0) + tokens
-                        row.updated_at = datetime.utcnow()
-                    else:
-                        db.add(models.UserTokenBalance(user_id=user_id, purchased_tokens=float(tokens)))
+                    amount_usd = float(meta.get("amount_usd") or 0) or (tokens / 100.0)
+                    token_ledger_svc.add_tokens(db, user_id, float(tokens), "deposit_usd")
+                    apply_referral_rewards_on_purchase(db, user_id, amount_usd)
                     db.commit()
                 finally:
                     db.close()
@@ -5440,31 +5623,22 @@ async def stripe_webhook(request: Request):
             if plan in PLAN_REBALANCE_MIN:
                 user.plan_tier = plan
                 user.rebalance_interval = PLAN_REBALANCE_MIN[plan]
-                user.lending_limit = PLAN_LENDING_LIMIT.get(plan, 250_000.0)
 
             now = datetime.utcnow()
             base = user.pro_expiry if user.pro_expiry and user.pro_expiry > now else now
             user.pro_expiry = base + timedelta(days=interval_days)
 
-            # Award plan-specific tokens to purchased_tokens (add, do not overwrite)
+            # Award plan-specific tokens via ledger (add)
             tokens_to_award = (
                 PLAN_TOKEN_AWARD_YEARLY.get(plan, 0)
                 if interval == "yearly"
                 else PLAN_TOKEN_AWARD_MONTHLY.get(plan, 0)
             )
             if tokens_to_award > 0:
-                token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user.id).first()
-                if token_row:
-                    token_row.purchased_tokens = float(token_row.purchased_tokens or 0) + tokens_to_award
-                    token_row.updated_at = now
-                else:
-                    db.add(models.UserTokenBalance(
-                        user_id=user.id,
-                        purchased_tokens=float(tokens_to_award),
-                        tokens_remaining=0.0,
-                        last_gross_usd_used=0.0,
-                        updated_at=now,
-                    ))
+                reason = "subscription_yearly" if interval == "yearly" else "subscription_monthly"
+                token_ledger_svc.add_tokens(db, user.id, float(tokens_to_award), reason)
+                usd_value = tokens_to_award / 100.0  # 1 USD = 100 tokens
+                apply_referral_rewards_on_purchase(db, user.id, usd_value)
                 logger.info(
                     "subscription_token_award user_id=%s plan=%s interval=%s tokens_added=%s timestamp=%s",
                     user.id, plan, interval, tokens_to_award, now.isoformat(),

@@ -2,25 +2,51 @@ import asyncio
 import contextlib
 import os
 from datetime import datetime
+from pathlib import Path
 
 from arq.connections import RedisSettings
+from sqlalchemy import text
 
 from database import SessionLocal
 import models
 from bot_engine import PortfolioManager
 from dotenv import load_dotenv
 
+# Load .env from project root (same as database.py) so worker always uses same DB/Redis
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=_env_path)
 
-load_dotenv()
+
+def _tokens_remaining_for_user(db, user_id: int) -> float:
+    """Token balance for bot gate: user_token_balance.tokens_remaining from DB (direct check)."""
+    try:
+        from services import token_ledger_service as token_ledger_svc
+        return token_ledger_svc.get_tokens_remaining(db, user_id)
+    except Exception as e:
+        print(f"[WARN] Worker token read for user {user_id} failed: {e}")
+    return 0.0
 
 
-# Pro 20 USDT, AI Ultra 60 USDT, Whales 200 USDT. Token credits: 100 free, 1500, 9000, 40000.
+async def _term(redis, user_id: int, msg: str) -> None:
+    """Push one timestamped line to terminal_logs for the user (so Terminal tab shows it)."""
+    if not redis:
+        return
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    try:
+        key = f"terminal_logs:{user_id}"
+        await redis.rpush(key, line)
+        await redis.ltrim(key, -300, -1)
+    except Exception:
+        pass
+
+
+# Tier rebalance intervals (minutes): Trial/Free 4h, Pro 5m, AI Ultra 30m, Whales 10m.
 PLAN_CONFIG = {
-    "trial": {"limit": 250_000.0, "sleep_minutes": 30},
-    "free": {"limit": 250_000.0, "sleep_minutes": 30},
-    "pro": {"limit": 250_000.0, "sleep_minutes": 30},
-    "ai_ultra": {"limit": 250_000.0, "sleep_minutes": 3},
-    "whales": {"limit": 1_500_000.0, "sleep_minutes": 1},
+    "trial": {"sleep_minutes": 240},
+    "free": {"sleep_minutes": 240},
+    "pro": {"sleep_minutes": 5},
+    "ai_ultra": {"sleep_minutes": 30},
+    "whales": {"sleep_minutes": 10},
 }
 TOKENS_PER_USDT_GROSS = 10
 PLAN_TOKEN_CREDITS = {"trial": 100, "free": 100, "pro": 1500, "ai_ultra": 9000, "whales": 40000}
@@ -32,42 +58,49 @@ async def run_bot_task(ctx, user_id: int):
 
     Enforces:
     - Subscription tiers (limits + rebalance interval)
-    - Kill switch based on pro_expiry
+    - Kill switch based on token balance only
     """
     print(f"[{ctx['job_id']}] Booting Lending Engine for User {user_id}...")
 
-    # Push one line to Redis immediately so the Terminal tab shows output on next poll
     redis = ctx.get("redis")
-    if redis:
-        key = f"terminal_logs:{user_id}"
-        boot_msg = f"[{datetime.now().strftime('%H:%M:%S')}] Bot started for user {user_id}. Loading..."
-        await redis.rpush(key, boot_msg)
-        await redis.ltrim(key, -500, -1)
+    key = f"terminal_logs:{user_id}"
+
+    await _term(redis, user_id, "Job picked up from queue. Loading...")
 
     db = SessionLocal()
     try:
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user or not user.vault:
             print(f"[ERROR] No API keys found for User {user_id}")
+            await _term(redis, user_id, "Failure: No API keys found. Bot not started.")
+            if user and hasattr(user, "bot_status"):
+                try:
+                    user.bot_status = "stopped"
+                    db.commit()
+                except Exception:
+                    db.rollback()
             return
 
-        # Initialize plan config on each start (in case plan changed)
-        tier = (user.plan_tier or "trial").lower()
+        # Initialize plan config on each start (in case plan changed); normalize tier (e.g. "ai ultra" -> ai_ultra)
+        raw_tier = (user.plan_tier or "trial").strip().lower()
+        tier = "ai_ultra" if raw_tier in ("ai ultra", "ai_ultra") else raw_tier.replace(" ", "_")
         cfg = PLAN_CONFIG.get(tier, PLAN_CONFIG["trial"])
-        user.lending_limit = cfg["limit"]
         user.rebalance_interval = cfg["sleep_minutes"]
         db.commit()
 
-        # Balance check right before bot runs; if low, log and bypass for now (product: allow run)
-        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
-        gross = float(snap.gross_profit_usd) if snap and snap.gross_profit_usd is not None else 0.0
-        tier = (user.plan_tier or "trial").lower()
-        initial = PLAN_TOKEN_CREDITS.get(tier, 100)
-        token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-        purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
-        tokens_remaining = max(0.0, float(initial) + purchased - int(gross * TOKENS_PER_USDT_GROSS))
-        if tokens_remaining < 0.1:
-            print(f"[INFO] User {user_id} token balance below 0.1 (bypassing for now). Bot will run.")
+        await _term(redis, user_id, "API keys found. Checking token balance...")
+
+        # Token gate at start: run only when tokens_remaining > 0 (same as POST /start-bot)
+        tokens_remaining = _tokens_remaining_for_user(db, user_id)
+        print(f"[INFO] User {user_id} tokens_remaining={tokens_remaining} (from user_token_balance)")
+        if tokens_remaining <= 0:
+            await _term(redis, user_id, f"Failure: No tokens remaining (balance={tokens_remaining:.0f}). Bot not started.")
+            user.bot_status = "stopped"
+            db.commit()
+            print(f"[INFO] User {user_id} tokens_remaining={tokens_remaining} (<=0). Bot not started.")
+            return
+
+        await _term(redis, user_id, f"Token balance OK ({tokens_remaining:.0f} tokens). Starting trading engine...")
 
         vault = user.vault
         keys = vault.get_keys()
@@ -78,6 +111,8 @@ async def run_bot_task(ctx, user_id: int):
             db.commit()
         except Exception:
             db.rollback()
+
+        await _term(redis, user_id, "Bot status: running. Launching portfolio manager...")
 
         log_lines: list[str] = []
         manager = PortfolioManager(
@@ -97,42 +132,50 @@ async def run_bot_task(ctx, user_id: int):
                 key = f"terminal_logs:{user_id}"
                 for line in log_lines:
                     await redis.rpush(key, line)
-                await redis.ltrim(key, -500, -1)
+                await redis.ltrim(key, -300, -1)
             del log_lines[:]
 
         # Launch portfolio engines in the background
         engine_task = asyncio.create_task(manager.scan_and_launch())
 
-        # Push terminal logs to Redis early and often so the user's Terminal tab shows output quickly
-        async def early_flushes():
-            for delay in (1, 3, 10, 20):
-                await asyncio.sleep(delay)
-                await flush_terminal_logs()
-        asyncio.create_task(early_flushes())
+        await _term(redis, user_id, f"Trading terminal active. Rebalance every {user.rebalance_interval} min. Scanner starting...")
 
-        # Kill-switch loop – token balance (and optional pro_expiry for paid plans).
+        # Flush after 2s so "[SCANNER] Initializing..." appears in terminal
+        async def flush_after_2s():
+            await asyncio.sleep(2)
+            await flush_terminal_logs()
+        asyncio.create_task(flush_after_2s())
+        # Second flush at 5s to catch any further scanner output
+        async def one_early_flush():
+            await asyncio.sleep(5)
+            await flush_terminal_logs()
+        asyncio.create_task(one_early_flush())
+
+        # Batch flush every 90s to limit Redis writes
+        TERMINAL_FLUSH_INTERVAL_SEC = 90
+        async def periodic_flush():
+            while True:
+                await asyncio.sleep(TERMINAL_FLUSH_INTERVAL_SEC)
+                await flush_terminal_logs()
+        asyncio.create_task(periodic_flush())
+
+        # Kill-switch loop – token balance only.
+        loop_count = 0
         try:
             while True:
-                now = datetime.utcnow()
-                if user.pro_expiry and user.pro_expiry < now:
-                    print(f"[KILL] User {user_id} subscription expired. Cancelling all activity.")
-                    user.status = "expired"
+                tokens_remaining = _tokens_remaining_for_user(db, user_id)
+                if tokens_remaining <= 0:
+                    await _term(redis, user_id, f"Failure: No tokens remaining (balance={tokens_remaining:.0f}). Stopping bot.")
+                    print(f"[KILL] User {user_id} tokens_remaining={tokens_remaining} (<=0). Stopping bot.")
+                    user.bot_status = "stopped"
                     db.commit()
                     engine_task.cancel()
                     break
-                # Token balance check: bypass for now (product); log only when low
-                snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
-                gross = float(snap.gross_profit_usd) if snap and snap.gross_profit_usd is not None else 0.0
-                tier = (user.plan_tier or "trial").lower()
-                initial = PLAN_TOKEN_CREDITS.get(tier, 100)
-                token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
-                purchased = float(token_row.purchased_tokens) if token_row and token_row.purchased_tokens is not None else 0.0
-                tokens_remaining = max(0.0, float(initial) + purchased - int(gross * TOKENS_PER_USDT_GROSS))
-                if tokens_remaining < 0.1:
-                    # Bypass: do not stop bot for low balance for now
-                    pass
 
                 await flush_terminal_logs()
+                loop_count += 1
+                if loop_count == 1:
+                    await _term(redis, user_id, f"Heartbeat: Bot running. Next rebalance in {user.rebalance_interval} min.")
                 await asyncio.sleep(user.rebalance_interval * 60)
                 db.expire(user)
                 user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -142,19 +185,52 @@ async def run_bot_task(ctx, user_id: int):
                 await engine_task
 
     except asyncio.CancelledError:
+        # Normal stop (user clicked Stop): set both so desired state stays in sync
         print(f"[SHUTDOWN] Task for User {user_id} was cancelled gracefully.")
+        try:
+            await _term(ctx.get("redis"), user_id, "Shutdown: task cancelled.")
+        except Exception:
+            pass
+        try:
+            if db is not None:
+                u = db.query(models.User).filter(models.User.id == user_id).first()
+                if u:
+                    if hasattr(u, "bot_status"):
+                        u.bot_status = "stopped"
+                    if hasattr(u, "bot_desired_state"):
+                        u.bot_desired_state = "stopped"
+                    db.commit()
+        except Exception:
+            try:
+                if db is not None:
+                    db.rollback()
+            except Exception:
+                pass
     except Exception as e:
         print(f"[CRITICAL] Worker failed for User {user_id}: {e}")
-    finally:
-        # State sync: always set stopped on exit (abort, cancel, or exception) so Start/Stop buttons stay in sync
         try:
-            u = db.query(models.User).filter(models.User.id == user_id).first()
-            if u and hasattr(u, "bot_status"):
-                u.bot_status = "stopped"
-                db.commit()
+            await _term(ctx.get("redis"), user_id, f"Failure: {type(e).__name__}: {e}")
         except Exception:
-            db.rollback()
-        db.close()
+            pass
+    finally:
+        # Only set bot_status here (token exhaustion / crash). Normal stop sets both in CancelledError handler.
+        try:
+            if db is not None:
+                u = db.query(models.User).filter(models.User.id == user_id).first()
+                if u and hasattr(u, "bot_status"):
+                    u.bot_status = "stopped"
+                    db.commit()
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[WARN] Worker finally: could not set bot_status=stopped for user {user_id}: {e}")
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
         print(f"[INFO] Cleanup complete for User {user_id}")
 
 
