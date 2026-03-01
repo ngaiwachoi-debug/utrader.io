@@ -4,11 +4,11 @@ import { useEffect, useState } from "react"
 import {
   DollarSign,
   TrendingUp,
-  Wallet,
   BarChart3,
   Clock,
   RefreshCw,
 } from "lucide-react"
+import { Spinner } from "@/components/ui/spinner"
 import { useDateRange } from "@/lib/date-range-context"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
@@ -25,7 +25,48 @@ import {
   Bar,
 } from "recharts"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+const API_BACKEND = "/api-backend"
+
+type TradeForChart = { mts_create: number; amount: number; interest_usd: number }
+
+/** Chart range from 7d/30d/90d relative to today (so trades are not filtered out by wrong year). */
+function chartRangeFromTimeRange(timeRange: string): { start: Date; end: Date } {
+  const end = new Date()
+  end.setHours(23, 59, 59, 999)
+  const start = new Date(end)
+  const days = timeRange === "90d" ? 90 : timeRange === "7d" ? 7 : 30
+  start.setDate(start.getDate() - days)
+  start.setHours(0, 0, 0, 0)
+  return { start, end }
+}
+
+/** Derive chart time series from funding trades (no extra API). Updates when gross profit / lending data updates. */
+function deriveChartHistoryFromTrades(
+  trades: TradeForChart[],
+  rangeStart: Date,
+  rangeEnd: Date
+): { date: string; volume: number; interest: number }[] {
+  const start = rangeStart.getTime()
+  const end = rangeEnd.getTime()
+  const byDay = new Map<string, { volume: number; interest: number }>()
+  for (const t of trades) {
+    const ms = typeof t.mts_create === "number" ? t.mts_create : 0
+    if (ms < start || ms > end) continue
+    const d = new Date(ms)
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+    const prev = byDay.get(key) ?? { volume: 0, interest: 0 }
+    byDay.set(key, {
+      volume: prev.volume + Math.abs(typeof t.amount === "number" ? t.amount : 0),
+      interest: prev.interest + (typeof t.interest_usd === "number" ? t.interest_usd : 0),
+    })
+  }
+  return Array.from(byDay.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([dateKey, { volume, interest }]) => {
+      const [y, m, d] = dateKey.split("-")
+      return { date: `${m}-${d}`, volume: Math.round(volume * 100) / 100, interest: Math.round(interest * 100) / 100 }
+    })
+}
 
 const chartData = [
   { date: "02-19", volume: 12400, interest: 32 },
@@ -35,69 +76,6 @@ const chartData = [
   { date: "02-23", volume: 24500, interest: 68 },
   { date: "02-24", volume: 19300, interest: 52 },
   { date: "02-25", volume: 21000, interest: 58 },
-]
-
-const lendingEngines = [
-  {
-    currency: "USD",
-    status: "Active",
-    rate: "2.63%",
-    dailyChange: "-84.14%",
-    amount: "$701,154,043",
-    lent: "$45,200",
-    earned: "$12.45",
-    offers: 7,
-  },
-  {
-    currency: "USDt",
-    status: "Active",
-    rate: "6.49%",
-    dailyChange: "-58.08%",
-    amount: "$74,105,449",
-    lent: "$22,100",
-    earned: "$8.32",
-    offers: 4,
-  },
-  {
-    currency: "APE",
-    status: "Paused",
-    rate: "67.35%",
-    dailyChange: "-2.87%",
-    amount: "$70,125",
-    lent: "$0",
-    earned: "$0.00",
-    offers: 0,
-  },
-  {
-    currency: "EGLD",
-    status: "Active",
-    rate: "49.27%",
-    dailyChange: "+0.00%",
-    amount: "$176",
-    lent: "$176",
-    earned: "$0.24",
-    offers: 1,
-  },
-  {
-    currency: "NEO",
-    status: "Active",
-    rate: "41.61%",
-    dailyChange: "+18.51%",
-    amount: "$2,746",
-    lent: "$1,850",
-    earned: "$2.11",
-    offers: 2,
-  },
-  {
-    currency: "SUI",
-    status: "Active",
-    rate: "30.84%",
-    dailyChange: "+6.40%",
-    amount: "$8,558",
-    lent: "$5,200",
-    earned: "$4.40",
-    offers: 3,
-  },
 ]
 
 type ProfitCenterProps = { onUpgradeClick?: () => void }
@@ -113,7 +91,6 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
-  const [lendingLimit, setLendingLimit] = useState<number>(250_000)
   const [lendingDataSource, setLendingDataSource] = useState<"live" | "cache" | null>(null)
   const [lendingRateLimited, setLendingRateLimited] = useState(false)
   const [tradesCount, setTradesCount] = useState<number | null>(null)
@@ -133,7 +110,6 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
       setNetProfit(null)
       setChartHistory([])
       setTokensRemaining(null)
-      setLendingLimit(250_000)
       setLendingDataSource(null)
       setLendingRateLimited(false)
       setTradesCount(null)
@@ -148,75 +124,84 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         setError(null)
         const token = await getBackendToken()
         const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-        const start = range.start.toISOString().slice(0, 10)
-        const end = range.end.toISOString().slice(0, 10)
 
         // Gross Profit and Net Profit: single direct backend source (server is source of truth)
-        const lendingRes = await fetch(`${API_BASE}/stats/${userId}/lending`, { credentials: "include", headers })
+        const lendingRes = await fetch(`${API_BACKEND}/stats/${userId}/lending`, { credentials: "include", headers })
         const src = lendingRes.headers.get("X-Data-Source")
         setLendingDataSource(src === "cache" ? "cache" : "live")
         setLendingRateLimited(lendingRes.headers.get("X-Rate-Limited") === "true")
         if (lendingRes.ok) {
-          let lendingData = await lendingRes.json()
-          // #region agent log
-          fetch("http://127.0.0.1:7697/ingest/7a2fbc25-d656-4da7-8da6-75a34780f2db", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "1b4a77" }, body: JSON.stringify({ sessionId: "1b4a77", location: "profit-center.tsx:lending", message: "lending response", data: { userId, status: lendingRes.status, gross_profit: lendingData?.gross_profit, hypothesisId: "H4" }, timestamp: Date.now() }) }).catch(() => {})
-          // #endregion
-          // If normal response has zero gross profit, try persisted DB snapshot (works even when cache/API returned 0)
-          if (typeof lendingData?.gross_profit === "number" && lendingData.gross_profit === 0) {
-            const localBase = "http://127.0.0.1:8000"
-            let dbRes = await fetch(`${API_BASE}/stats/${userId}/lending?source=db`, { credentials: "include", headers })
-            let dbData = dbRes.ok ? await dbRes.json() : null
-            // #region agent log (db_snapshot_gross in body = backend has new code and DB read value)
-            fetch("http://127.0.0.1:7697/ingest/7a2fbc25-d656-4da7-8da6-75a34780f2db", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "1b4a77" }, body: JSON.stringify({ sessionId: "1b4a77", location: "profit-center.tsx:source=db", message: "source=db response", data: { userId, status: dbRes.status, gross_profit: dbData?.gross_profit, db_snapshot_gross: dbData?.db_snapshot_gross }, timestamp: Date.now() }) }).catch(() => {})
-            // #endregion
-            // If API_BASE returned 0 and is not local, try local backend (correct backend may be on 127.0.0.1:8000)
-            const apiBaseNorm = API_BASE.replace(/\/$/, "")
-            if ((!dbData?.gross_profit || dbData.gross_profit === 0) && apiBaseNorm !== localBase) {
-              const localRes = await fetch(`${localBase}/stats/${userId}/lending?source=db`, { credentials: "include", headers })
-              const localData = localRes.ok ? await localRes.json() : null
-              if (localData?.gross_profit > 0) {
-                dbData = localData
-                dbRes = localRes
+          try {
+            let lendingData: { gross_profit?: number; db_snapshot_gross?: number; net_profit?: number; trades?: unknown[]; total_trades_count?: number; calculation_breakdown?: unknown } | null = await lendingRes.json()
+            // If normal response has zero gross profit, try persisted DB snapshot (works even when cache/API returned 0)
+            if (typeof lendingData?.gross_profit === "number" && lendingData.gross_profit === 0) {
+              const dbRes = await fetch(`${API_BACKEND}/stats/${userId}/lending?source=db`, { credentials: "include", headers })
+              const dbData = dbRes.ok ? await dbRes.json() : null
+              if (dbRes.ok && typeof dbData?.gross_profit === "number" && dbData.gross_profit > 0) {
+                lendingData = dbData
+                setLendingDataSource("db")
               }
             }
-            if (dbRes.ok && typeof dbData?.gross_profit === "number" && dbData.gross_profit > 0) {
-              lendingData = dbData
-              setLendingDataSource("db")
+            // Use db_snapshot_gross when API returned 0 but sent snapshot (e.g. cache body had 0, backend merged db_snapshot_gross)
+            let gross =
+              typeof lendingData?.gross_profit === "number" && lendingData.gross_profit > 0
+                ? lendingData.gross_profit
+                : typeof lendingData?.db_snapshot_gross === "number" && (lendingData?.db_snapshot_gross ?? 0) > 0
+                  ? (lendingData?.db_snapshot_gross ?? 0)
+                  : 0
+            let net =
+              typeof lendingData?.net_profit === "number" && (lendingData?.net_profit ?? 0) > 0
+                ? (lendingData?.net_profit ?? 0)
+                : gross > 0
+                  ? Math.round(gross * (1 - 0.15) * 100) / 100
+                  : 0
+            setGrossProfit(gross)
+            setNetProfit(net)
+            const trades = Array.isArray(lendingData?.trades) ? lendingData.trades : []
+            setCalculationBreakdown(lendingData?.calculation_breakdown ?? null)
+            let tradesForChart = trades as TradeForChart[]
+            // When lending returns no trades but we have gross profit, fetch trades once for chart (cache/db path omits trades)
+            if (tradesForChart.length === 0 && gross > 0) {
+              try {
+                const ftRes = await fetch(`${API_BACKEND}/api/funding-trades`, { credentials: "include", headers })
+                if (ftRes.ok) {
+                  const ftData = await ftRes.json()
+                  tradesForChart = Array.isArray(ftData?.trades) ? (ftData.trades as TradeForChart[]) : []
+                }
+              } catch {
+                // keep trades empty
+              }
             }
+            setFundingTrades(tradesForChart)
+            setTradesCount(
+              typeof lendingData?.total_trades_count === "number"
+                ? lendingData.total_trades_count
+                : tradesForChart.length
+            )
+            if (tradesForChart.length === 0) setChartHistory([])
+            // else: chart derived in useEffect below when fundingTrades/timeRange change
+          } catch (err) {
+            setGrossProfit(0)
+            setNetProfit(0)
+            setFundingTrades([])
+            setTradesCount(null)
+            setCalculationBreakdown(null)
+            setChartHistory([])
           }
-          setGrossProfit(typeof lendingData.gross_profit === "number" ? lendingData.gross_profit : 0)
-          setNetProfit(typeof lendingData.net_profit === "number" ? lendingData.net_profit : 0)
-          const trades = Array.isArray(lendingData.trades) ? lendingData.trades : []
-          setFundingTrades(trades)
-          setTradesCount(
-            typeof lendingData.total_trades_count === "number"
-              ? lendingData.total_trades_count
-              : trades.length
-          )
-          setCalculationBreakdown(lendingData.calculation_breakdown ?? null)
         } else {
           setGrossProfit(0)
           setNetProfit(0)
           setFundingTrades([])
           setTradesCount(null)
           setCalculationBreakdown(null)
-        }
-
-        const [historyRes, statusRes] = await Promise.all([
-          fetch(`${API_BASE}/stats/${userId}/history?start=${start}&end=${end}`, { credentials: "include", headers }),
-          fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers }),
-        ])
-        if (historyRes.ok) {
-          const history = await historyRes.json()
-          setChartHistory(Array.isArray(history) ? history : [])
-        } else {
           setChartHistory([])
         }
+
+        const statusRes = await fetch(`${API_BACKEND}/user-status/${userId}`, { credentials: "include", headers })
         if (statusRes.ok) {
           const statusData = await statusRes.json()
           const tr = statusData.tokens_remaining
           setTokensRemaining(typeof tr === "number" ? tr : null)
-          setLendingLimit(Number(statusData.lending_limit) ?? 250_000)
         }
       } catch (e) {
         const isNetworkError =
@@ -231,7 +216,14 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
     }
 
     fetchStats()
-  }, [userId, range.start, range.end, t])
+  }, [userId, range.start, range.end, timeRange, t])
+
+  // Re-derive chart when user changes 7d/30d/90d (no refetch)
+  useEffect(() => {
+    if (userId == null || fundingTrades.length === 0) return
+    const { start, end } = chartRangeFromTimeRange(timeRange)
+    setChartHistory(deriveChartHistoryFromTrades(fundingTrades as TradeForChart[], start, end))
+  }, [timeRange, userId, fundingTrades])
 
   const refreshFromServer = async () => {
     if (userId == null) return
@@ -239,7 +231,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
     try {
       const token = await getBackendToken()
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-      const res = await fetch(`${API_BASE}/api/refresh-lending-stats`, { method: "POST", credentials: "include", headers })
+      const res = await fetch(`${API_BACKEND}/api/refresh-lending-stats`, { method: "POST", credentials: "include", headers })
       if (res.ok) {
         const data = await res.json()
         setGrossProfit(typeof data.gross_profit === "number" ? data.gross_profit : 0)
@@ -249,6 +241,8 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         setTradesCount(typeof data.total_trades_count === "number" ? data.total_trades_count : trades.length)
         setCalculationBreakdown(data.calculation_breakdown ?? null)
         setLendingDataSource("live")
+        const { start, end } = chartRangeFromTimeRange(timeRange)
+        setChartHistory(deriveChartHistoryFromTrades(trades as TradeForChart[], start, end))
       }
     } finally {
       setRefreshing(false)
@@ -265,6 +259,9 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
       </div>
     )
   }
+
+  const gross = grossProfit ?? 0
+  const net = netProfit ?? 0
 
   return (
     <div className="flex flex-col gap-6">
@@ -293,6 +290,32 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         </div>
       )}
 
+      {/* Token credit – upfront so user sees balance before profit detail */}
+      <div className="rounded-xl border border-emerald/20 bg-card p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald/10">
+              <Clock className="h-5 w-5 text-emerald" />
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-foreground">Token credit</p>
+              <p className="text-xs text-muted-foreground">0.1 USD gross profit = 1 token used</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-bold text-emerald">
+              {tokensRemaining !== null ? `${Math.round(tokensRemaining)} tokens remaining` : "—"}
+            </span>
+            <button
+              onClick={() => onUpgradeClick?.()}
+              className="rounded-lg bg-emerald px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+            >
+              {t("dashboard.upgradeToPro")}
+            </button>
+          </div>
+        </div>
+      </div>
+
       {/* Profit Stats Cards */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         {/* Gross Profit */}
@@ -304,12 +327,19 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
             <DollarSign className="h-4 w-4 text-emerald" />
           </div>
           <div className="mt-3 flex items-baseline gap-2">
-            <span className="text-2xl font-bold text-foreground">
-              {loading && grossProfit === null ? "…" : `$${(grossProfit ?? 0).toFixed(2)}`}
-            </span>
+            {loading && grossProfit === null ? (
+              <span className="flex items-center gap-2 text-2xl font-bold text-foreground">
+                <Spinner className="h-6 w-6" />
+                <span className="text-muted-foreground">Loading…</span>
+              </span>
+            ) : (
+              <span className="text-2xl font-bold text-foreground">${gross.toFixed(2)}</span>
+            )}
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            {!loading && !error && (grossProfit ?? 0) === 0 ? t("dashboard.noDataYet") : t("dashboard.grossProfitSinceRegistration")}
+            {!loading && !error && gross === 0
+              ? t("dashboard.noDataYet") + " Gross comes from Bitfinex Margin Funding ledger (sum of EARNED). Use Refresh, or ensure the daily 9:40/10:00 UTC job has run and API keys are connected."
+              : t("dashboard.grossProfitSinceRegistration")}
             {tradesCount != null && tradesCount > 0 && (
               <span className="ml-1"> · {tradesCount} repaid lending trade{tradesCount !== 1 ? "s" : ""} extracted</span>
             )}
@@ -360,30 +390,134 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
             </div>
           )}
         </div>
-
-        {/* Net Earnings */}
-        <div className="rounded-xl border border-emerald/30 bg-emerald/5 p-5">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium uppercase tracking-wider text-emerald">
-              {t("dashboard.netEarnings")}
-            </span>
-            <Wallet className="h-4 w-4 text-emerald" />
-          </div>
-          <div className="mt-3 flex items-baseline gap-2">
-            <span className="text-2xl font-bold text-emerald">
-              {loading && netProfit === null ? "…" : `$${(netProfit ?? 0).toFixed(2)}`}
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {!loading && !error && (netProfit ?? 0) === 0 ? t("dashboard.noDataYet") : t("dashboard.netProfitSinceRegistration")}
-          </p>
-        </div>
       </div>
       {(lendingDataSource === "cache" || lendingRateLimited) && (
         <p className="text-xs text-muted-foreground">
           {lendingRateLimited ? t("dashboard.rateLimited") : t("dashboard.dataCached")}
         </p>
       )}
+
+      {/* Charts Row */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {/* Lending Volume Chart */}
+        <div className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="text-sm font-semibold text-foreground">{t("dashboard.lendingVolume24h")}</h3>
+              <p className="text-xs text-muted-foreground">{t("dashboard.lendingVolumeDesc")}</p>
+            </div>
+            <div className="flex items-center gap-1 rounded-lg border border-border p-0.5">
+              {["7d", "30d", "90d"].map((range) => (
+                <button
+                  key={range}
+                  onClick={() => setTimeRange(range)}
+                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                    timeRange === range
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {range}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="relative h-[220px]">
+            {loading && chartHistory.length === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+                <Spinner className="h-8 w-8" />
+                <span>Loading chart…</span>
+              </div>
+            ) : !loading && chartHistory.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                {t("dashboard.noDataYet")}
+              </div>
+            ) : (
+              <>
+                {loading && chartHistory.length === 0 && (
+                  <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-card/80">
+                    <Spinner className="h-8 w-8" />
+                  </div>
+                )}
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={chartHistory.length > 0 ? chartHistory : chartData}>
+                    <defs>
+                      <linearGradient id="volumeGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="var(--chart-1)" stopOpacity={0.3} />
+                        <stop offset="95%" stopColor="var(--chart-1)" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
+                    <XAxis dataKey="date" tick={{ fill: "var(--muted-foreground)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} />
+                    <YAxis tick={{ fill: "var(--muted-foreground)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: "var(--card)",
+                        borderColor: "var(--border)",
+                        borderRadius: "8px",
+                        color: "var(--card-foreground)",
+                        fontSize: "12px",
+                      }}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="volume"
+                      stroke="var(--chart-1)"
+                      strokeWidth={2}
+                      fill="url(#volumeGradient)"
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Interest Earned Chart */}
+        <div className="rounded-xl border border-border bg-card p-5">
+          <div className="mb-4">
+            <h3 className="text-sm font-semibold text-foreground">{t("dashboard.interestEarned")}</h3>
+            <p className="text-xs text-muted-foreground">{t("dashboard.interestEarnedDesc")}</p>
+          </div>
+          <div className="relative h-[220px]">
+            {loading && chartHistory.length === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+                <Spinner className="h-8 w-8" />
+                <span>Loading chart…</span>
+              </div>
+            ) : !loading && chartHistory.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                {t("dashboard.noDataYet")}
+              </div>
+            ) : (
+              <>
+                {loading && chartHistory.length === 0 && (
+                  <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-card/80">
+                    <Spinner className="h-8 w-8" />
+                  </div>
+                )}
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={chartHistory.length > 0 ? chartHistory : chartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
+                    <XAxis dataKey="date" tick={{ fill: "var(--muted-foreground)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} />
+                    <YAxis tick={{ fill: "var(--muted-foreground)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: "var(--card)",
+                        borderColor: "var(--border)",
+                        borderRadius: "8px",
+                        color: "var(--card-foreground)",
+                        fontSize: "12px",
+                      }}
+                    />
+                    <Bar dataKey="interest" fill="var(--chart-1)" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
 
       {/* Trading record (repaid funding trades from Bitfinex) */}
       {fundingTrades.length > 0 && (
@@ -429,220 +563,6 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
           )}
         </div>
       )}
-
-      {/* Trial Countdown Bar */}
-      <div className="rounded-xl border border-emerald/20 bg-card p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald/10">
-              <Clock className="h-5 w-5 text-emerald" />
-            </div>
-            <div>
-              <p className="text-sm font-semibold text-foreground">Token credit</p>
-              <p className="text-xs text-muted-foreground">0.1 USD gross profit = 1 token used</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-sm font-bold text-emerald">
-              {tokensRemaining !== null ? `${Math.round(tokensRemaining)} tokens remaining` : "—"}
-            </span>
-            <span className="text-xs text-muted-foreground">{t("header.lendingLimit")}: ${(lendingLimit ?? 0).toLocaleString()}</span>
-            <button
-              onClick={() => onUpgradeClick?.()}
-              className="rounded-lg bg-emerald px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
-            >
-              {t("dashboard.upgradeToPro")}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Charts Row */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Lending Volume Chart */}
-        <div className="rounded-xl border border-border bg-card p-5">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h3 className="text-sm font-semibold text-foreground">{t("dashboard.lendingVolume24h")}</h3>
-              <p className="text-xs text-muted-foreground">{t("dashboard.lendingVolumeDesc")}</p>
-            </div>
-            <div className="flex items-center gap-1 rounded-lg border border-border p-0.5">
-              {["7d", "30d", "90d"].map((range) => (
-                <button
-                  key={range}
-                  onClick={() => setTimeRange(range)}
-                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
-                    timeRange === range
-                      ? "bg-emerald text-primary-foreground"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {range}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="h-[220px]">
-            {!loading && chartHistory.length === 0 ? (
-              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                {t("dashboard.noDataYet")}
-              </div>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chartHistory.length > 0 ? chartHistory : chartData}>
-                  <defs>
-                    <linearGradient id="volumeGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
-                      <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                  <XAxis dataKey="date" tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
-                  <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: "#0f1729",
-                      borderColor: "#1e293b",
-                      borderRadius: "8px",
-                      color: "#e2e8f0",
-                      fontSize: "12px",
-                    }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="volume"
-                    stroke="#10b981"
-                    strokeWidth={2}
-                    fill="url(#volumeGradient)"
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-        </div>
-
-        {/* Interest Earned Chart */}
-        <div className="rounded-xl border border-border bg-card p-5">
-          <div className="mb-4">
-            <h3 className="text-sm font-semibold text-foreground">{t("dashboard.interestEarned")}</h3>
-            <p className="text-xs text-muted-foreground">{t("dashboard.interestEarnedDesc")}</p>
-          </div>
-          <div className="h-[220px]">
-            {!loading && chartHistory.length === 0 ? (
-              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                {t("dashboard.noDataYet")}
-              </div>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={chartHistory.length > 0 ? chartHistory : chartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                <XAxis dataKey="date" tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
-                <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} axisLine={{ stroke: "#1e293b" }} />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "#0f1729",
-                    borderColor: "#1e293b",
-                    borderRadius: "8px",
-                    color: "#e2e8f0",
-                    fontSize: "12px",
-                  }}
-                />
-                <Bar dataKey="interest" fill="#10b981" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Active Lending Engines Table */}
-      <div className="rounded-xl border border-border bg-card">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-5">
-          <div>
-            <h3 className="text-sm font-semibold text-foreground">Active Lending Engines</h3>
-            <p className="text-xs text-muted-foreground">Market conditions and your active lending positions</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span className="h-2 w-2 rounded-full bg-emerald"></span>
-              {lendingEngines.filter((e) => e.status === "Active").length} Active
-            </span>
-            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span className="h-2 w-2 rounded-full bg-chart-2"></span>
-              {lendingEngines.filter((e) => e.status === "Paused").length} Paused
-            </span>
-          </div>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm" role="table">
-            <thead>
-              <tr className="border-b border-border text-xs uppercase text-muted-foreground">
-                <th className="px-5 py-3 font-medium">Currency</th>
-                <th className="px-5 py-3 font-medium">Status</th>
-                <th className="px-5 py-3 font-medium text-right">Rate</th>
-                <th className="hidden px-5 py-3 font-medium text-right md:table-cell">1d Change</th>
-                <th className="hidden px-5 py-3 font-medium text-right lg:table-cell">Market Vol.</th>
-                <th className="px-5 py-3 font-medium text-right">Lent</th>
-                <th className="hidden px-5 py-3 font-medium text-right sm:table-cell">Earned</th>
-                <th className="hidden px-5 py-3 font-medium text-right md:table-cell">Offers</th>
-              </tr>
-            </thead>
-            <tbody>
-              {lendingEngines.map((engine) => (
-                <tr
-                  key={engine.currency}
-                  className="border-b border-border/50 transition-colors hover:bg-secondary/30"
-                >
-                  <td className="px-5 py-3.5">
-                    <div className="flex items-center gap-2.5">
-                      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-secondary text-xs font-bold text-foreground">
-                        {engine.currency.charAt(0)}
-                      </div>
-                      <span className="font-medium text-foreground">{engine.currency}</span>
-                    </div>
-                  </td>
-                  <td className="px-5 py-3.5">
-                    <span
-                      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                        engine.status === "Active"
-                          ? "bg-emerald/10 text-emerald"
-                          : "bg-chart-2/10 text-chart-2"
-                      }`}
-                    >
-                      <span
-                        className={`h-1.5 w-1.5 rounded-full ${
-                          engine.status === "Active" ? "bg-emerald" : "bg-chart-2"
-                        }`}
-                      ></span>
-                      {engine.status}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3.5 text-right font-mono text-foreground">{engine.rate}</td>
-                  <td
-                    className={`hidden px-5 py-3.5 text-right font-mono md:table-cell ${
-                      engine.dailyChange.startsWith("+")
-                        ? "text-emerald"
-                        : "text-destructive"
-                    }`}
-                  >
-                    {engine.dailyChange}
-                  </td>
-                  <td className="hidden px-5 py-3.5 text-right font-mono text-muted-foreground lg:table-cell">
-                    {engine.amount}
-                  </td>
-                  <td className="px-5 py-3.5 text-right font-mono text-foreground">{engine.lent}</td>
-                  <td className="hidden px-5 py-3.5 text-right font-mono text-emerald sm:table-cell">
-                    {engine.earned}
-                  </td>
-                  <td className="hidden px-5 py-3.5 text-right font-mono text-muted-foreground md:table-cell">
-                    {engine.offers}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   )
 }

@@ -3,7 +3,7 @@ import { withAuth } from "next-auth/middleware";
 import { NextRequest } from "next/request";
 
 const locales = ['en', 'zh'];
-const publicPages = ['/', '/login', '/dashboard']; // Dashboard is public so "Dev: Login as" (token-only) can open it
+const publicPages = ['/', '/login', '/dashboard', '/admin-login']; // Dashboard public for "Dev: Login as"; admin-login for admin Google sign-in
 
 const intlMiddleware = createMiddleware({
   locales,

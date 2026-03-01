@@ -5,6 +5,7 @@ import { Crown, Users, Zap, Check, Loader2 } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
+import { calculateTotalBudget, calculateUsagePercentage } from "@/lib/calculateTokenUsage"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 
@@ -21,15 +22,24 @@ const PRO_TOKENS = 2000
 const AI_ULTRA_TOKENS = 9000
 const WHALES_TOKENS = 40000
 
+type TokenBalanceState = {
+  tokens_remaining: number
+  total_tokens_added: number
+  total_tokens_deducted: number
+}
+
 export function Subscription() {
   const t = useT()
   const userId = useCurrentUserId()
   const [loading, setLoading] = useState<string | null>(null) // plan key e.g. "pro" or "pro_yearly"
   const [planTier, setPlanTier] = useState<string>("trial")
-  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
+  const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
+  const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
+  const [tokenBalanceError, setTokenBalanceError] = useState<string | null>(null)
   const [addTokensUsd, setAddTokensUsd] = useState<string>("")
   const [loadingTokens, setLoadingTokens] = useState(false)
   const [depositMessage, setDepositMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
+  const [bypassPayment, setBypassPayment] = useState(false)
 
   useEffect(() => {
     if (userId == null) return
@@ -42,13 +52,55 @@ export function Subscription() {
         if (cancelled || !res.ok) return
         const data = await res.json()
         setPlanTier((data.plan_tier || "trial").toLowerCase())
-        const tr = data.tokens_remaining
-        setTokensRemaining(typeof tr === "number" ? tr : null)
       } catch {
-        if (!cancelled) setTokensRemaining(null)
+        /* ignore */
       }
     }
     run()
+    return () => { cancelled = true }
+  }, [userId])
+
+  useEffect(() => {
+    if (userId == null) {
+      setTokenBalance(null)
+      setTokenBalanceLoading(false)
+      setTokenBalanceError(null)
+      return
+    }
+    let cancelled = false
+    const fetchTokenBalance = async () => {
+      const token = await getBackendToken()
+      if (!token) {
+        if (!cancelled) setTokenBalanceLoading(false)
+        return
+      }
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, {
+          credentials: "include",
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (cancelled) return
+        if (res.ok) {
+          const data = await res.json()
+          if (!cancelled) {
+            setTokenBalance({
+              tokens_remaining: Number(data.tokens_remaining) ?? 0,
+              total_tokens_added: Number(data.total_tokens_added) ?? 0,
+              total_tokens_deducted: Number(data.total_tokens_deducted) ?? 0,
+            })
+            setTokenBalanceError(null)
+          }
+        } else {
+          if (!cancelled) setTokenBalanceError(t("settings.tokenDataContactSupport"))
+        }
+      } catch {
+        if (!cancelled) setTokenBalanceError(t("settings.tokenUsageFailed"))
+      } finally {
+        if (!cancelled) setTokenBalanceLoading(false)
+      }
+    }
+    setTokenBalanceLoading(true)
+    fetchTokenBalance()
     return () => { cancelled = true }
   }, [userId])
 
@@ -111,15 +163,30 @@ export function Subscription() {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         credentials: "include",
-        body: JSON.stringify({ usd_amount: amount }),
+        body: JSON.stringify({ usd_amount: amount, bypass_payment: bypassPayment }),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.status === "success" && data.tokens_to_award != null) {
         setDepositMessage({
           type: "success",
-          text: `${data.tokens_to_award} tokens will be added after payment`,
+          text: bypassPayment ? `${data.tokens_to_award} tokens added.` : `${data.tokens_to_award} tokens will be added after payment`,
         })
         setAddTokensUsd("")
+        if (bypassPayment && userId != null) {
+          const [statusRes, balanceRes] = await Promise.all([
+            fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers: { Authorization: `Bearer ${token}` } }),
+            fetch(`${API_BASE}/api/v1/users/me/token-balance`, { credentials: "include", headers: { Authorization: `Bearer ${token}` } }),
+          ])
+          if (balanceRes.ok) {
+            const bal = await balanceRes.json()
+            setTokenBalance({
+              tokens_remaining: Number(bal.tokens_remaining) ?? 0,
+              total_tokens_added: Number(bal.total_tokens_added) ?? 0,
+              total_tokens_deducted: Number(bal.total_tokens_deducted) ?? 0,
+            })
+            setTokenBalanceError(null)
+          }
+        }
       } else {
         setDepositMessage({
           type: "error",
@@ -142,23 +209,38 @@ export function Subscription() {
         <p className="mt-1 text-sm text-muted-foreground">{t("subscription.subtitle")}</p>
       </div>
 
-      {tokensRemaining !== null && (() => {
-        const initial = planTier === "pro" ? PRO_TOKENS : planTier === "ai_ultra" ? AI_ULTRA_TOKENS : planTier === "whales" ? WHALES_TOKENS : 100
-        const used = Math.max(0, initial - tokensRemaining)
-        const pct = initial > 0 ? Math.min(100, (used / initial) * 100) : 0
-        const runningLow = tokensRemaining < initial * 0.2 || tokensRemaining < 50
+      {/* Token usage: same data and logic as Settings (total_tokens_added, total_tokens_deducted, tokens_remaining) — show for all users */}
+      {tokenBalanceLoading && tokenBalance == null && !tokenBalanceError && (
+        <div className="rounded-xl border border-border bg-card px-4 py-4">
+          <div className="h-2 w-full rounded-full bg-muted animate-pulse" />
+          <p className="mt-2 text-xs text-muted-foreground">…</p>
+        </div>
+      )}
+      {tokenBalanceError && (
+        <div className="rounded-xl border border-border bg-card px-4 py-4">
+          <p className="text-xs text-destructive">{tokenBalanceError}</p>
+        </div>
+      )}
+      {tokenBalance != null && (() => {
+        const totalBudget = calculateTotalBudget(tokenBalance.total_tokens_added)
+        const used = tokenBalance.total_tokens_deducted
+        const pct = calculateUsagePercentage(used, totalBudget)
+        const remaining = tokenBalance.tokens_remaining
+        const runningLow = totalBudget > 0 && (remaining < totalBudget * 0.2 || remaining < 50)
         return (
           <>
             <div className="rounded-xl border border-border bg-card px-4 py-4">
               <div className="flex items-center justify-between text-sm">
                 <span className="font-medium text-foreground">{t("subscription.usageBar")}</span>
-                <span className="text-muted-foreground">{Math.round(used)} / {initial} ({pct.toFixed(0)}%)</span>
+                <span className="text-muted-foreground">
+                  {totalBudget > 0 ? `${Math.round(used)} / ${Math.round(totalBudget)} (${Math.round(pct)}%)` : `${Math.round(remaining)} tokens`}
+                </span>
               </div>
               <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-muted">
-                <div className="h-full rounded-full bg-emerald transition-all" style={{ width: `${pct}%` }} />
+                <div className="h-full rounded-full bg-emerald transition-all" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
               </div>
               <p className="mt-2 text-xs text-muted-foreground">
-                {t("subscription.tokensRemaining", { n: Math.round(tokensRemaining) })}
+                {t("subscription.tokensRemaining", { n: Math.round(remaining) })}
               </p>
               {runningLow && (
                 <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
@@ -313,7 +395,7 @@ export function Subscription() {
         </div>
       </div>
 
-      {/* Add tokens: custom USD → tokens (1 USD = 10 tokens), min $1 */}
+      {/* Add tokens: 1 USD = 100 tokens, min $1 */}
       <div className="rounded-xl border border-border bg-card p-5">
         <h3 className="text-sm font-semibold text-foreground">{t("subscription.addTokens")}</h3>
         <p className="mt-1 text-xs text-muted-foreground">{t("subscription.addTokensDesc")}</p>
@@ -333,6 +415,10 @@ export function Subscription() {
               placeholder="10"
             />
           </div>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <input type="checkbox" checked={bypassPayment} onChange={(e) => setBypassPayment(e.target.checked)} />
+            Bypass payment (dev)
+          </label>
           <button
             onClick={handlePurchaseTokens}
             disabled={loadingTokens}
@@ -350,7 +436,7 @@ export function Subscription() {
         </div>
         {addTokensUsd && Number(addTokensUsd) >= 1 && !loadingTokens && (
           <p className="mt-2 text-xs text-muted-foreground">
-            You get {Math.floor(Number(addTokensUsd) * 10)} tokens
+            You get {Math.floor(Number(addTokensUsd) * 100)} tokens (1 USD = 100 tokens)
           </p>
         )}
         {depositMessage && (

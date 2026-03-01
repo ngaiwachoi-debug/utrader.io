@@ -26,7 +26,6 @@ def test_authenticated_user_returns_correct_balance():
         user = models.User(
             email=email,
             plan_tier="trial",
-            lending_limit=250_000.0,
             rebalance_interval=30,
         )
         user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
@@ -38,7 +37,7 @@ def test_authenticated_user_returns_correct_balance():
         db.add(models.UserTokenBalance(
             user_id=user_id,
             tokens_remaining=1500.0,
-            purchased_tokens=2000.0,
+            purchased_tokens=3500.0,
             last_gross_usd_used=500.0,
         ))
         db.commit()
@@ -53,7 +52,8 @@ def test_authenticated_user_returns_correct_balance():
             assert r.status_code == 200, r.text
             data = r.json()
             assert data["tokens_remaining"] == 1500.0
-            assert data["purchased_tokens"] == 2000.0
+            assert data["total_tokens_added"] == 3500.0
+            assert data["total_tokens_deducted"] == 2000.0
             assert data["last_gross_usd_used"] == 500.0
             assert data.get("updated_at") is None or isinstance(data["updated_at"], str)
         finally:
@@ -90,7 +90,6 @@ def test_rate_limit_exceeded_returns_429():
         user = models.User(
             email=email,
             plan_tier="trial",
-            lending_limit=250_000.0,
             rebalance_interval=30,
         )
         user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
@@ -98,6 +97,12 @@ def test_rate_limit_exceeded_returns_429():
         db.commit()
         db.refresh(user)
         user_id = user.id
+        db.add(models.UserTokenBalance(
+            user_id=user_id,
+            tokens_remaining=100.0,
+            purchased_tokens=0.0,
+        ))
+        db.commit()
 
         def override_get_current_user():
             return db.query(models.User).filter(models.User.id == user_id).first()
@@ -118,8 +123,8 @@ def test_rate_limit_exceeded_returns_429():
         db.close()
 
 
-def test_no_user_token_balance_row_returns_defaults():
-    """Test 4: User has no user_token_balance row → 200 with 0 defaults."""
+def test_no_user_token_balance_row_returns_404():
+    """Test 4: User has no user_token_balance row → 404."""
     import database
     import models
     from fastapi.testclient import TestClient
@@ -132,7 +137,6 @@ def test_no_user_token_balance_row_returns_defaults():
         user = models.User(
             email=email,
             plan_tier="trial",
-            lending_limit=250_000.0,
             rebalance_interval=30,
         )
         user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
@@ -140,7 +144,6 @@ def test_no_user_token_balance_row_returns_defaults():
         db.commit()
         db.refresh(user)
         user_id = user.id
-        # Do NOT create UserTokenBalance row
 
         def override_get_current_user():
             return db.query(models.User).filter(models.User.id == user_id).first()
@@ -149,12 +152,7 @@ def test_no_user_token_balance_row_returns_defaults():
         client = TestClient(app)
         try:
             r = client.get("/api/v1/users/me/token-balance")
-            assert r.status_code == 200
-            data = r.json()
-            assert data["tokens_remaining"] == 0.0
-            assert data["purchased_tokens"] == 0.0
-            assert data["last_gross_usd_used"] == 0.0
-            assert data["updated_at"] is None
+            assert r.status_code == 404
         finally:
             app.dependency_overrides.pop(get_current_user, None)
     finally:
@@ -179,7 +177,6 @@ def test_after_deduction_balance_updates():
         user = models.User(
             email=email,
             plan_tier="trial",
-            lending_limit=250_000.0,
             rebalance_interval=30,
         )
         user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
@@ -191,7 +188,7 @@ def test_after_deduction_balance_updates():
         db.add(models.UserTokenBalance(
             user_id=user_id,
             tokens_remaining=2000.0,
-            purchased_tokens=0.0,
+            purchased_tokens=2000.0,
             last_gross_usd_used=0.0,
         ))
         db.add(models.UserProfitSnapshot(
@@ -215,6 +212,8 @@ def test_after_deduction_balance_updates():
             assert r.status_code == 200
             data = r.json()
             assert data["tokens_remaining"] == 1500.0  # 2000 - 500
+            assert data["total_tokens_added"] == 2000.0
+            assert data["total_tokens_deducted"] == 500.0
             assert data["last_gross_usd_used"] == 500.0
         finally:
             app.dependency_overrides.pop(get_current_user, None)
@@ -231,6 +230,6 @@ if __name__ == "__main__":
     test_authenticated_user_returns_correct_balance()
     test_unauthenticated_returns_401()
     test_rate_limit_exceeded_returns_429()
-    test_no_user_token_balance_row_returns_defaults()
+    test_no_user_token_balance_row_returns_404()
     test_after_deduction_balance_updates()
     print("All tests passed.")

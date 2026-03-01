@@ -6,11 +6,13 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  // Proxy API to backend so browser uses same origin (avoids CORS / "Cannot reach API server")
+  // Proxy API to backend so browser uses same origin (avoids CORS)
   async rewrites() {
-    return [
-      { source: "/api-backend/:path*", destination: "http://127.0.0.1:8000/:path*" },
-    ];
+    return {
+      fallback: [
+        { source: "/api-backend/:path*", destination: "http://127.0.0.1:8000/:path*" },
+      ],
+    };
   },
 }
 

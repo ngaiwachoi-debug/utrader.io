@@ -28,9 +28,10 @@ interface SidebarProps {
   onPageChange: (page: string) => void
   collapsed: boolean
   onToggle: () => void
+  planTier?: string
 }
 
-const navItems = [
+const allNavItems = [
   { id: "profit-center", labelKey: "sidebar.profitCenter", icon: DollarSign },
   { id: "live-status", labelKey: "sidebar.liveStatus", icon: Activity },
   { id: "market-status", labelKey: "sidebar.marketStatus", icon: BarChart3 },
@@ -41,7 +42,8 @@ const navItems = [
   { id: "settings", labelKey: "sidebar.settings", icon: Settings },
 ]
 
-export function Sidebar({ activePage, onPageChange, collapsed, onToggle }: SidebarProps) {
+export function Sidebar({ activePage, onPageChange, collapsed, onToggle, planTier = "trial" }: SidebarProps) {
+  const navItems = allNavItems
   const t = useT()
   const router = useRouter()
   const { data: session, status } = useSession()

@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import SessionLocal
 import models
+from services import token_ledger_service as token_ledger_svc
 
 # Normalize gamil -> gmail typo
 def normalize_email(email: str) -> str:
@@ -37,15 +38,9 @@ def main():
         if not user:
             print(f"No user found: {email}")
             sys.exit(1)
-        row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user.id).first()
-        if not row:
-            row = models.UserTokenBalance(user_id=user.id, purchased_tokens=0.0)
-            db.add(row)
-            db.flush()
-        prev = float(row.purchased_tokens or 0)
-        row.purchased_tokens = prev + amount
+        new_remaining = token_ledger_svc.add_tokens(db, user.id, amount, "admin_add")
         db.commit()
-        print(f"Added {amount} tokens for {email} (user_id={user.id}). Balance: {prev} -> {row.purchased_tokens}")
+        print(f"Added {amount} tokens for {email} (user_id={user.id}). New remaining: {new_remaining}")
         return 0
     finally:
         db.close()

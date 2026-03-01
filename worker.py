@@ -40,13 +40,13 @@ async def _term(redis, user_id: int, msg: str) -> None:
         pass
 
 
-# Tier rebalance intervals (minutes): Trial/Free 4h, Pro 5m, AI Ultra 30m, Whales 10m.
+# Tier rebalance intervals (minutes): Trial/Free 40m, Pro 20m, AI Ultra 10m, Whales 3m.
 PLAN_CONFIG = {
-    "trial": {"sleep_minutes": 240},
-    "free": {"sleep_minutes": 240},
-    "pro": {"sleep_minutes": 5},
-    "ai_ultra": {"sleep_minutes": 30},
-    "whales": {"sleep_minutes": 10},
+    "trial": {"sleep_minutes": 40},
+    "free": {"sleep_minutes": 40},
+    "pro": {"sleep_minutes": 20},
+    "ai_ultra": {"sleep_minutes": 10},
+    "whales": {"sleep_minutes": 3},
 }
 TOKENS_PER_USDT_GROSS = 10
 PLAN_TOKEN_CREDITS = {"trial": 100, "free": 100, "pro": 1500, "ai_ultra": 9000, "whales": 40000}

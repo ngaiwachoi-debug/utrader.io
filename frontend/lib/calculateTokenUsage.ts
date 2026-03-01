@@ -1,22 +1,20 @@
 /**
- * Token usage calculations for Settings "Token Usage" section.
- * Total Token Budget = purchased_tokens + REGISTRATION_BONUS (150).
+ * Token usage: remaining = total_tokens_added - total_tokens_deducted.
+ * Total budget = total_tokens_added; used = total_tokens_deducted.
  */
-
-export const REGISTRATION_BONUS_TOKENS = 150
 
 /**
- * Total token budget (purchased + registration bonus).
+ * Total token budget (from API total_tokens_added).
  */
-export function calculateTotalBudget(purchasedTokens: number): number {
-  return Math.max(0, Number(purchasedTokens) || 0) + REGISTRATION_BONUS_TOKENS
+export function calculateTotalBudget(totalTokensAdded: number): number {
+  return Math.max(0, Number(totalTokensAdded) ?? 0)
 }
 
 /**
- * Tokens used = total budget - remaining.
+ * Tokens used (from API total_tokens_deducted, or total budget - remaining).
  */
 export function calculateUsedTokens(totalBudget: number, remaining: number): number {
-  const rem = Math.max(0, Number(remaining) || 0)
+  const rem = Math.max(0, Number(remaining) ?? 0)
   return Math.max(0, totalBudget - rem)
 }
 

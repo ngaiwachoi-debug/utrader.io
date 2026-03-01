@@ -40,7 +40,7 @@ export const authOptions: NextAuthOptions = {
     colorScheme: "dark",
     brandColor: "#10b981",
   },
-  secret: process.env.NEXTAUTH_SECRET,
+  secret: (process.env.NEXTAUTH_SECRET || "").trim() || undefined,
 }
 
 const handler = NextAuth(authOptions)

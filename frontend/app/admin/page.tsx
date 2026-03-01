@@ -2,10 +2,12 @@
 
 import { useEffect, useState, useCallback } from "react"
 import Link from "next/link"
+import { useRouter, usePathname } from "next/navigation"
 import { useSession, signOut } from "next-auth/react"
-import { getBackendToken } from "@/lib/auth"
+import { getBackendToken, clearBackendTokenCache } from "@/lib/auth"
 import {
   AlertCircle,
+  Copy,
   RefreshCw,
   Users,
   Bot,
@@ -29,13 +31,12 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { toast } from "sonner"
 
-const ADMIN_EMAIL = (typeof process !== "undefined" && process.env.NEXT_PUBLIC_ADMIN_EMAIL) || "ngaiwanchoi@gmail.com"
+const ADMIN_EMAIL = (typeof process !== "undefined" && process.env.NEXT_PUBLIC_ADMIN_EMAIL) || "ngaiwachoi@gmail.com"
 
 type AdminUser = {
   id: number
   email: string
   plan_tier: string
-  lending_limit: number
   rebalance_interval: number
   pro_expiry: string | null
   status: string
@@ -64,6 +65,28 @@ type DeductionEntry = {
 type Health = { redis: string; db: string }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+
+function BotStatusBadge({ status }: { status: string | null | undefined }) {
+  const s = (status ?? "").toLowerCase()
+  const stopped = s === "stopped"
+  const starting = s === "starting"
+  const running = s === "running"
+  const error = !stopped && !starting && !running && (s === "error" || s === "failed" || s.length > 0)
+  const circleClass = running
+    ? "bg-emerald-500"
+    : starting
+      ? "bg-yellow-500"
+      : error
+        ? "bg-red-500"
+        : "bg-muted-foreground"
+  const label = status ?? "—"
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className={`h-2 w-2 shrink-0 rounded-full ${circleClass}`} title={label} aria-hidden />
+      <span>{label}</span>
+    </span>
+  )
+}
 
 function NotificationFormInline({ backendToken, onSent }: { backendToken: string | null; onSent: () => void }) {
   const [title, setTitle] = useState("")
@@ -137,6 +160,8 @@ const SECTIONS = [
 type SectionId = (typeof SECTIONS)[number]["id"]
 
 export default function AdminPage() {
+  const router = useRouter()
+  const pathname = usePathname()
   const { data: session, status: sessionStatus } = useSession()
   const [backendToken, setBackendToken] = useState<string | null>(null)
   const [section, setSection] = useState<SectionId>("users")
@@ -159,6 +184,7 @@ export default function AdminPage() {
   const [botLogsUserId, setBotLogsUserId] = useState("")
   const [botLogs, setBotLogs] = useState<string[]>([])
   const [botLogsLoading, setBotLogsLoading] = useState(false)
+  const [stopCooldownUntil, setStopCooldownUntil] = useState<Record<number, number>>({})
   const [auditLogs, setAuditLogs] = useState<{ ts: string; email: string; action: string; detail: Record<string, unknown> }[]>([])
   const [auditLoading, setAuditLoading] = useState(false)
   const [apiKeys, setApiKeys] = useState<{ user_id: number; email: string; has_keys: boolean; key_masked?: string; last_tested_at?: string }[]>([])
@@ -184,9 +210,11 @@ export default function AdminPage() {
   const [deductionEndDate, setDeductionEndDate] = useState("")
 
   const handleSessionExpired = useCallback(() => {
-    signOut({ callbackUrl: "/" })
-    window.location.href = "/"
-  }, [signOut])
+    clearBackendTokenCache()
+    const locale = pathname?.startsWith("/zh") ? "zh" : "en"
+    signOut({ callbackUrl: `/${locale}/admin-login` })
+    window.location.href = `/${locale}/admin-login`
+  }, [signOut, pathname])
 
   useEffect(() => {
     if (sessionStatus !== "authenticated") return
@@ -416,7 +444,6 @@ export default function AdminPage() {
     const body: Record<string, unknown> = {
       plan_tier: updates.plan_tier,
       pro_expiry: updates.pro_expiry,
-      lending_limit: updates.lending_limit,
       rebalance_interval: updates.rebalance_interval,
     }
     if (updates.tokens_remaining !== undefined) body.tokens_remaining = updates.tokens_remaining
@@ -452,8 +479,34 @@ export default function AdminPage() {
     }
   }
 
+  const adminBotRestart = async (userId: number) => {
+    if (!backendToken) return
+    try {
+      await fetch(`${API_BASE}/admin/bot/stop/${userId}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${backendToken}` },
+      })
+      await new Promise((r) => setTimeout(r, 2000))
+      const res = await fetch(`${API_BASE}/admin/bot/start/${userId}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${backendToken}` },
+      })
+      if (res.ok) void fetchUsers(backendToken)
+    } catch {
+      // ignore
+    }
+  }
+
   const adminBotStop = async (userId: number) => {
     if (!backendToken) return
+    setStopCooldownUntil((prev) => ({ ...prev, [userId]: Date.now() + 4000 }))
+    setTimeout(() => {
+      setStopCooldownUntil((prev) => {
+        const next = { ...prev }
+        delete next[userId]
+        return next
+      })
+    }, 4000)
     try {
       const res = await fetch(`${API_BASE}/admin/bot/stop/${userId}`, {
         method: "POST",
@@ -545,6 +598,15 @@ export default function AdminPage() {
       (u.plan_tier || "").toLowerCase().includes(userSearch.toLowerCase()) ||
       (u.bot_status || "").toLowerCase().includes(userSearch.toLowerCase())
   )
+  const botStatusOrder = (s: string | null | undefined) => {
+    const x = (s ?? "").toLowerCase()
+    if (x === "error" || x === "failed") return 0
+    if (x === "running") return 1
+    if (x === "starting") return 2
+    return 3
+  }
+  const sortedUsers = [...filteredUsers].sort((a, b) => botStatusOrder(a.bot_status) - botStatusOrder(b.bot_status))
+  const sortedUsersForBot = [...users].sort((a, b) => botStatusOrder(a.bot_status) - botStatusOrder(b.bot_status))
 
   if (sessionStatus === "loading" || (sessionStatus === "authenticated" && !backendToken)) {
     return (
@@ -555,21 +617,11 @@ export default function AdminPage() {
   }
 
   if (sessionStatus === "unauthenticated") {
+    const locale = pathname?.startsWith("/zh") ? "zh" : "en"
+    router.replace(`/${locale}/admin-login`)
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
-        <Card className="w-full max-w-sm">
-          <CardHeader>
-            <CardTitle>Admin access</CardTitle>
-            <p className="text-xs text-muted-foreground">
-              Sign in with Google. Admin panel is restricted to <span className="font-semibold">{ADMIN_EMAIL}</span>.
-            </p>
-          </CardHeader>
-          <CardContent>
-            <Link href="/login">
-              <Button className="w-full">Sign in with Google</Button>
-            </Link>
-          </CardContent>
-        </Card>
+        <p className="text-sm text-muted-foreground">Redirecting to admin login…</p>
       </div>
     )
   }
@@ -668,11 +720,11 @@ export default function AdminPage() {
                         <th className="text-left py-2 px-2">Bot</th>
                         <th className="text-left py-2 px-2">Status</th>
                         <th className="text-left py-2 px-2">Created</th>
-                        <th className="text-left py-2 px-2">Actions</th>
+                        <th className="text-right py-2 px-2">Actions</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredUsers.map((u) => (
+                      {sortedUsers.map((u) => (
                         <tr key={u.id} className="border-b border-border/50">
                           <td className="py-2 px-2">{u.id}</td>
                           <td className="py-2 px-2 font-medium">
@@ -680,36 +732,15 @@ export default function AdminPage() {
                           </td>
                           <td className="py-2 px-2">{u.plan_tier}</td>
                           <td className="py-2 px-2">{u.tokens_remaining != null ? u.tokens_remaining.toFixed(0) : "—"}</td>
-                          <td className="py-2 px-2">{u.bot_status ?? "—"}</td>
+                          <td className="py-2 px-2"><BotStatusBadge status={u.bot_status} /></td>
                           <td className="py-2 px-2">{u.status}</td>
                           <td className="py-2 px-2 text-muted-foreground">{u.created_at ? new Date(u.created_at).toLocaleDateString() : "—"}</td>
                           <td className="py-2 px-2">
-                            <div className="flex flex-wrap gap-1 items-center">
+                            <div className="flex items-center justify-end gap-2">
+                              <span className="text-muted-foreground text-xs">{u.plan_tier ?? "—"}</span>
                               <Link href={`/admin/users/${u.id}`}>
                                 <Button size="sm" variant="ghost" className="h-7 text-xs">View</Button>
                               </Link>
-                              {["trial", "pro", "expert", "guru"].map((tier) => (
-                                <button
-                                  key={tier}
-                                  type="button"
-                                  onClick={() => handleUpdate(u, { plan_tier: tier })}
-                                  className={`rounded px-2 py-0.5 text-xs border ${
-                                    u.plan_tier === tier ? "bg-emerald text-white border-emerald" : "border-border"
-                                  }`}
-                                >
-                                  {tier}
-                                </button>
-                              ))}
-                              <input
-                                type="number"
-                                placeholder="Tokens"
-                                className="w-16 rounded border border-border px-1 py-0.5 text-xs"
-                                onBlur={(e) => {
-                                  const v = e.target.value
-                                  const n = parseFloat(v)
-                                  if (v !== "" && !isNaN(n) && n >= 0) handleUpdate(u, { tokens_remaining: n })
-                                }}
-                              />
                             </div>
                           </td>
                         </tr>
@@ -859,19 +890,31 @@ export default function AdminPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {users.map((u) => (
+                        {sortedUsersForBot.map((u) => (
                           <tr key={u.id} className="border-b border-border/50">
                             <td className="py-2 px-2">{u.id}</td>
                             <td className="py-2 px-2">{u.email}</td>
-                            <td className="py-2 px-2">{u.bot_status ?? "—"}</td>
+                            <td className="py-2 px-2"><BotStatusBadge status={u.bot_status} /></td>
                             <td className="py-2 px-2 flex gap-1">
-                              <Button size="sm" variant="outline" onClick={() => adminBotStart(u.id)}>
-                                <Play className="h-3 w-3 mr-1" />
-                                Start
-                              </Button>
-                              <Button size="sm" variant="outline" onClick={() => adminBotStop(u.id)}>
+                              {((u.bot_status ?? "").toLowerCase() === "stopped" ? (
+                                <Button size="sm" variant="outline" onClick={() => adminBotStart(u.id)}>
+                                  <Play className="h-3 w-3 mr-1" />
+                                  Start
+                                </Button>
+                              ) : (
+                                <Button size="sm" variant="outline" onClick={() => adminBotRestart(u.id)}>
+                                  <RefreshCw className="h-3 w-3 mr-1" />
+                                  Restart
+                                </Button>
+                              ))}
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={(stopCooldownUntil[u.id] ?? 0) > Date.now()}
+                                onClick={() => adminBotStop(u.id)}
+                              >
                                 <Square className="h-3 w-3 mr-1" />
-                                Stop
+                                {(stopCooldownUntil[u.id] ?? 0) > Date.now() ? "Stop (cooldown)" : "Stop"}
                               </Button>
                             </td>
                           </tr>
@@ -1067,8 +1110,28 @@ export default function AdminPage() {
                         <tr key={w.id} className={`border-b border-border/50 ${w.status === "pending" ? "bg-amber-500/10" : ""}`}>
                           <td className="py-2 px-2">{w.id}</td>
                           <td className="py-2 px-2">{w.email} ({w.user_id})</td>
-                          <td className="py-2 px-2">{w.amount}</td>
-                          <td className="py-2 px-2 truncate max-w-[120px]" title={w.address}>{w.address}</td>
+                          <td className="py-2 px-2">
+                            <button
+                              type="button"
+                              onClick={() => { navigator.clipboard.writeText(String(w.amount)); toast.success("Amount copied") }}
+                              className="inline-flex items-center gap-1.5 rounded hover:bg-muted/80 px-1 -mx-1 py-0.5"
+                              title="Copy amount"
+                            >
+                              {w.amount}
+                              <Copy className="h-3 w-3 shrink-0 text-muted-foreground" />
+                            </button>
+                          </td>
+                          <td className="py-2 px-2 max-w-[180px]">
+                            <button
+                              type="button"
+                              onClick={() => { navigator.clipboard.writeText(w.address); toast.success("Address copied") }}
+                              className="inline-flex items-center gap-1.5 rounded hover:bg-muted/80 px-1 -mx-1 py-0.5 w-full text-left truncate"
+                              title={w.address}
+                            >
+                              <span className="truncate">{w.address}</span>
+                              <Copy className="h-3 w-3 shrink-0 text-muted-foreground" />
+                            </button>
+                          </td>
                           <td className="py-2 px-2">{w.status}</td>
                           <td className="py-2 px-2 text-muted-foreground">{w.created_at ? new Date(w.created_at).toLocaleString() : "—"}</td>
                           <td className="py-2 px-2 text-muted-foreground text-xs">{w.processed_by ?? "—"}</td>

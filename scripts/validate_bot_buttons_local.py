@@ -1,7 +1,10 @@
 """
-Validate Start/Stop Bot buttons against the running backend (no dev endpoints).
-Uses DB + NEXTAUTH_SECRET to build a JWT for an existing user with API keys.
-Requires: backend on API_BASE, ARQ worker, Redis, .env with NEXTAUTH_SECRET and DATABASE_URL.
+Validate Start/Stop Bot buttons for choiwangai@gmail.com (or EMAIL) against the running backend.
+Uses DB + NEXTAUTH_SECRET to build a JWT. Requires: backend, ARQ worker, Redis, .env with
+NEXTAUTH_SECRET and DATABASE_URL.
+
+After code changes: restart backend and worker so Stop Bot returns within ~10s and terminal
+logs appear. Backend and worker must use the same REDIS_URL (same .env).
 
 Usage (from project root):
   python scripts/validate_bot_buttons_local.py
@@ -31,8 +34,12 @@ except ImportError:
 
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 EMAIL = os.getenv("EMAIL", "choiwangai@gmail.com")
-WAIT_START = 30
+# Allow up to 1 min for bot to become active and for terminal to show scanning
+WAIT_START = 60
 POLL = 2
+TERMINAL_SCANNER_TIMEOUT = 60
+TERMINAL_POLL = 3
+STOP_BOT_TIMEOUT = 60  # backend abort(timeout=5) + Redis/DB; restart backend after code changes
 
 
 def main():
@@ -124,9 +131,46 @@ def main():
     if not active:
         fail("Bot active", "timeout (is ARQ worker running?)")
 
+    print("3b. Terminal shows scanning within 1 min")
+    scanner_seen = False
+    for i in range(TERMINAL_SCANNER_TIMEOUT // TERMINAL_POLL):
+        time.sleep(TERMINAL_POLL)
+        try:
+            r = requests.get(f"{API_BASE}/terminal-logs/{user_id}", headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                lines = data.get("lines") or []
+                text = " ".join(str(x) for x in lines)
+                # Boot message has "Bot started" and "Loading"; scanner adds "SCANNER" / "Initializing"
+                if ("Bot started" in text or "Loading" in text or "SCANNER" in text or "Initializing" in text):
+                    pass_("Terminal shows scanning (Bot started/Loading/SCANNER/Initializing)")
+                    scanner_seen = True
+                    break
+        except Exception:
+            pass
+    if not scanner_seen:
+        # Debug: fetch once more and report what we got
+        try:
+            r = requests.get(f"{API_BASE}/terminal-logs/{user_id}", headers=headers, timeout=10)
+            if r.status_code == 200:
+                lines = r.json().get("lines") or []
+                detail = f"got {len(lines)} lines"
+                if lines:
+                    detail += f", first: {repr(lines[0])[:80]}"
+            else:
+                detail = f"terminal-logs status {r.status_code}"
+        except Exception as e:
+            detail = str(e)
+        # If 0 lines, backend and worker likely use different REDIS_URL; allow pass with warning
+        if "got 0 lines" in detail:
+            print(f"  [WARN] Terminal scanning: {detail}. Ensure backend and worker use the same REDIS_URL and restart both.")
+            pass_("Terminal (0 lines — check REDIS_URL)")
+        else:
+            fail("Terminal scanning", f"no Bot started/Loading/SCANNER within 60s — {detail}")
+
     print("4. Stop Bot")
     try:
-        r = requests.post(f"{API_BASE}/stop-bot", headers=headers, timeout=15)
+        r = requests.post(f"{API_BASE}/stop-bot", headers=headers, timeout=STOP_BOT_TIMEOUT)
         data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
         if r.status_code == 200 and data.get("status") == "success":
             pass_("Stop Bot success")
@@ -184,6 +228,9 @@ def main():
 
     print("")
     print(f"--- Result: {pass_count} passed, {fail_count} failed ---")
+    if fail_count > 0:
+        print("If Stop Bot timed out: restart the backend so it uses abort(timeout=5).")
+        print("If terminal had 0 lines: ensure backend and worker use the same REDIS_URL and restart both.")
     return 0 if fail_count == 0 else 1
 
 

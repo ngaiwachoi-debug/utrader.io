@@ -22,6 +22,7 @@ type Overview = {
   withdrawals: Record<string, unknown>[]
   deduction_history: Record<string, unknown>[]
   audit_entries: Record<string, unknown>[]
+  edits_locked?: boolean
 }
 
 export default function AdminUserDetailPage() {
@@ -32,7 +33,14 @@ export default function AdminUserDetailPage() {
   const [overview, setOverview] = useState<Overview | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [adjustTokens, setAdjustTokens] = useState("")
+  const [addTokensAmount, setAddTokensAmount] = useState("")
+  const [deductTokensAmount, setDeductTokensAmount] = useState("")
+  const [tokenMessage, setTokenMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
+  const [tokenLoading, setTokenLoading] = useState<"add" | "deduct" | null>(null)
+  const [actionLoading, setActionLoading] = useState<string | null>(null)
+  const [profileMessage, setProfileMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
+  const [usdtMessage, setUsdtMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
+  const [apiKeyMessage, setApiKeyMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [adjustUsdt, setAdjustUsdt] = useState("")
   const [setPlanTier, setSetPlanTier] = useState("")
   const [extendDays, setExtendDays] = useState("")
@@ -86,6 +94,12 @@ export default function AdminUserDetailPage() {
 
   const u = overview.user as Record<string, unknown>
   const uid = Number(user_id)
+  const editsDisabled = actionLoading !== null || tokenLoading !== null || !!overview?.edits_locked
+  const refetchOverview = async () => {
+    if (!token) return
+    const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } })
+    if (r.ok) setOverview(await r.json())
+  }
 
   return (
     <div className="min-h-screen bg-background p-4">
@@ -99,6 +113,12 @@ export default function AdminUserDetailPage() {
         </h1>
       </div>
 
+      {overview?.edits_locked && (
+        <p className="mb-4 rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-2 text-sm text-amber-700 dark:text-amber-400">
+          Edits are disabled during the daily fee window (09:55–10:35 UTC). Buttons will be clickable again after the job finishes.
+        </p>
+      )}
+
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader><CardTitle>Profile</CardTitle></CardHeader>
@@ -107,17 +127,44 @@ export default function AdminUserDetailPage() {
             <p>Pro expiry: {u.pro_expiry ? new Date(String(u.pro_expiry)).toLocaleString() : "—"}</p>
             <p>Created: {u.created_at ? new Date(String(u.created_at)).toLocaleString() : "—"}</p>
             <p>Referral code: {String(u.referral_code ?? "—")} · Referred by: {u.referred_by != null ? String(u.referred_by) : "—"}</p>
-            <div className="flex flex-wrap gap-2 mt-2">
-              <select className="rounded border border-border px-2 py-1 text-sm" value={setPlanTier} onChange={(e) => setSetPlanTier(e.target.value)}>
-                <option value="">Set plan…</option>
-                <option value="trial">trial</option>
-                <option value="pro">pro</option>
-                <option value="expert">expert</option>
-                <option value="guru">guru</option>
-              </select>
-              <Button size="sm" disabled={!setPlanTier || !token} onClick={async () => { if (!token || !setPlanTier) return; await fetch(`${API_BASE}/admin/users/${uid}/set-plan`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ plan_tier: setPlanTier }) }); setSetPlanTier(""); const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } }); if (r.ok) setOverview(await r.json()) }}>Set plan</Button>
-              <Input type="number" placeholder="Extend expiry (days)" className="w-36" value={extendDays} onChange={(e) => setExtendDays(e.target.value)} />
-              <Button size="sm" disabled={!extendDays || !token} onClick={async () => { if (!token || extendDays === "") return; const days = parseInt(extendDays, 10); if (isNaN(days)) return; await fetch(`${API_BASE}/admin/users/${uid}/extend-expiry`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ days }) }); setExtendDays(""); const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } }); if (r.ok) setOverview(await r.json()) }}>Extend expiry</Button>
+            {profileMessage && (
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${profileMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{profileMessage.text}</p>
+            )}
+            <div className="flex flex-col gap-3 mt-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <select className="rounded border border-border px-2 py-1 text-sm focus:text-black [&_option]:text-black" value={setPlanTier} onChange={(e) => { setSetPlanTier(e.target.value); setProfileMessage(null) }} disabled={editsDisabled}>
+                  <option value="">Set plan…</option>
+                  <option value="trial">trial</option>
+                  <option value="free">free</option>
+                  <option value="pro">pro</option>
+                  <option value="ai_ultra">ai_ultra</option>
+                  <option value="whales">whales</option>
+                </select>
+                <Button size="sm" type="button" disabled={editsDisabled || !setPlanTier || !token} onClick={async () => {
+                  if (!token || !setPlanTier) return
+                  setActionLoading("set_plan"); setProfileMessage(null)
+                  try {
+                    const res = await fetch(`${API_BASE}/admin/users/${uid}/set-plan`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ plan_tier: setPlanTier }) })
+                    const data = await res.json().catch(() => ({}))
+                    if (!res.ok) { setProfileMessage({ type: "error", text: `Set plan failed: ${res.status}. ${typeof data?.detail === "string" ? data.detail : data?.detail ?? "No details"}` }); return }
+                    setSetPlanTier(""); setProfileMessage({ type: "success", text: `Plan set to ${setPlanTier}.` }); await refetchOverview()
+                  } finally { setActionLoading(null) }
+                }}>{actionLoading === "set_plan" ? "Saving…" : "Set plan"}</Button>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Input type="number" placeholder="Extend expiry (days)" className="w-36" value={extendDays} onChange={(e) => { setExtendDays(e.target.value); setProfileMessage(null) }} disabled={editsDisabled} />
+                <Button size="sm" type="button" disabled={editsDisabled || !extendDays || !token} onClick={async () => {
+                  if (!token || extendDays === "") return
+                  const days = parseInt(extendDays, 10); if (isNaN(days)) return
+                  setActionLoading("extend_expiry"); setProfileMessage(null)
+                  try {
+                    const res = await fetch(`${API_BASE}/admin/users/${uid}/extend-expiry`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ days }) })
+                    const data = await res.json().catch(() => ({}))
+                    if (!res.ok) { setProfileMessage({ type: "error", text: `Extend expiry failed: ${res.status}. ${typeof data?.detail === "string" ? data.detail : data?.detail ?? "No details"}` }); return }
+                    setExtendDays(""); setProfileMessage({ type: "success", text: `Expiry extended by ${days} days.` }); await refetchOverview()
+                  } finally { setActionLoading(null) }
+                }}>{actionLoading === "extend_expiry" ? "Saving…" : "Extend expiry"}</Button>
+              </div>
             </div>
           </CardContent>
         </Card>
@@ -126,20 +173,113 @@ export default function AdminUserDetailPage() {
           <CardHeader><CardTitle>Token balance</CardTitle></CardHeader>
           <CardContent className="text-sm">
             {overview.token_balance ? (
-              <p>Remaining: {String(overview.token_balance.tokens_remaining)} · Purchased: {String(overview.token_balance.purchased_tokens)} · Last gross used: {String(overview.token_balance.last_gross_usd_used)}</p>
+              <p>Remaining: {String(overview.token_balance.tokens_remaining)} · Total added: {String(overview.token_balance.total_tokens_added)} · Total deducted: {String(overview.token_balance.total_tokens_deducted)} · Last gross used: {String(overview.token_balance.last_gross_usd_used)}</p>
             ) : (
               <p>No balance row.</p>
             )}
-            <div className="flex gap-2 mt-2">
-              <Input type="number" placeholder="Set tokens" className="w-28" value={adjustTokens} onChange={(e) => setAdjustTokens(e.target.value)} />
-              <Button size="sm" onClick={async () => {
-                const v = parseFloat(adjustTokens)
-                if (!token || isNaN(v) || v < 0) return
-                await fetch(`${API_BASE}/admin/users/${uid}`, { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ tokens_remaining: v }) })
-                setAdjustTokens("")
-                const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } })
-                if (r.ok) setOverview(await r.json())
-              }}>Apply</Button>
+            {tokenMessage && (
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${tokenMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{tokenMessage.text}</p>
+            )}
+            <div className="flex flex-wrap gap-4 mt-3">
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  placeholder="Amount to add"
+                  className="w-28"
+                  min={0}
+                  step={1}
+                  value={addTokensAmount}
+                  onChange={(e) => { setAddTokensAmount(e.target.value); setTokenMessage(null) }}
+                  disabled={editsDisabled}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={editsDisabled || !addTokensAmount.trim() || parseFloat(addTokensAmount) <= 0}
+                  onClick={async () => {
+                    const v = parseFloat(addTokensAmount)
+                    if (!token || isNaN(v) || v <= 0) return
+                    setTokenLoading("add")
+                    setTokenMessage(null)
+                    try {
+                      const url = `${API_BASE}/admin/users/${uid}/tokens/add`
+                      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ amount: v }) })
+                      const data = await res.json().catch(() => ({}))
+                      if (!res.ok) {
+                        const detail = typeof data?.detail === "string" ? data.detail : Array.isArray(data?.detail) ? data.detail.map((x: { msg?: string }) => x?.msg).filter(Boolean).join("; ") : data?.detail ?? ""
+                        const hint = res.status === 404
+                          ? " Backend may be missing this route or not running. Start with: python -m uvicorn main:app --host 127.0.0.1 --port 8000"
+                          : res.status === 403
+                            ? " Check you are signed in as the admin user (ADMIN_EMAIL in .env)."
+                            : ""
+                        setTokenMessage({ type: "error", text: `Add tokens failed: ${res.status} ${res.statusText}. ${detail || "No details"}${hint} [POST ${url}]` })
+                        return
+                      }
+                      setAddTokensAmount("")
+                      setTokenMessage({ type: "success", text: `Added ${v} tokens. New balance: ${data.tokens_remaining ?? "—"}` })
+                      const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } })
+                      if (r.ok) setOverview(await r.json())
+                    } catch (err) {
+                      const msg = err instanceof Error ? err.message : String(err)
+                      setTokenMessage({ type: "error", text: `Add tokens request failed: ${msg}. Check backend is running at ${API_BASE} (python -m uvicorn main:app --host 127.0.0.1 --port 8000).` })
+                    } finally {
+                      setTokenLoading(null)
+                    }
+                  }}
+                >
+                  {tokenLoading === "add" ? "Adding…" : "Add tokens"}
+                </Button>
+              </div>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  placeholder="Amount to deduct"
+                  className="w-28"
+                  min={0}
+                  step={1}
+                  value={deductTokensAmount}
+                  onChange={(e) => { setDeductTokensAmount(e.target.value); setTokenMessage(null) }}
+                  disabled={editsDisabled}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={editsDisabled || !deductTokensAmount.trim() || parseFloat(deductTokensAmount) <= 0}
+                  onClick={async () => {
+                    const v = parseFloat(deductTokensAmount)
+                    if (!token || isNaN(v) || v <= 0) return
+                    setTokenLoading("deduct")
+                    setTokenMessage(null)
+                    try {
+                      const url = `${API_BASE}/admin/users/${uid}/tokens/deduct`
+                      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ amount: v }) })
+                      const data = await res.json().catch(() => ({}))
+                      if (!res.ok) {
+                        const detail = typeof data?.detail === "string" ? data.detail : Array.isArray(data?.detail) ? data.detail.map((x: { msg?: string }) => x?.msg).filter(Boolean).join("; ") : data?.detail ?? ""
+                        const hint = res.status === 404
+                          ? " Backend may be missing this route or not running. Start with: python -m uvicorn main:app --host 127.0.0.1 --port 8000"
+                          : res.status === 403
+                            ? " Check you are signed in as the admin user (ADMIN_EMAIL in .env)."
+                            : ""
+                        setTokenMessage({ type: "error", text: `Deduct tokens failed: ${res.status} ${res.statusText}. ${detail || "No details"}${hint} [POST ${url}]` })
+                        return
+                      }
+                      setDeductTokensAmount("")
+                      setTokenMessage({ type: "success", text: `Deducted ${v} tokens. New balance: ${data.tokens_remaining ?? "—"}` })
+                      const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } })
+                      if (r.ok) setOverview(await r.json())
+                    } catch (err) {
+                      const msg = err instanceof Error ? err.message : String(err)
+                      setTokenMessage({ type: "error", text: `Deduct tokens request failed: ${msg}. Check backend is running at ${API_BASE} (python -m uvicorn main:app --host 127.0.0.1 --port 8000).` })
+                    } finally {
+                      setTokenLoading(null)
+                    }
+                  }}
+                >
+                  {tokenLoading === "deduct" ? "Deducting…" : "Deduct tokens"}
+                </Button>
+              </div>
             </div>
           </CardContent>
         </Card>
@@ -152,16 +292,21 @@ export default function AdminUserDetailPage() {
             ) : (
               <p>No USDT credit row.</p>
             )}
+            {usdtMessage && (
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${usdtMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{usdtMessage.text}</p>
+            )}
             <div className="flex gap-2 mt-2">
-              <Input type="number" placeholder="+ or - amount" className="w-28" value={adjustUsdt} onChange={(e) => setAdjustUsdt(e.target.value)} />
-              <Button size="sm" onClick={async () => {
-                const v = parseFloat(adjustUsdt)
-                if (!token || isNaN(v)) return
-                await fetch(`${API_BASE}/admin/usdt-credit/${uid}/adjust`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ amount: v }) })
-                setAdjustUsdt("")
-                const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } })
-                if (r.ok) setOverview(await r.json())
-              }}>Adjust</Button>
+              <Input type="number" placeholder="+ or - amount" className="w-28" value={adjustUsdt} onChange={(e) => { setAdjustUsdt(e.target.value); setUsdtMessage(null) }} disabled={editsDisabled} />
+              <Button size="sm" type="button" disabled={editsDisabled || !token} onClick={async () => {
+                const v = parseFloat(adjustUsdt); if (!token || isNaN(v)) return
+                setActionLoading("adjust_usdt"); setUsdtMessage(null)
+                try {
+                  const res = await fetch(`${API_BASE}/admin/usdt-credit/${uid}/adjust`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ amount: v }) })
+                  const data = await res.json().catch(() => ({}))
+                  if (!res.ok) { setUsdtMessage({ type: "error", text: `USDT adjust failed: ${res.status}. ${typeof data?.detail === "string" ? data.detail : data?.detail ?? "No details"}` }); return }
+                  setAdjustUsdt(""); setUsdtMessage({ type: "success", text: `Adjusted by ${v >= 0 ? "+" : ""}${v} USDT.` }); await refetchOverview()
+                } finally { setActionLoading(null) }
+              }}>{actionLoading === "adjust_usdt" ? "Saving…" : "Adjust"}</Button>
             </div>
           </CardContent>
         </Card>
@@ -169,14 +314,21 @@ export default function AdminUserDetailPage() {
         <Card>
           <CardHeader><CardTitle>API key</CardTitle></CardHeader>
           <CardContent className="text-sm">
-            {overview.api_key_status?.has_keys ? "Keys set" : "No keys"}
-            {overview.api_key_status?.has_keys && (
-              <Button size="sm" variant="destructive" className="ml-2" onClick={async () => {
+            {(overview.api_key_status && overview.api_key_status.has_keys === true) ? "Keys set" : "No keys"}
+            {apiKeyMessage && (
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${apiKeyMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{apiKeyMessage.text}</p>
+            )}
+            {Boolean(overview.api_key_status?.has_keys) && (
+              <Button size="sm" variant="destructive" className="ml-2 mt-1" type="button" disabled={editsDisabled || !token} onClick={async () => {
                 if (!token || !confirm("Reset API keys?")) return
-                await fetch(`${API_BASE}/admin/api-keys/${uid}/reset`, { method: "POST", headers: { Authorization: `Bearer ${token}` } })
-                const r = await fetch(`${API_BASE}/admin/users/${user_id}/overview`, { headers: { Authorization: `Bearer ${token}` } })
-                if (r.ok) setOverview(await r.json())
-              }}>Reset keys</Button>
+                setActionLoading("reset_keys"); setApiKeyMessage(null)
+                try {
+                  const res = await fetch(`${API_BASE}/admin/api-keys/${uid}/reset`, { method: "POST", headers: { Authorization: `Bearer ${token}` } })
+                  const data = await res.json().catch(() => ({}))
+                  if (!res.ok) { setApiKeyMessage({ type: "error", text: `Reset keys failed: ${res.status}. ${typeof data?.detail === "string" ? data.detail : data?.detail ?? "No details"}` }); return }
+                  setApiKeyMessage({ type: "success", text: "API keys reset." }); await refetchOverview()
+                } finally { setActionLoading(null) }
+              }}>{actionLoading === "reset_keys" ? "Resetting…" : "Reset keys"}</Button>
             )}
           </CardContent>
         </Card>
@@ -186,7 +338,7 @@ export default function AdminUserDetailPage() {
         <CardHeader><CardTitle>Referral</CardTitle></CardHeader>
         <CardContent className="text-sm">
           {overview.referral ? (
-            <p>Referrer: {String(overview.referral.referrer_email ?? "—")} (ID {overview.referral.referrer_id ?? "—"}) · Downlines: {String(overview.referral.downline_count)}</p>
+            <p>Referrer: {String(overview.referral.referrer_email ?? "—")} (ID {String(overview.referral.referrer_id ?? "—")}) · Downlines: {String(overview.referral.downline_count ?? "—")}</p>
           ) : (
             <p>—</p>
           )}

@@ -2,7 +2,7 @@
 
 import { useState } from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { useRouter, useParams } from "next/navigation"
 import { signIn } from "next-auth/react"
 import { useT } from "@/lib/i18n"
 import { setDevBackendToken } from "@/lib/auth"
@@ -13,6 +13,8 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 export default function LandingPage() {
   const t = useT()
   const router = useRouter()
+  const params = useParams()
+  const locale = (params?.locale as string) || "en"
   const [devLoginLoading, setDevLoginLoading] = useState(false)
   const [devLoginError, setDevLoginError] = useState<string | null>(null)
 
@@ -53,6 +55,12 @@ export default function LandingPage() {
             uTrader<span className="text-emerald">.io</span>
           </Link>
           <div className="flex items-center gap-3">
+            <Link
+              href={`/${locale}/admin-login`}
+              className="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-secondary transition-colors"
+            >
+              Admin
+            </Link>
             <Link
               href="/login"
               className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-secondary transition-colors"

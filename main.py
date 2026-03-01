@@ -88,8 +88,8 @@ RECONCILIATION_UTC_HOUR = 23
 RECONCILIATION_UTC_MINUTE = 0
 RECONCILIATION_BATCH_SIZE = 10  # process 10 users per batch; 1s delay between batches
 
-# Exclusive admin: only this email can access /admin/* (set ADMIN_EMAIL in env to override)
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "ngaiwanchoi@gmail.com").strip().lower()
+# Exclusive admin: only this email can access /admin/* (set ADMIN_EMAIL in env to override; use ngaiwachoi@gmail.com)
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "ngaiwachoi@gmail.com").strip().lower()
 
 # API failure log for admin panel (in-memory, last N entries)
 API_FAILURES_MAX = 200
@@ -967,21 +967,32 @@ def _redis_host_from_url(url: str) -> str:
 
 
 async def get_redis():
-    """Create Redis pool from REDIS_URL (.env). Uses rediss:// with SSL for Upstash."""
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    settings = RedisSettings.from_dsn(redis_url)
-    return await create_pool(settings)
+    """Create Redis pool from REDIS_URL (.env). Uses rediss:// with SSL for Upstash. Returns None on failure."""
+    try:
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        settings = RedisSettings.from_dsn(redis_url)
+        return await create_pool(settings)
+    except Exception:
+        return None
 
 
 async def get_redis_or_raise():
     """Get Redis with timeout; raises HTTPException 503 if unavailable (REDIS_URL in .env, e.g. Upstash)."""
     try:
-        return await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+        redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+        if redis is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Queue service unavailable. Check REDIS_URL in .env and Redis server reachability.",
+            )
+        return redis
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=503,
             detail="Queue service unavailable. Check REDIS_URL in .env and Redis server reachability.",
         )
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(
             status_code=503,
@@ -1051,7 +1062,11 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
 def _get_user_by_email(email: str, db: Session) -> models.User:
     if not email or not email.endswith("@gmail.com"):
         raise HTTPException(status_code=400, detail="Only @gmail.com accounts are allowed.")
-    user = db.query(models.User).filter(models.User.email == email).first()
+    try:
+        user = db.query(models.User).filter(models.User.email == email).first()
+    except Exception as e:
+        logger.exception("_get_user_by_email db query failed: %s", e)
+        raise HTTPException(status_code=500, detail="Authentication service error. Please try again.")
     if not user:
         raise HTTPException(status_code=401, detail="User not registered.")
     return user
@@ -1086,8 +1101,11 @@ async def get_current_user(
                 return _get_user_by_email(email, db)
         except jwt.PyJWTError:
             pass
-        except Exception:
-            pass
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("get_current_user JWT lookup failed: %s", e)
+            raise HTTPException(status_code=500, detail="Authentication service error. Please try again.")
 
     # 2) Fallback: Google ID token (legacy)
     try:
@@ -1096,6 +1114,8 @@ async def get_current_user(
         )
         email = idinfo.get("email")
         return _get_user_by_email(email or "", db)
+    except HTTPException:
+        raise
     except Exception:
         pass
 
@@ -1127,7 +1147,15 @@ def get_admin_user(current_user: models.User = Depends(get_current_user)) -> mod
     """
     Restrict admin endpoints to the exclusive admin email (ADMIN_EMAIL).
     """
-    if (current_user.email or "").strip().lower() != ADMIN_EMAIL:
+    incoming = (current_user.email or "").strip().lower()
+    if incoming != ADMIN_EMAIL:
+        logger.warning(
+            "admin_denied user_id=%s current_email=%r admin_email=%r match=%s",
+            getattr(current_user, "id", None),
+            current_user.email,
+            ADMIN_EMAIL,
+            incoming == ADMIN_EMAIL,
+        )
         raise HTTPException(status_code=403, detail="Not authorized.")
     return current_user
 
@@ -1297,6 +1325,14 @@ class AdminUserUpdate(BaseModel):
     tokens_remaining: Optional[float] = None
 
 
+class AdminTokenAdjustBody(BaseModel):
+    amount: float
+
+
+class AdminTokenAdjustResponse(BaseModel):
+    tokens_remaining: float
+
+
 class ApiFailureOut(BaseModel):
     id: str
     ts: str
@@ -1412,6 +1448,7 @@ class UserOverviewOut(BaseModel):
     withdrawals: List[Dict[str, Any]]
     deduction_history: List[Dict[str, Any]]
     audit_entries: List[Dict[str, Any]]
+    edits_locked: bool = False  # True during daily fee window (09:55–10:35 UTC); admin should not edit then
 
 
 # --- Google Auth Endpoint ---
@@ -1442,6 +1479,13 @@ async def get_all_bot_stats(
     user = db.query(models.User).filter(models.User.id == user_id).first()
     bot_status = getattr(user, "bot_status", None) if user else None
 
+    if redis is None:
+        return {
+            "active": bot_status in ("running", "starting"),
+            "engines": [],
+            "total_loaned": "0.00",
+            "bot_status": bot_status or "stopped",
+        }
     keys = await redis.keys(f"status:{user_id}:*")
 
     all_engines = []
@@ -1460,7 +1504,7 @@ async def get_all_bot_stats(
             "bot_status": bot_status or "stopped",
         }
 
-    total_val = sum(float(str(e["loaned"]).replace(",", "")) for e in all_engines)
+    total_val = sum(float(str(e.get("loaned", 0)).replace(",", "") or 0) for e in all_engines)
 
     return {
         "active": active,
@@ -1470,26 +1514,41 @@ async def get_all_bot_stats(
     }
 
 
-# --- Whales terminal: cached logs; user end: auth required, own data only ---
+# --- Whales terminal: cached logs + summary; user end: auth required, own data only ---
+TERMINAL_SUMMARY_KEY = "terminal_summary"
+TERMINAL_SUMMARY_TTL_SEC = 120
+
+
 @app.get("/terminal-logs/{user_id}")
 async def get_terminal_logs(
     user_id: int,
     current_user: models.User = Depends(get_current_user),
 ):
-    """Returns last 500 terminal log lines for the user (from worker). Caller must be the same user."""
+    """Returns last 300 terminal log lines and optional summary (strategy, regime, idle, next rebalance). Caller must be the same user."""
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
     try:
         redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
     except (asyncio.TimeoutError, Exception):
-        return {"lines": []}
+        return {"lines": [], "summary": None}
+    lines_decoded: list = []
+    summary_obj: dict | None = None
     try:
-        key = f"terminal_logs:{user_id}"
-        lines = await asyncio.wait_for(redis.lrange(key, 0, -1), timeout=5.0)
+        key_logs = f"terminal_logs:{user_id}"
+        lines = await asyncio.wait_for(redis.lrange(key_logs, 0, -1), timeout=5.0)
+        lines_decoded = [line.decode("utf-8") if isinstance(line, bytes) else line for line in (lines or [])]
     except (asyncio.TimeoutError, Exception):
-        return {"lines": []}
-    decoded = [line.decode("utf-8") if isinstance(line, bytes) else line for line in (lines or [])]
-    return {"lines": decoded}
+        pass
+    try:
+        key_summary = f"{TERMINAL_SUMMARY_KEY}:{user_id}"
+        raw = await redis.get(key_summary)
+        if raw:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            summary_obj = json.loads(raw)
+    except Exception:
+        summary_obj = None
+    return {"lines": lines_decoded, "summary": summary_obj}
 
 
 def _detail_invalid_keys(msg: str) -> str:
@@ -1578,7 +1637,11 @@ async def get_current_user_info(
     Returns the currently authenticated user's id and email.
     Used by the frontend to scope all user-specific API calls (wallets, stats, etc.).
     """
-    return {"id": current_user.id, "email": current_user.email}
+    try:
+        return {"id": current_user.id, "email": getattr(current_user, "email", "") or ""}
+    except Exception as e:
+        logger.exception("api/me failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to load user info.")
 
 
 @app.get("/api/keys")
@@ -2174,11 +2237,10 @@ async def dev_login_as(
     user = db.query(models.User).filter(models.User.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    token = jwt.encode(
-        {"email": user.email, "sub": str(user.id)},
-        NEXTAUTH_SECRET,
-        algorithm="HS256",
-    )
+    import time
+    now = int(time.time())
+    payload = {"email": user.email, "sub": str(user.id), "iat": now, "exp": now + 24 * 3600}
+    token = jwt.encode(payload, NEXTAUTH_SECRET, algorithm="HS256")
     return {"token": token}
 
 
@@ -2529,18 +2591,21 @@ def get_stats_history(
         out = []
         cumulative = 0.0
         for log in logs:
-            ts = log.timestamp
+            ts = getattr(log, "timestamp", None)
             date_str = ts.strftime("%m-%d") if ts else ""
-            waroc = float(log.waroc or 0.0)
+            waroc = float(getattr(log, "waroc", 0) or 0.0)
             cumulative += waroc
             out.append({
                 "date": date_str,
-                "volume": float(log.total_assets or 0.0),
+                "volume": float(getattr(log, "total_assets", 0) or 0.0),
                 "interest": waroc,
                 "cumulative": cumulative,
             })
         return out
     except (ProgrammingError, SQLAlchemyError):
+        return []
+    except Exception as e:
+        logger.exception("stats/%s/history failed: %s", user_id, e)
         return []
 
 
@@ -3149,7 +3214,7 @@ async def get_lending_stats(
         # User + vault check via raw SQL to avoid User model columns that may be missing (e.g. key_deletions)
         try:
             has_vault = db.execute(
-                text("SELECT 1 FROM users u INNER JOIN vaults v ON v.user_id = u.id WHERE u.id = :uid"),
+                text("SELECT 1 FROM users u INNER JOIN api_vault v ON v.user_id = u.id WHERE u.id = :uid"),
                 {"uid": user_id},
             ).fetchone() is not None
         except Exception:
@@ -3566,19 +3631,18 @@ def get_user_status(
         else:
             token_row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
             if not token_row:
-                logger.error("user_status user_id=%s: token balance row not found", user_id)
-                raise HTTPException(status_code=404, detail="Token balance not found. Please contact support.")
-            tokens_remaining = float(token_row.tokens_remaining or 0)
-            total_added = float(token_row.purchased_tokens or 0)
-            tokens_used = 0
+                tokens_remaining = 0.0
+                total_added = 0.0
+                tokens_used = 0
+            else:
+                tokens_remaining = float(token_row.tokens_remaining or 0)
+                total_added = float(getattr(token_row, "purchased_tokens", 0) or 0)
+                tokens_used = 0
         snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
-        if not snap:
-            logger.error("user_status user_id=%s: profit snapshot not found", user_id)
-            raise HTTPException(status_code=404, detail="Profit snapshot not found. Please contact support.")
-        if snap.gross_profit_usd is None:
-            logger.error("user_status user_id=%s: gross_profit_usd is NULL in database", user_id)
-            raise HTTPException(status_code=500, detail="Profit data is invalid. Please contact support.")
-        gross = float(snap.gross_profit_usd)
+        if not snap or snap.gross_profit_usd is None:
+            gross = 0.0
+        else:
+            gross = float(snap.gross_profit_usd)
 
         pro_expiry_iso = None
         if getattr(user, "pro_expiry", None) and user.pro_expiry:
@@ -3645,14 +3709,9 @@ def update_user(
     if payload.plan_tier is not None:
         tier = payload.plan_tier.lower()
         user.plan_tier = tier
-        if tier == "pro":
-            user.rebalance_interval = payload.rebalance_interval or 30
-        elif tier == "expert":
-            user.rebalance_interval = payload.rebalance_interval or 3
-        elif tier == "guru":
-            user.rebalance_interval = payload.rebalance_interval or 1
-        else:
-            user.rebalance_interval = payload.rebalance_interval or 3
+        # Rebalance intervals (minutes) must match worker PLAN_CONFIG
+        rebalance_by_tier = {"trial": 40, "free": 40, "pro": 20, "ai_ultra": 10, "whales": 3}
+        user.rebalance_interval = payload.rebalance_interval if payload.rebalance_interval is not None else rebalance_by_tier.get(tier, 40)
     elif payload.rebalance_interval is not None:
         user.rebalance_interval = payload.rebalance_interval
 
@@ -3691,6 +3750,56 @@ def update_user(
         bot_status=getattr(user, "bot_status", None) or "stopped",
         created_at=user.created_at.isoformat() + "Z" if getattr(user, "created_at", None) and user.created_at else None,
     )
+
+
+@app.post("/admin/users/{user_id}/tokens/add", response_model=AdminTokenAdjustResponse)
+def admin_add_tokens(
+    user_id: int,
+    payload: AdminTokenAdjustBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Add tokens to a user's balance. Uses token_ledger_svc.add_tokens with reason 'admin_add' (updates purchased_tokens for consistency)."""
+    logger.info("admin_token_add process_start user_id=%s amount=%s admin_email=%s", user_id, payload.amount, admin_user.email or "")
+    if payload.amount <= 0:
+        logger.warning("admin_token_add validation_failed user_id=%s amount=%s reason=amount_not_positive", user_id, payload.amount)
+        raise HTTPException(status_code=400, detail="amount must be positive.")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        logger.warning("admin_token_add user_not_found user_id=%s", user_id)
+        raise HTTPException(status_code=404, detail="User not found.")
+    before = token_ledger_svc.get_tokens_remaining(db, user_id)
+    logger.info("admin_token_add before_amend user_id=%s tokens_remaining_before=%s", user_id, before)
+    new_remaining = token_ledger_svc.add_tokens(db, user_id, float(payload.amount), "admin_add")
+    db.commit()
+    logger.info("admin_token_add db_amended user_id=%s amount_added=%s tokens_remaining_after=%s", user_id, payload.amount, new_remaining)
+    _admin_audit(admin_user.email or "", "admin_token_add", {"user_id": user_id, "amount": payload.amount})
+    return AdminTokenAdjustResponse(tokens_remaining=new_remaining)
+
+
+@app.post("/admin/users/{user_id}/tokens/deduct", response_model=AdminTokenAdjustResponse)
+def admin_deduct_tokens(
+    user_id: int,
+    payload: AdminTokenAdjustBody,
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Deduct tokens from a user's balance. Uses token_ledger_svc.deduct_tokens (balance floors at 0)."""
+    logger.info("admin_token_deduct process_start user_id=%s amount=%s admin_email=%s", user_id, payload.amount, admin_user.email or "")
+    if payload.amount <= 0:
+        logger.warning("admin_token_deduct validation_failed user_id=%s amount=%s reason=amount_not_positive", user_id, payload.amount)
+        raise HTTPException(status_code=400, detail="amount must be positive.")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        logger.warning("admin_token_deduct user_not_found user_id=%s", user_id)
+        raise HTTPException(status_code=404, detail="User not found.")
+    before = token_ledger_svc.get_tokens_remaining(db, user_id)
+    logger.info("admin_token_deduct before_amend user_id=%s tokens_remaining_before=%s", user_id, before)
+    new_remaining = token_ledger_svc.deduct_tokens(db, user_id, float(payload.amount))
+    db.commit()
+    logger.info("admin_token_deduct db_amended user_id=%s amount_deducted=%s tokens_remaining_after=%s", user_id, payload.amount, new_remaining)
+    _admin_audit(admin_user.email or "", "admin_token_deduct", {"user_id": user_id, "amount": payload.amount})
+    return AdminTokenAdjustResponse(tokens_remaining=new_remaining)
 
 
 @app.get("/admin/api-failures", response_model=List[ApiFailureOut])
@@ -4135,9 +4244,11 @@ def admin_set_plan(
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    user.plan_tier = (body.plan_tier or "trial").lower()
-    if body.rebalance_interval is not None:
-        user.rebalance_interval = body.rebalance_interval
+    tier = (body.plan_tier or "trial").lower()
+    user.plan_tier = tier
+    # Rebalance intervals (minutes) must match worker PLAN_CONFIG
+    rebalance_by_tier = {"trial": 40, "free": 40, "pro": 20, "ai_ultra": 10, "whales": 3}
+    user.rebalance_interval = body.rebalance_interval if body.rebalance_interval is not None else rebalance_by_tier.get(tier, 40)
     db.commit()
     db.refresh(user)
     _admin_audit(admin_user.email or "", "set_plan", {"user_id": user_id, "plan_tier": user.plan_tier})
@@ -4911,7 +5022,8 @@ def admin_user_overview(
     except Exception:
         pass
     audit_entries = audit_entries[:30]
-    return UserOverviewOut(user=user_dict, token_balance=token_balance, usdt_credit=usdt_credit, profit_snapshot=profit_snapshot, referral=referral, api_key_status=api_key_status, withdrawals=withdrawals, deduction_history=deduction_history, audit_entries=audit_entries)
+    edits_locked = _is_api_key_lock_window()
+    return UserOverviewOut(user=user_dict, token_balance=token_balance, usdt_credit=usdt_credit, profit_snapshot=profit_snapshot, referral=referral, api_key_status=api_key_status, withdrawals=withdrawals, deduction_history=deduction_history, audit_entries=audit_entries, edits_locked=edits_locked)
 
 
 def _aggregate_lent_per_currency(credits_data: Any) -> dict:
@@ -5270,6 +5382,31 @@ async def _portfolio_allocation_snapshot(mgr: BitfinexManager) -> tuple:
     return summary, log_str, rate_limited
 
 
+def _empty_wallet_response():
+    return {
+        "message": "No data yet",
+        "total_usd_all": 0.0,
+        "usd_only": 0.0,
+        "per_currency": {},
+        "per_currency_usd": {},
+        "lent_per_currency": {},
+        "offers_per_currency": {},
+        "lent_per_currency_usd": {},
+        "offers_per_currency_usd": {},
+        "idle_per_currency_usd": {},
+        "total_lent_usd": 0.0,
+        "total_offers_usd": 0.0,
+        "idle_usd": 0.0,
+        "weighted_avg_apr_pct": 0.0,
+        "est_daily_earnings_usd": 0.0,
+        "yield_over_total_pct": 0.0,
+        "credits_count": 0,
+        "offers_count": 0,
+        "credits_detail": [],
+        "offers_detail": [],
+    }
+
+
 @app.get("/wallets/{user_id}")
 async def wallet_summary(
     user_id: int,
@@ -5285,43 +5422,41 @@ async def wallet_summary(
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
     try:
         user = db.query(models.User).filter(models.User.id == user_id).first()
-        if not user or not user.vault:
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        vault = getattr(user, "vault", None)
+        if not vault:
             raise HTTPException(status_code=404, detail="API keys not found.")
+    except HTTPException:
+        raise
     except (ProgrammingError, SQLAlchemyError):
-        return {
-            "message": "No data yet",
-            "total_usd_all": 0.0,
-            "usd_only": 0.0,
-            "per_currency": {},
-            "per_currency_usd": {},
-            "lent_per_currency": {},
-            "offers_per_currency": {},
-            "lent_per_currency_usd": {},
-            "offers_per_currency_usd": {},
-            "idle_per_currency_usd": {},
-            "total_lent_usd": 0.0,
-            "total_offers_usd": 0.0,
-            "idle_usd": 0.0,
-            "weighted_avg_apr_pct": 0.0,
-            "est_daily_earnings_usd": 0.0,
-            "yield_over_total_pct": 0.0,
-            "credits_count": 0,
-            "offers_count": 0,
-            "credits_detail": [],
-            "offers_detail": [],
-        }
+        return _empty_wallet_response()
+    except Exception as e:
+        logger.exception("wallets/%s load user/vault failed: %s", user_id, e)
+        return _empty_wallet_response()
 
-    cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
-    if cached is not None:
-        data, from_cache = cached
-        if from_cache and data is not None:
-            response.headers["X-Data-Source"] = "cache"
-            exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_WALLETS)
-            if exp is not None:
-                response.headers["X-Cache-Expires-At"] = str(int(exp))
-            return data
+    try:
+        cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
+    except Exception as e:
+        logger.exception("wallets/%s cache get failed: %s", user_id, e)
+        return _empty_wallet_response()
 
-    if await bitfinex_cache.is_in_cooldown(user_id, bitfinex_cache.KEY_WALLETS):
+    try:
+        if cached is not None:
+            data, from_cache = cached
+            if from_cache and data is not None:
+                response.headers["X-Data-Source"] = "cache"
+                exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_WALLETS)
+                if exp is not None:
+                    response.headers["X-Cache-Expires-At"] = str(int(exp))
+                return data
+
+        in_cooldown = await bitfinex_cache.is_in_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
+    except Exception as e:
+        logger.exception("wallets/%s cache/cooldown failed: %s", user_id, e)
+        return _empty_wallet_response()
+
+    if in_cooldown:
         response.headers["X-Data-Source"] = "cache"
         response.headers["X-Rate-Limited"] = "true"
         response.headers["Retry-After"] = "60"
@@ -5370,9 +5505,16 @@ async def wallet_summary(
         raise
     except Exception as e:
         if bitfinex_cache.is_rate_limit_error(str(e)):
-            await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
-        raise
-    await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_WALLETS, summary)
+            try:
+                await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
+            except Exception:
+                pass
+        logger.exception("wallets/%s Bitfinex snapshot failed: %s", user_id, e)
+        return _empty_wallet_response()
+    try:
+        await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_WALLETS, summary)
+    except Exception:
+        pass
     response.headers["X-Data-Source"] = "live"
     exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_WALLETS)
     if exp is not None:

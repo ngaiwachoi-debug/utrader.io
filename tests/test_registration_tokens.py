@@ -18,16 +18,15 @@ def test_award_registration_tokens_creates_record_with_150_tokens():
     import database
     import models
     from main import _award_registration_tokens, REGISTRATION_TOKEN_AWARD
+    from services import token_ledger_service as token_ledger_svc
 
     db = database.SessionLocal()
     user_id = None
     try:
-        # Create a user without going through registration (so no token award yet)
         email = f"test-registration-tokens-{id(db)}@gmail.com"
         user = models.User(
             email=email,
             plan_tier="trial",
-            lending_limit=250_000.0,
             rebalance_interval=30,
         )
         user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
@@ -36,20 +35,17 @@ def test_award_registration_tokens_creates_record_with_150_tokens():
         db.refresh(user)
         user_id = user.id
 
-        # Award registration tokens (same as registration flow)
         _award_registration_tokens(user_id, db)
 
-        # Assert: user_token_balance exists and has 150 tokens
         row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
         assert row is not None, "user_token_balance row should exist"
-        assert row.tokens_remaining == float(REGISTRATION_TOKEN_AWARD), (
+        assert float(row.tokens_remaining) == float(REGISTRATION_TOKEN_AWARD), (
             f"tokens_remaining should be {REGISTRATION_TOKEN_AWARD}, got {row.tokens_remaining}"
         )
-        # Registration stores bonus (150 - 100 trial) as purchased_tokens so API shows 150
-        assert row.purchased_tokens == 50.0, f"purchased_tokens should be 50 (registration bonus), got {row.purchased_tokens}"
+        remaining = token_ledger_svc.get_tokens_remaining(db, user_id)
+        assert remaining == float(REGISTRATION_TOKEN_AWARD)
         assert row.last_gross_usd_used == 0.0
     finally:
-        # Cleanup: delete token row and user
         if user_id is not None:
             db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()
             db.query(models.User).filter(models.User.id == user_id).delete()
@@ -62,6 +58,7 @@ def test_award_registration_tokens_adds_150_when_record_exists():
     import database
     import models
     from main import _award_registration_tokens, REGISTRATION_TOKEN_AWARD
+    from services import token_ledger_service as token_ledger_svc
 
     db = database.SessionLocal()
     user_id = None
@@ -70,7 +67,6 @@ def test_award_registration_tokens_adds_150_when_record_exists():
         user = models.User(
             email=email,
             plan_tier="trial",
-            lending_limit=250_000.0,
             rebalance_interval=30,
         )
         user.referral_code = f"ref-{abs(hash(email)) % 10_000_000}"
@@ -79,7 +75,6 @@ def test_award_registration_tokens_adds_150_when_record_exists():
         db.refresh(user)
         user_id = user.id
 
-        # Pre-create a token balance row (edge case)
         existing = models.UserTokenBalance(
             user_id=user_id,
             tokens_remaining=100.0,
@@ -89,15 +84,15 @@ def test_award_registration_tokens_adds_150_when_record_exists():
         db.add(existing)
         db.commit()
 
-        # Award registration tokens (should add 150, not overwrite)
         _award_registration_tokens(user_id, db)
 
         row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
         assert row is not None
-        assert row.tokens_remaining == 100.0 + REGISTRATION_TOKEN_AWARD, (
+        assert float(row.tokens_remaining) == 100.0 + REGISTRATION_TOKEN_AWARD, (
             f"tokens_remaining should be 250.0, got {row.tokens_remaining}"
         )
-        assert row.purchased_tokens == 50.0, f"purchased_tokens should be 50 (bonus added), got {row.purchased_tokens}"
+        remaining = token_ledger_svc.get_tokens_remaining(db, user_id)
+        assert remaining == 250.0
     finally:
         if user_id is not None:
             db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()

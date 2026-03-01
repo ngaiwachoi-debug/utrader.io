@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 import models
 from services.referral_rewards import apply_referral_rewards
+from services import token_ledger_service as token_ledger_svc
 
 TOKENS_PER_USDT_GROSS = 10  # used_tokens = gross_profit_usd × TOKENS_PER_USDT_GROSS (documented for consistency)
 
@@ -77,13 +78,13 @@ def run_daily_token_deduction(
 
             tokens_deducted = daily_gross  # 1:1 USD per requirement
 
-            purchased = float(token_row.purchased_tokens or 0)
-            free_remaining = max(0.0, tokens_before - purchased)
+            purchased_added = token_ledger_svc.purchased_tokens_for_referral(db, user_id)
+            free_remaining = max(0.0, tokens_before - purchased_added)
             purchased_burned = max(0.0, daily_gross - free_remaining)
             if purchased_burned > 0:
                 apply_referral_rewards(db, user_id, purchased_burned)
 
-            token_row.tokens_remaining = new_tokens
+            new_tokens = token_ledger_svc.deduct_tokens(db, user_id, tokens_deducted)
             token_row.last_gross_usd_used = daily_gross
             token_row.updated_at = now_utc
 

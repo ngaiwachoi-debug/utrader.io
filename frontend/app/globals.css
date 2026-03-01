@@ -3,45 +3,87 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Binance-style light theme: white main, light grey sidebar/cards, gold accent */
 :root {
-  --background: #020617;
-  --foreground: #e2e8f0;
-  --card: #0f1729;
-  --card-foreground: #e2e8f0;
-  --popover: #0f1729;
-  --popover-foreground: #e2e8f0;
-  --primary: #10b981;
-  --primary-foreground: #022c22;
-  --secondary: #1e293b;
-  --secondary-foreground: #e2e8f0;
-  --muted: #1e293b;
-  --muted-foreground: #94a3b8;
-  --accent: #10b981;
-  --accent-foreground: #022c22;
-  --destructive: #ef4444;
-  --destructive-foreground: #fef2f2;
-  --border: #1e293b;
-  --input: #1e293b;
-  --ring: #10b981;
-  --chart-1: #10b981;
-  --chart-2: #f59e0b;
-  --chart-3: #3b82f6;
+  --background: #ffffff;
+  --foreground: #333333;
+  --card: #f8f8f8;
+  --card-foreground: #333333;
+  --popover: #ffffff;
+  --popover-foreground: #333333;
+  --primary: #f0b90b;
+  --primary-foreground: #1e2329;
+  --secondary: #f0f0f0;
+  --secondary-foreground: #333333;
+  --muted: #f0f0f0;
+  --muted-foreground: #888888;
+  --accent: #f0b90b;
+  --accent-foreground: #1e2329;
+  --destructive: #ea4b4b;
+  --destructive-foreground: #fff;
+  --border: #eaecef;
+  --input: #eaecef;
+  --ring: #f0b90b;
+  --chart-1: #0ecb81;
+  --chart-2: #f0b90b;
+  --chart-3: #229ed9;
   --chart-4: #8b5cf6;
-  --chart-5: #ef4444;
+  --chart-5: #ea4b4b;
   --radius: 0.625rem;
-  --sidebar: #0a0f1e;
-  --sidebar-foreground: #e2e8f0;
-  --sidebar-primary: #10b981;
-  --sidebar-primary-foreground: #022c22;
-  --sidebar-accent: #10b981;
-  --sidebar-accent-foreground: #022c22;
-  --sidebar-border: #1e293b;
-  --sidebar-ring: #10b981;
-  --emerald: #10b981;
-  --emerald-light: #34d399;
-  --emerald-dark: #059669;
-  --surface: #111827;
-  --surface-light: #1e293b;
+  --sidebar: #f8f8f8;
+  --sidebar-foreground: #333333;
+  --sidebar-primary: #f0b90b;
+  --sidebar-primary-foreground: #1e2329;
+  --sidebar-accent: #f0b90b;
+  --sidebar-accent-foreground: #1e2329;
+  --sidebar-border: #eaecef;
+  --sidebar-ring: #f0b90b;
+  --emerald: #0ecb81;
+  --emerald-light: #3fd999;
+  --emerald-dark: #0a9e6a;
+  --surface: #f8f8f8;
+  --surface-light: #ffffff;
+}
+
+/* Binance-style dark theme: charcoal background, gold accent, green/red for PnL */
+.dark {
+  --background: #1e2329;
+  --foreground: #eaecef;
+  --card: #2b3139;
+  --card-foreground: #eaecef;
+  --popover: #2b3139;
+  --popover-foreground: #eaecef;
+  --primary: #f0b90b;
+  --primary-foreground: #1e2329;
+  --secondary: #2b3139;
+  --secondary-foreground: #eaecef;
+  --muted: #2b3139;
+  --muted-foreground: #848e9c;
+  --accent: #f0b90b;
+  --accent-foreground: #1e2329;
+  --destructive: #ea4b4b;
+  --destructive-foreground: #fff;
+  --border: #2b3139;
+  --input: #2b3139;
+  --ring: #f0b90b;
+  --chart-1: #0ecb81;
+  --chart-2: #f0b90b;
+  --chart-3: #229ed9;
+  --chart-4: #8b5cf6;
+  --chart-5: #ea4b4b;
+  --sidebar: #181a20;
+  --sidebar-foreground: #eaecef;
+  --sidebar-primary: #f0b90b;
+  --sidebar-primary-foreground: #1e2329;
+  --sidebar-accent: #f0b90b;
+  --sidebar-accent-foreground: #1e2329;
+  --sidebar-border: #2b3139;
+  --sidebar-ring: #f0b90b;
+  --emerald: #0ecb81;
+  --emerald-light: #3fd999;
+  --emerald-dark: #0a9e6a;
+  --surface: #2b3139;
+  --surface-light: #363e4a;
 }
 
 @theme inline {

@@ -7,7 +7,6 @@ import { toast } from "sonner"
 import { useSession } from "next-auth/react"
 import { useT } from "@/lib/i18n"
 import {
-  Clock,
   Calendar,
   Link2,
   Lock,
@@ -32,7 +31,6 @@ import {
   calculateTotalBudget,
   calculateUsedTokens,
   calculateUsagePercentage,
-  formatRenewalDate,
 } from "@/lib/calculateTokenUsage"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
@@ -41,14 +39,19 @@ const TOKEN_BALANCE_CACHE_MS = 10_000
 
 type TokenBalanceState = {
   tokens_remaining: number
-  purchased_tokens: number
+  total_tokens_added: number
+  total_tokens_deducted: number
   last_gross_usd_used: number
   updated_at: string | null
 }
 
 type SettingsTab = "general" | "notifications" | "api-keys" | "community"
 
-export function SettingsPage() {
+const INSUFFICIENT_TOKENS_MSG = "Please add tokens to run the bot. A minimum balance of 1 token is required."
+
+type SettingsPageProps = { onUpgradeClick?: () => void }
+
+export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const t = useT()
   const userId = useCurrentUserId()
   const { data: session, status } = useSession()
@@ -62,10 +65,11 @@ export function SettingsPage() {
   const [usdtWithdrawAddress, setUsdtWithdrawAddress] = useState<string>("")
   const [usdtAddressSaving, setUsdtAddressSaving] = useState(false)
 
-  // Account & Membership: plan and renewal (from user-status)
+  // Account & Membership: plan and registration (from user-status)
   const [planTier, setPlanTier] = useState<string>("Trial User")
   const [planName, setPlanName] = useState<string>("Trial Plan")
   const [proExpiry, setProExpiry] = useState<string | null>(null)
+  const [createdAt, setCreatedAt] = useState<string | null>(null)
 
   // Token Usage: from /api/v1/users/me/token-balance
   const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
@@ -114,7 +118,8 @@ export function SettingsPage() {
       tokenBalanceLastFetch.current = now
       setTokenBalance({
         tokens_remaining: Number(data.tokens_remaining) ?? 0,
-        purchased_tokens: Number(data.purchased_tokens) ?? 0,
+        total_tokens_added: Number(data.total_tokens_added) ?? 0,
+        total_tokens_deducted: Number(data.total_tokens_deducted) ?? 0,
         last_gross_usd_used: Number(data.last_gross_usd_used) ?? 0,
         updated_at: data.updated_at ?? null,
       })
@@ -134,6 +139,7 @@ export function SettingsPage() {
       setPlanTier("Trial User")
       setPlanName("Trial Plan")
       setProExpiry(null)
+      setCreatedAt(null)
       setTokenBalance(null)
       setTokenBalanceLoading(false)
       setTokenBalanceError(null)
@@ -156,10 +162,14 @@ export function SettingsPage() {
         setPlanTier((data.plan_tier ?? "trial").toUpperCase() + " User")
         const tier = (data.plan_tier ?? "trial").toLowerCase()
         if (tier === "pro") setPlanName("Pro Plan")
+        else if (tier === "free") setPlanName("Free Plan")
+        else if (tier === "ai_ultra") setPlanName("AI Ultra")
+        else if (tier === "whales") setPlanName("Whales Plan")
         else if (tier === "expert") setPlanName("Expert Plan")
         else if (tier === "guru") setPlanName("Guru Plan")
         else setPlanName("Trial Plan")
         setProExpiry(data.pro_expiry ?? null)
+        setCreatedAt(data.created_at ?? null)
       } catch (e) {
         if (process.env.NODE_ENV === "development") console.error("Failed to fetch user status", e)
       }
@@ -210,16 +220,16 @@ export function SettingsPage() {
 
   const tabs: { id: SettingsTab; labelKey: string }[] = [
     { id: "general", labelKey: "settings.tabs.general" },
-    { id: "notifications", labelKey: "settings.tabs.notifications" },
     { id: "api-keys", labelKey: "settings.tabs.apiKeys" },
+    { id: "notifications", labelKey: "settings.tabs.notifications" },
     { id: "community", labelKey: "settings.tabs.community" },
   ]
 
   // Calculated token usage (memoized)
   const tokenUsage = useMemo(() => {
     if (tokenBalance == null) return null
-    const totalBudget = calculateTotalBudget(tokenBalance.purchased_tokens)
-    const used = calculateUsedTokens(totalBudget, tokenBalance.tokens_remaining)
+    const totalBudget = calculateTotalBudget(tokenBalance.total_tokens_added)
+    const used = tokenBalance.total_tokens_deducted
     const pct = calculateUsagePercentage(used, totalBudget)
     return { totalBudget, used, pct, remaining: tokenBalance.tokens_remaining }
   }, [tokenBalance])
@@ -256,8 +266,8 @@ export function SettingsPage() {
           </div>
         )}
 
-        {/* Plan Details: Current Plan, Rebalancing Frequency, Token Usage %, Tokens Remaining, Next Renewal Date */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5 mb-6">
+        {/* Plan Details: Current Plan, Token Usage %, Tokens Remaining, Registration Date */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 mb-6">
           <div className="flex items-center gap-3">
             <BarChart3 className="h-4 w-4 text-muted-foreground" />
             <div>
@@ -266,18 +276,11 @@ export function SettingsPage() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <Clock className="h-4 w-4 text-muted-foreground" />
-            <div>
-              <p className="text-xs font-semibold text-foreground">{t("settings.rebalancingFrequency")}</p>
-              <p className="text-xs text-muted-foreground">{t("settings.every30Minutes")}</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
             <BarChart3 className="h-4 w-4 text-muted-foreground" />
             <div>
               <p className="text-xs font-semibold text-foreground">{t("settings.tokenUsage")}</p>
               <p className="text-xs text-muted-foreground">
-                {tokenUsage != null ? `${Math.round(tokenUsage.pct)}% Used` : "—"}
+                {tokenUsage != null ? `${Math.round(tokenUsage.pct)}% Used` : tokenBalance != null ? "0% Used" : "—"}
               </p>
             </div>
           </div>
@@ -286,16 +289,16 @@ export function SettingsPage() {
             <div>
               <p className="text-xs font-semibold text-foreground">{t("settings.tokensRemaining")}</p>
               <p className="text-xs text-muted-foreground">
-                {tokenUsage != null ? `${Math.round(tokenUsage.remaining)} Tokens` : tokenBalanceLoading ? "…" : "—"}
+                {tokenUsage != null ? `${Math.round(tokenUsage.remaining)} Tokens` : tokenBalance != null ? `${Math.round(tokenBalance.tokens_remaining)} Tokens` : tokenBalanceLoading ? "…" : "—"}
               </p>
             </div>
           </div>
           <div className="flex items-center gap-3">
             <Calendar className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-xs font-semibold text-foreground">Next Renewal Date</p>
+              <p className="text-xs font-semibold text-foreground">Registration Date</p>
               <p className="text-xs text-muted-foreground">
-                {formatRenewalDate(proExpiry) === "No renewal date (Free Plan)" ? t("settings.noRenewalDate") : formatRenewalDate(proExpiry)}
+                {createdAt ? (() => { try { const d = new Date(createdAt); return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); } catch { return "—"; } })() : "—"}
               </p>
             </div>
           </div>
@@ -651,8 +654,14 @@ function ApiKeysTab({
               toast.info("Bot is starting", { description: "Open the Terminal tab to see live output (updates every 10s)." })
             } else {
               const errData = await startRes.json().catch(() => ({}))
-              const msg = errData.detail || "Could not start bot."
-              if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
+              const msg = typeof errData.detail === "string" ? errData.detail : "Could not start bot."
+              const isInsufficient = errData.code === "INSUFFICIENT_TOKENS" || (msg && String(msg).toLowerCase().includes("minimum balance"))
+              if (startRes.status === 400 && isInsufficient) {
+                toast.warning("Tokens required", {
+                  description: INSUFFICIENT_TOKENS_MSG,
+                  action: onUpgradeClick ? { label: t("sidebar.subscription"), onClick: onUpgradeClick } : undefined,
+                })
+              } else if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
               else if (startRes.status === 402) toast.warning("Bot not started", { description: msg })
             }
           } catch {
@@ -696,8 +705,14 @@ function ApiKeysTab({
             toast.info("Bot is starting", { description: "Open the Terminal tab to see live output (updates every 10s)." })
           } else {
             const errData = await startRes.json().catch(() => ({}))
-            const msg = errData.detail || "Could not start bot."
-            if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
+            const msg = typeof errData.detail === "string" ? errData.detail : "Could not start bot."
+            const isInsufficient = errData.code === "INSUFFICIENT_TOKENS" || (msg && String(msg).toLowerCase().includes("minimum balance"))
+            if (startRes.status === 400 && isInsufficient) {
+              toast.warning("Tokens required", {
+                description: INSUFFICIENT_TOKENS_MSG,
+                action: onUpgradeClick ? { label: t("sidebar.subscription"), onClick: onUpgradeClick } : undefined,
+              })
+            } else if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
             else if (startRes.status === 402) toast.warning("Bot not started", { description: msg })
           }
         } catch {

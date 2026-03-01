@@ -5,8 +5,6 @@ import {
   Wallet,
   DollarSign,
   TrendingUp,
-  ArrowUpRight,
-  RefreshCw,
   BarChart3,
   PieChart,
   Activity,
@@ -15,7 +13,10 @@ import {
 } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
+import { useBotStatus } from "@/lib/bot-status-context"
 import { getBackendToken } from "@/lib/auth"
+import { BotStatusBar } from "@/components/dashboard/bot-status-bar"
+import { Spinner } from "@/components/ui/spinner"
 import {
   LineChart,
   Line,
@@ -28,7 +29,7 @@ import {
   Bar,
 } from "recharts"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+const API_BACKEND = "/api-backend"
 
 const hourlyData = [
   { time: "00:00", usdVolume: 12000, usdRate: 2.3, usdtVolume: 8000, usdtRate: 5.2 },
@@ -98,16 +99,14 @@ const liveStatusCache: Record<number, LiveStatusCacheEntry> = {}
 export function LiveStatus() {
   const t = useT()
   const userId = useCurrentUserId()
-  const [activeTab, setActiveTab] = useState("total")
   const [totalAssets, setTotalAssets] = useState<number | null>(null)
   const [walletSummary, setWalletSummary] = useState<WalletSummary | null>(null)
   const [walletError, setWalletError] = useState<string | null>(null)
-  const [botActive, setBotActive] = useState<boolean | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [isStarting, setIsStarting] = useState(false)
-  const [isStopping, setIsStopping] = useState(false)
   const [walletDataSource, setWalletDataSource] = useState<"live" | "cache" | null>(null)
+  const botCtx = useBotStatus()
+  const botActive = botCtx?.botActive ?? null
   const [walletRateLimited, setWalletRateLimited] = useState(false)
   const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
@@ -136,8 +135,8 @@ export function LiveStatus() {
       const token = await getBackendToken()
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
       const [botRes, walletsRes] = await Promise.all([
-        fetch(`${API_BASE}/bot-stats/${userId}`, { credentials: "include", headers }),
-        fetch(`${API_BASE}/wallets/${userId}`, { credentials: "include", headers }),
+        fetch(`${API_BACKEND}/bot-stats/${userId}`, { credentials: "include", headers }),
+        fetch(`${API_BACKEND}/wallets/${userId}`, { credentials: "include", headers }),
       ])
       let nextBotActive: boolean | null = null
       let nextTotalAssets: number | null = null
@@ -146,14 +145,18 @@ export function LiveStatus() {
       let nextWalletDataSource: "live" | "cache" | null = null
       let nextWalletRateLimited = false
 
+      let botTotalLoaned: number | undefined
       if (botRes.ok) {
         const data = await botRes.json()
         nextBotActive = Boolean(data.active)
         const total = parseFloat(String(data.total_loaned ?? "0").replace(/,/g, ""))
         nextTotalAssets = Number.isFinite(total) ? total : 0
+        botTotalLoaned = total
       }
+      let walletsTotalUsd: number | undefined
       if (walletsRes.ok) {
         const wallets = await walletsRes.json()
+        walletsTotalUsd = Number(wallets.total_usd_all) || 0
         nextWalletSummary = {
           total_usd_all: Number(wallets.total_usd_all) || 0,
           usd_only: Number(wallets.usd_only) || 0,
@@ -185,7 +188,7 @@ export function LiveStatus() {
             : t("liveStatus.connectApiKeys")
       }
 
-      setBotActive(nextBotActive)
+      botCtx?.setBotActive(nextBotActive)
       setTotalAssets(nextTotalAssets)
       setWalletSummary(nextWalletSummary)
       setWalletError(nextWalletError)
@@ -222,7 +225,7 @@ export function LiveStatus() {
     }
     const cached = liveStatusCache[userId]
     if (cached && Date.now() - cached.fetchedAt < LIVE_STATUS_CACHE_TTL_MS) {
-      setBotActive(cached.botActive)
+      botCtx?.setBotActive(cached.botActive)
       setTotalAssets(cached.totalAssets)
       setWalletSummary(cached.walletSummary)
       setWalletError(cached.walletError)
@@ -233,98 +236,6 @@ export function LiveStatus() {
     }
     refreshStatus()
   }, [userId])
-
-  // Poll bot status every 5s so Running/Stopped updates without full refresh
-  const BOT_STATUS_POLL_MS = 5000
-  useEffect(() => {
-    if (userId == null) return
-    const pollBotStatus = async () => {
-      const token = await getBackendToken()
-      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-      fetch(`${API_BASE}/bot-stats/${userId}`, { credentials: "include", headers })
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (data && typeof data.active === "boolean") setBotActive(data.active)
-        })
-        .catch(() => {})
-    }
-    const t = setInterval(pollBotStatus, BOT_STATUS_POLL_MS)
-    return () => clearInterval(t)
-  }, [userId])
-
-
-  const handleStart = async () => {
-    if (userId == null) return
-    try {
-      setIsStarting(true)
-      setError(null)
-      const token = await getBackendToken()
-      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-      const res = await fetch(`${API_BASE}/start-bot`, {
-        method: "POST",
-        credentials: "include",
-        headers,
-      })
-      const data = res.ok ? await res.json().catch(() => ({})) : null
-      if (!res.ok) {
-        const text = await res.text()
-        let msg: string
-        try {
-          const j = JSON.parse(text)
-          msg = j.detail || text
-        } catch {
-          msg = text || t("liveStatus.startFailed")
-        }
-        setError(msg || t("liveStatus.startFailed"))
-      } else {
-        // Fixed: immediate UI update from response (no wait for 5s polling)
-        if (data && (data.bot_status === "running" || data.bot_status === "starting")) {
-          setBotActive(true)
-        }
-        await refreshStatus()
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")
-      setError(isNetworkError ? t("dashboard.apiUnreachable") : msg)
-    } finally {
-      setIsStarting(false)
-    }
-  }
-
-  const handleStop = async () => {
-    if (userId == null) return
-    try {
-      setIsStopping(true)
-      setError(null)
-      const token = await getBackendToken()
-      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-      const res = await fetch(`${API_BASE}/stop-bot`, {
-        method: "POST",
-        credentials: "include",
-        headers,
-      })
-      if (!res.ok) {
-        const text = await res.text()
-        try {
-          const j = JSON.parse(text)
-          setError(j.detail || text)
-        } catch {
-          setError(text || "Stop failed")
-        }
-      } else {
-        // Fixed: immediate UI update (backend now returns success for idempotent stop)
-        setBotActive(false)
-        await refreshStatus()
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      const isNetworkError = msg === "Failed to fetch" || msg.includes("NetworkError")
-      setError(isNetworkError ? t("dashboard.apiUnreachable") : msg)
-    } finally {
-      setIsStopping(false)
-    }
-  }
 
   if (userId == null) {
     return (
@@ -338,66 +249,25 @@ export function LiveStatus() {
     )
   }
 
+  // Use real API data only. When 0, we show why it's wrong (no fake numbers).
+  const displayTotalUsd = walletSummary?.total_usd_all ?? totalAssets ?? 0
+  const displayTotalLent = walletSummary?.total_lent_usd ?? totalAssets ?? 0
+  const displayWalletSummary = walletSummary
+
   return (
     <div className="flex flex-col gap-6">
-      {/* Page Title */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p className="text-xs font-medium uppercase tracking-wider text-emerald">February 25, 2026</p>
-          <h1 className="text-2xl font-bold text-foreground">{t("liveStatus.title")}</h1>
-        </div>
-        <div className="flex items-center gap-2">
-          <span
-            className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${
-              botActive ? "bg-emerald/10 text-emerald" : "bg-destructive/10 text-destructive"
-            }`}
-          >
-            {botActive === null ? t("liveStatus.statusUnknown") : botActive ? t("liveStatus.botActive") : t("liveStatus.botStopped")}
-          </span>
-          <button
-            onClick={refreshStatus}
-            disabled={loading || refreshCooldownSec > 0}
-            className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground hover:border-emerald/50 hover:text-foreground transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-            title={refreshCooldownSec > 0 ? t("liveStatus.refreshIn", { n: refreshCooldownSec }) : undefined}
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-            {refreshCooldownSec > 0 ? t("liveStatus.refreshIn", { n: refreshCooldownSec }) : t("liveStatus.refresh")}
-          </button>
-          {!botActive && (
-            <button
-              onClick={handleStart}
-              disabled={isStarting}
-              className="rounded-lg bg-emerald px-3 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-            >
-              {isStarting ? t("liveStatus.starting") : t("liveStatus.startBot")}
-            </button>
-          )}
-          {botActive && (
-            <button
-              onClick={handleStop}
-              disabled={isStopping}
-              className="rounded-lg bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground hover:bg-destructive/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-            >
-              {isStopping ? t("liveStatus.stopping") : t("liveStatus.stopBot")}
-            </button>
-          )}
-        </div>
-      </div>
+      <BotStatusBar
+        title={t("liveStatus.title")}
+        date="February 25, 2026"
+        onRefresh={refreshStatus}
+        refreshCooldownSec={refreshCooldownSec}
+      />
 
-      {error && (
+      {(error || botCtx?.error) && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-          {error}
+          {error || botCtx?.error}
         </div>
       )}
-
-      {/* Tab */}
-      <div>
-        <button
-          className="rounded-full bg-emerald px-4 py-1.5 text-xs font-semibold text-primary-foreground"
-        >
-          {t("liveStatus.total")}
-        </button>
-      </div>
 
       {/* Summary Cards */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -411,12 +281,24 @@ export function LiveStatus() {
             <Wallet className="h-5 w-5 text-emerald" />
           </div>
           <div className="mt-3">
-            <span className="text-3xl font-bold text-foreground">
-              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_usd_all ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
-            </span>
+            {loading && !displayWalletSummary ? (
+              <span className="flex items-center gap-2 text-3xl font-bold text-foreground">
+                <Spinner className="h-8 w-8" />
+                <span className="text-muted-foreground">Loading…</span>
+              </span>
+            ) : (
+              <span className="text-3xl font-bold text-foreground">
+                {!displayWalletSummary ? "—" : `$${(displayTotalUsd ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+              </span>
+            )}
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            {walletError ?? (walletSummary ? t("liveStatus.totalUsdValue") : loading ? t("liveStatus.loading") : "—")}
+            {walletError ?? (displayWalletSummary ? t("liveStatus.totalUsdValue") : loading ? t("liveStatus.loading") : "—")}
+            {!loading && !walletError && (displayTotalUsd ?? 0) === 0 && (
+              <span className="block mt-1 text-amber-600 dark:text-amber-400">
+                No data: Connect Bitfinex API keys with wallets/read permission, or the API may be rate limited. Total USD is from Bitfinex funding wallets only.
+              </span>
+            )}
             {walletDataSource === "cache" && !walletError && (
               <span className="ml-1 text-muted-foreground"> · {t("liveStatus.dataCached")}</span>
             )}
@@ -436,24 +318,157 @@ export function LiveStatus() {
             <DollarSign className="h-5 w-5 text-emerald" />
           </div>
           <div className="mt-3">
-            <span className="text-3xl font-bold text-foreground">
-              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
-            </span>
+            {loading && !displayWalletSummary ? (
+              <span className="flex items-center gap-2 text-3xl font-bold text-foreground">
+                <Spinner className="h-8 w-8" />
+                <span className="text-muted-foreground">Loading…</span>
+              </span>
+            ) : (
+              <span className="text-3xl font-bold text-foreground">
+                {!displayWalletSummary ? "—" : `$${(displayTotalLent ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+              </span>
+            )}
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             {botActive ? "Bot is actively deploying lending capital." : "Bot is currently idle."}
+            {!loading && (displayTotalLent ?? 0) === 0 && (
+              <span className="block mt-1 text-amber-600 dark:text-amber-400">
+                No data: Same as Assets — Bitfinex keys and wallets/read required.
+              </span>
+            )}
           </p>
         </div>
       </div>
 
-      {/* Currently Lent Out: bar per currency (Amount lent | Pending | Idle); hide if total USD < 1 (incl. BTC, ETH, XRP) */}
-      {walletSummary && (() => {
-        const lentUsd = walletSummary.lent_per_currency_usd ?? {}
-        const offersUsd = walletSummary.offers_per_currency_usd ?? {}
-        const idleUsd = walletSummary.idle_per_currency_usd ?? {}
+      {/* Portfolio Allocation */}
+      <div className="rounded-xl border border-border bg-card p-5">
+        <div className="flex items-center gap-2 mb-1">
+          <PieChart className="h-5 w-5 text-emerald" />
+          <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.portfolioAllocation")}</h3>
+        </div>
+        <p className="text-xs text-muted-foreground mb-4">{t("liveStatus.capitalDeploymentOverview")}</p>
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          {loading && !displayWalletSummary ? (
+            <span className="flex items-center gap-2 text-xl font-bold text-emerald">
+              <Spinner className="h-5 w-5" />
+              <span className="text-muted-foreground">Loading…</span>
+            </span>
+          ) : (
+            <span className="text-xl font-bold text-emerald">
+              {!displayWalletSummary ? "—" : `$${(displayTotalUsd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            </span>
+          )}
+          <span className="text-xs text-muted-foreground">{displayWalletSummary ? "100.0% Active" : "—"}</span>
+          <span className="text-xs text-muted-foreground">{displayWalletSummary ? "100.0% deployed" : "—"}</span>
+        </div>
+        <div className="mb-4">
+          <div className="flex justify-between text-xs text-muted-foreground mb-1.5">
+            <span>{t("liveStatus.allocationBreakdown")}</span>
+          </div>
+          <div className="h-3 w-full rounded-full bg-secondary overflow-hidden flex">
+            <div
+              className="h-full bg-emerald transition-all"
+              style={{
+                width: `${!displayWalletSummary ? 0 : (() => {
+                  const lent = displayWalletSummary.total_lent_usd ?? totalAssets ?? 0
+                  const total = displayWalletSummary.total_usd_all ?? 0
+                  return total > 0 ? Math.min(100, (100 * lent) / total) : 0
+                })()}%`,
+              }}
+            />
+            <div
+              className="h-full bg-amber-500/80 transition-all"
+              style={{
+                width: `${!displayWalletSummary ? 0 : (() => {
+                  const offers = displayWalletSummary.total_offers_usd ?? 0
+                  const total = displayWalletSummary.total_usd_all ?? 0
+                  return total > 0 ? Math.min(100, (100 * offers) / total) : 0
+                })()}%`,
+              }}
+            />
+            <div
+              className="h-full bg-muted-foreground/50 transition-all"
+              style={{
+                width: `${!displayWalletSummary ? 0 : (() => {
+                  const idle = displayWalletSummary.idle_usd ?? 0
+                  const total = displayWalletSummary.total_usd_all ?? 0
+                  return total > 0 ? Math.min(100, (100 * idle) / total) : 0
+                })()}%`,
+              }}
+            />
+          </div>
+          <div className="flex gap-4 mt-1.5 text-xs">
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-4 rounded-full bg-emerald" />
+              {t("liveStatus.earning")}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-4 rounded-full bg-amber-500/80" />
+              {t("liveStatus.inOrderBook")}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-4 rounded-full bg-muted-foreground/50" />
+              {t("liveStatus.idleFunds")}
+            </span>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <div className="rounded-xl border border-emerald/30 bg-emerald/5 p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.activelyEarning")}</span>
+              <Activity className="h-4 w-4 text-emerald" />
+            </div>
+            <p className="mt-2 text-xl font-bold text-foreground">
+              {!displayWalletSummary ? (loading ? "…" : "—") : `$${(displayWalletSummary.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            </p>
+            <p className="text-xs text-emerald">
+              {displayWalletSummary?.total_usd_all && displayWalletSummary.total_usd_all > 0
+                ? `${(((displayWalletSummary.total_lent_usd ?? totalAssets ?? 0) / displayWalletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : displayWalletSummary ? "0.0%" : "—"}
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.returnGenerating")}</p>
+          </div>
+          <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.pendingDeployment")}</span>
+              <Clock className="h-4 w-4 text-amber-500" />
+            </div>
+            <p className="mt-2 text-xl font-bold text-foreground">
+              {!displayWalletSummary ? (loading ? "…" : "—") : `$${(displayWalletSummary.total_offers_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            </p>
+            <p className="text-xs text-amber-500">
+              {displayWalletSummary?.total_usd_all && displayWalletSummary.total_usd_all > 0
+                ? `${(((displayWalletSummary.total_offers_usd ?? 0) / displayWalletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : displayWalletSummary ? "0.0%" : "—"}
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.inOrderBook")}</p>
+          </div>
+          <div className="rounded-xl border border-border bg-secondary/30 p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.idleFunds")}</span>
+              <Moon className="h-4 w-4 text-muted-foreground" />
+            </div>
+            <p className="mt-2 text-xl font-bold text-foreground">
+              {!displayWalletSummary ? (loading ? "…" : "—") : `$${(displayWalletSummary.idle_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {displayWalletSummary?.total_usd_all && displayWalletSummary.total_usd_all > 0
+                ? `${(((displayWalletSummary.idle_usd ?? 0) / displayWalletSummary.total_usd_all) * 100).toFixed(1)}%`
+                : displayWalletSummary ? "0.0%" : "—"}
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.cashDrag")}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Currently Lent Out: bar per currency (Amount lent | Pending | Idle); hide if total USD < 1 */}
+      {displayWalletSummary && (() => {
+        const lentUsd = displayWalletSummary.lent_per_currency_usd ?? {}
+        const offersUsd = displayWalletSummary.offers_per_currency_usd ?? {}
+        const idleUsd = displayWalletSummary.idle_per_currency_usd ?? {}
         const MIN_DISPLAY_USD = 1
         const currencies = Array.from(new Set([
-          ...Object.keys(walletSummary.per_currency_usd ?? {}),
+          ...Object.keys(displayWalletSummary.per_currency_usd ?? {}),
           ...Object.keys(lentUsd),
           ...Object.keys(offersUsd),
         ]))
@@ -521,122 +536,8 @@ export function LiveStatus() {
         )
       })()}
 
-      {/* Portfolio Allocation (after currency lend out) */}
-      <div className="rounded-xl border border-border bg-card p-5">
-        <div className="flex items-center gap-2 mb-1">
-          <PieChart className="h-5 w-5 text-emerald" />
-          <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.portfolioAllocation")}</h3>
-        </div>
-        <p className="text-xs text-muted-foreground mb-4">{t("liveStatus.capitalDeploymentOverview")}</p>
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-          <span className="text-xl font-bold text-emerald">
-            {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_usd_all ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-          </span>
-          <span className="text-xs text-muted-foreground">{walletSummary ? "100.0% Active" : "—"}</span>
-          <span className="text-xs text-muted-foreground">{walletSummary ? "100.0% deployed" : "—"}</span>
-        </div>
-        <div className="mb-4">
-          <div className="flex justify-between text-xs text-muted-foreground mb-1.5">
-            <span>{t("liveStatus.allocationBreakdown")}</span>
-          </div>
-          <div className="h-3 w-full rounded-full bg-secondary overflow-hidden flex">
-            <div
-              className="h-full bg-emerald transition-all"
-              style={{
-                width: `${!walletSummary ? 0 : (() => {
-                  const lent = walletSummary.total_lent_usd ?? totalAssets ?? 0
-                  const total = walletSummary.total_usd_all ?? 0
-                  return total > 0 ? Math.min(100, (100 * lent) / total) : 0
-                })()}%`,
-              }}
-            />
-            <div
-              className="h-full bg-amber-500/80 transition-all"
-              style={{
-                width: `${!walletSummary ? 0 : (() => {
-                  const offers = walletSummary.total_offers_usd ?? 0
-                  const total = walletSummary.total_usd_all ?? 0
-                  return total > 0 ? Math.min(100, (100 * offers) / total) : 0
-                })()}%`,
-              }}
-            />
-            <div
-              className="h-full bg-muted-foreground/50 transition-all"
-              style={{
-                width: `${!walletSummary ? 0 : (() => {
-                  const idle = walletSummary.idle_usd ?? 0
-                  const total = walletSummary.total_usd_all ?? 0
-                  return total > 0 ? Math.min(100, (100 * idle) / total) : 0
-                })()}%`,
-              }}
-            />
-          </div>
-          <div className="flex gap-4 mt-1.5 text-xs">
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-4 rounded-full bg-emerald" />
-              {t("liveStatus.earning")}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-4 rounded-full bg-amber-500/80" />
-              {t("liveStatus.inOrderBook")}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-4 rounded-full bg-muted-foreground/50" />
-              {t("liveStatus.idleFunds")}
-            </span>
-          </div>
-        </div>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-          <div className="rounded-xl border border-emerald/30 bg-emerald/5 p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.activelyEarning")}</span>
-              <Activity className="h-4 w-4 text-emerald" />
-            </div>
-            <p className="mt-2 text-xl font-bold text-foreground">
-              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_lent_usd ?? totalAssets ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            </p>
-            <p className="text-xs text-emerald">
-              {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
-                ? `${(((walletSummary.total_lent_usd ?? totalAssets ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : walletSummary ? "0.0%" : "—"}
-            </p>
-            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.returnGenerating")}</p>
-          </div>
-          <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.pendingDeployment")}</span>
-              <Clock className="h-4 w-4 text-amber-500" />
-            </div>
-            <p className="mt-2 text-xl font-bold text-foreground">
-              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.total_offers_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            </p>
-            <p className="text-xs text-amber-500">
-              {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
-                ? `${(((walletSummary.total_offers_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : walletSummary ? "0.0%" : "—"}
-            </p>
-            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.inOrderBook")}</p>
-          </div>
-          <div className="rounded-xl border border-border bg-secondary/30 p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.idleFunds")}</span>
-              <Moon className="h-4 w-4 text-muted-foreground" />
-            </div>
-            <p className="mt-2 text-xl font-bold text-foreground">
-              {!walletSummary ? (loading ? "…" : "—") : `$${(walletSummary.idle_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {walletSummary?.total_usd_all && walletSummary.total_usd_all > 0
-                ? `${(((walletSummary.idle_usd ?? 0) / walletSummary.total_usd_all) * 100).toFixed(1)}%`
-                : walletSummary ? "0.0%" : "—"}
-            </p>
-            <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.cashDrag")}</p>
-          </div>
-        </div>
-      </div>
-
-      {/* Performance (key metrics) — only when we have full wallet data */}
-      {walletSummary && (
+      {/* Performance (key metrics) — True ROI–style cards */}
+      {displayWalletSummary && (
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="flex items-center gap-2 mb-4">
           <TrendingUp className="h-5 w-5 text-amber-500" />
@@ -644,45 +545,62 @@ export function LiveStatus() {
         </div>
         <p className="text-xs text-muted-foreground mb-4">{t("liveStatus.keyMetrics")}</p>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-xl border border-border bg-secondary/20 p-4">
-            <p className="text-xs font-medium text-muted-foreground">{t("liveStatus.estDailyEarnings")}</p>
-            <p className="mt-2 text-xl font-bold text-emerald">
-              {!walletSummary ? "—" : `$${(walletSummary.est_daily_earnings_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            </p>
-            <p className="text-xs text-muted-foreground">{t("liveStatus.basedOnCurrentRates")}</p>
-          </div>
-          <div className="rounded-xl border border-border bg-secondary/20 p-4">
-            <p className="text-xs font-medium text-muted-foreground">{t("liveStatus.weightedAvgApr")}</p>
-            <p className="mt-2 text-xl font-bold text-blue-400">
-              {!walletSummary ? "—" : `${(walletSummary.weighted_avg_apr_pct ?? 0).toFixed(2)}%`}
-            </p>
-            <p className="text-xs text-muted-foreground">{t("liveStatus.acrossAllActiveLending")}</p>
-          </div>
-          <div className="rounded-xl border border-border bg-secondary/20 p-4">
-            <p className="text-xs font-medium text-muted-foreground">{t("liveStatus.yieldOverTotal")}</p>
-            <p className="mt-2 text-xl font-bold text-foreground">
-              {!walletSummary ? "—" : `${(walletSummary.yield_over_total_pct ?? 0).toFixed(2)}%`}
-            </p>
-            <p className="text-xs text-muted-foreground">{t("liveStatus.yieldOverTotalDesc")}</p>
-          </div>
-          <div className="rounded-xl border border-border bg-secondary/20 p-4">
+          <div className="rounded-xl border border-border bg-card p-5">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.activeOrders")}</span>
-              <Clock className="h-4 w-4 text-muted-foreground" />
+              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.estDailyEarnings")}</span>
+              <DollarSign className="h-4 w-4 text-emerald" />
             </div>
-            <p className="mt-2 text-xl font-bold text-foreground">
-              {!walletSummary ? "—" : String(walletSummary.credits_count ?? 0)}
-            </p>
-            <p className="text-xs text-muted-foreground">{t("liveStatus.activeLendingPositions")}</p>
+            <div className="mt-3">
+              <span className="text-3xl font-bold text-emerald">
+                {!displayWalletSummary ? "—" : `$${(displayWalletSummary.est_daily_earnings_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{t("liveStatus.basedOnCurrentRates")}</p>
+          </div>
+          <div className="rounded-xl border border-border bg-card p-5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.weightedAvgApr")}</span>
+              <TrendingUp className="h-4 w-4 text-blue-400" />
+            </div>
+            <div className="mt-3">
+              <span className="text-3xl font-bold text-foreground">
+                {!displayWalletSummary ? "—" : `${(displayWalletSummary.weighted_avg_apr_pct ?? 0).toFixed(2)}%`}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{t("liveStatus.acrossAllActiveLending")}</p>
+          </div>
+          <div className="rounded-xl border border-border bg-card p-5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.takenOrders")}</span>
+              <Activity className="h-4 w-4 text-emerald" />
+            </div>
+            <div className="mt-3">
+              <span className="text-3xl font-bold text-foreground">
+                {!displayWalletSummary ? "—" : String(displayWalletSummary.credits_count ?? 0)}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{t("liveStatus.takenOrdersDesc")}</p>
+          </div>
+          <div className="rounded-xl border border-border bg-card p-5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.ordersNotTaken")}</span>
+              <BarChart3 className="h-4 w-4 text-emerald" />
+            </div>
+            <div className="mt-3">
+              <span className="text-3xl font-bold text-foreground">
+                {!displayWalletSummary ? "—" : String(displayWalletSummary.offers_count ?? 0)}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{t("liveStatus.ordersNotTakenDesc")}</p>
           </div>
         </div>
       </div>
       )}
 
       {/* Personal Lending Ledger (active positions, 10 per page) — same wallet data, no extra API */}
-      {walletSummary && (walletSummary.credits_detail?.length ?? 0) > 0 && (() => {
+      {displayWalletSummary && (displayWalletSummary.credits_detail?.length ?? 0) > 0 && (() => {
         const PER_PAGE = 10
-        const list = walletSummary.credits_detail ?? []
+        const list = displayWalletSummary.credits_detail ?? []
         const totalPages = Math.max(1, Math.ceil(list.length / PER_PAGE))
         const page = Math.min(ledgerPage, totalPages)
         const start = (page - 1) * PER_PAGE
@@ -747,7 +665,7 @@ export function LiveStatus() {
       })()}
 
       {/* 24h Lending Record: hide when user has no meaningful exposure (< $1 total) */}
-      {walletSummary && (walletSummary.total_usd_all ?? 0) >= 1 && (
+      {displayWalletSummary && (displayWalletSummary.total_usd_all ?? 0) >= 1 && (
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-4">
           <h3 className="text-sm font-semibold text-foreground">24h Lending Record</h3>
@@ -756,23 +674,23 @@ export function LiveStatus() {
         <div className="h-[300px]">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={hourlyData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-              <XAxis dataKey="time" tick={{ fill: "#94a3b8", fontSize: 10 }} axisLine={{ stroke: "#1e293b" }} />
-              <YAxis yAxisId="left" tick={{ fill: "#94a3b8", fontSize: 10 }} axisLine={{ stroke: "#1e293b" }} />
-              <YAxis yAxisId="right" orientation="right" tick={{ fill: "#94a3b8", fontSize: 10 }} axisLine={{ stroke: "#1e293b" }} />
+              <CartesianGrid strokeDasharray="3 3" stroke="#2b3139" />
+              <XAxis dataKey="time" tick={{ fill: "#848e9c", fontSize: 10 }} axisLine={{ stroke: "#2b3139" }} />
+              <YAxis yAxisId="left" tick={{ fill: "#848e9c", fontSize: 10 }} axisLine={{ stroke: "#2b3139" }} />
+              <YAxis yAxisId="right" orientation="right" tick={{ fill: "#848e9c", fontSize: 10 }} axisLine={{ stroke: "#2b3139" }} />
               <Tooltip
                 contentStyle={{
-                  backgroundColor: "#0f1729",
-                  borderColor: "#1e293b",
+                  backgroundColor: "#1e2329",
+                  borderColor: "#2b3139",
                   borderRadius: "8px",
-                  color: "#e2e8f0",
+                  color: "#eaecef",
                   fontSize: "12px",
                 }}
               />
-              <Line yAxisId="left" type="monotone" dataKey="usdVolume" stroke="#10b981" strokeWidth={2} dot={false} name="USD Volume" />
-              <Line yAxisId="left" type="monotone" dataKey="usdtVolume" stroke="#ef4444" strokeWidth={2} dot={false} name="USDt Volume" />
-              <Bar yAxisId="right" dataKey="usdRate" fill="#10b981" opacity={0.3} name="USD Rate %" />
-              <Bar yAxisId="right" dataKey="usdtRate" fill="#ef4444" opacity={0.3} name="USDt Rate %" />
+              <Line yAxisId="left" type="monotone" dataKey="usdVolume" stroke="#0ecb81" strokeWidth={2} dot={false} name="USD Volume" />
+              <Line yAxisId="left" type="monotone" dataKey="usdtVolume" stroke="#ea4b4b" strokeWidth={2} dot={false} name="USDt Volume" />
+              <Bar yAxisId="right" dataKey="usdRate" fill="#0ecb81" opacity={0.3} name="USD Rate %" />
+              <Bar yAxisId="right" dataKey="usdtRate" fill="#ea4b4b" opacity={0.3} name="USDt Rate %" />
             </LineChart>
           </ResponsiveContainer>
         </div>

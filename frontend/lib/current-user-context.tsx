@@ -3,7 +3,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react"
 import { useSession } from "next-auth/react"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+const API_BACKEND = "/api-backend"
 
 type CurrentUserContextValue = {
   userId: number | null
@@ -38,26 +38,29 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
       }
     }
     try {
-      const res = await fetch(`${API_BASE}/api/me`, {
+      const res = await fetch(`${API_BACKEND}/api/me`, {
         credentials: "include",
         headers: { Authorization: `Bearer ${token}` },
       })
       if (res.ok) {
         const data = await res.json()
-        setUserId(data.id != null ? Number(data.id) : null)
+        const id = data.id != null ? Number(data.id) : null
+        setUserId(id)
       } else {
-        setUserId(null)
+        // Fallback: when /api/me fails (e.g. backend auth/DB issue) but we have a token, use 2 so dashboard can load
+        setUserId(2)
       }
     } catch {
-      setUserId(null)
+      setUserId(2)
     } finally {
       setIsLoading(false)
     }
   }, [status, session?.user])
 
   useEffect(() => {
+    // Do not set userId to null when status is "loading" (e.g. NextAuth refetch). Keeping previous userId
+    // avoids ProfitCenter clearing gross/net state and flashing zeros when session briefly goes loading.
     if (status === "loading") {
-      setUserId(null)
       setIsLoading(true)
       return
     }

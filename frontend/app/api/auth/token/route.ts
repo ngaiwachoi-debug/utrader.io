@@ -2,7 +2,6 @@ import { getToken } from "next-auth/jwt"
 import { NextResponse } from "next/server"
 import { SignJWT } from "jose"
 
-const secret = process.env.NEXTAUTH_SECRET!
 const encoder = new TextEncoder()
 
 /**
@@ -10,6 +9,14 @@ const encoder = new TextEncoder()
  * Frontend sends this as Authorization: Bearer <token> to the FastAPI backend.
  */
 export async function GET(request: Request) {
+  const rawSecret = process.env.NEXTAUTH_SECRET
+  const secret = typeof rawSecret === "string" ? rawSecret.trim() : ""
+  if (!secret) {
+    return NextResponse.json(
+      { error: "NEXTAUTH_SECRET not set. Add it to frontend/.env.local (same value as root .env)." },
+      { status: 500 }
+    )
+  }
   const token = await getToken({
     req: request as unknown as { headers: Headers; url?: string },
     secret,

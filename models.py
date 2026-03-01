@@ -1,4 +1,5 @@
 from sqlalchemy import BigInteger, Boolean, Column, Date, Integer, String, Float, DateTime, ForeignKey, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -29,6 +30,8 @@ class User(Base):
 
     # Bot process state (updated by API on start/stop and by worker on run/exit)
     bot_status = Column(String, default="stopped")  # stopped | running | starting
+    # Desired state (Plan C): running | stopped; worker reconciles to this
+    bot_desired_state = Column(String(20), default="stopped")  # running | stopped
 
     # Monthly API key deletion count for abuse detection (persisted; {"YYYY-MM": count})
     key_deletions = Column(Text, default="{}", nullable=True)  # JSON: {"2026-02": 2}
@@ -138,18 +141,17 @@ class UserProfitSnapshot(Base):
 
 class UserTokenBalance(Base):
     """
-    Token credit balance (Cursor-style). 0.1 USD gross profit = 1 token used.
-    Initial credit: 100 (free), 1500 (Pro), 9000 (AI Ultra), 40000 (Whales).
-    purchased_tokens: extra tokens from custom USD purchase (1 USD = 100 tokens).
+    Token balance (legacy schema). Single source of truth: tokens_remaining.
+    purchased_tokens = amount from deposit/subscription/admin (for referral burn logic).
     """
 
     __tablename__ = "user_token_balance"
 
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
-    tokens_remaining = Column(Float, default=0.0)
-    last_gross_usd_used = Column(Float, default=0.0)  # gross_profit_usd at last token calc
-    purchased_tokens = Column(Float, default=0.0)  # tokens bought via Add tokens (1 USD = 100)
+    tokens_remaining = Column(Float, default=0.0, nullable=False)
+    last_gross_usd_used = Column(Float, default=0.0)  # gross_profit_usd at last deduction
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    purchased_tokens = Column(Float, default=0.0, nullable=False)  # for referral: deposit/subscription/admin
 
 
 class UserUsdtCredit(Base):

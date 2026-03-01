@@ -1,0 +1,11 @@
+{
+  "btc_vol_sma_180d": 1.0116937231774012,
+  "rows_analyzed": 39825,
+  "pearson_corr_btc_volume_fusd_rate": -0.007100347155861563,
+  "pearson_corr_btc_volume_fusdt_rate": 0.02932455644816406,
+  "lag_minutes_fusd_after_btc_surge": 36,
+  "lag_minutes_fusdt_after_btc_surge": 32,
+  "lag_minutes_composite_after_btc_surge": 34,
+  "rate_spike_threshold_fusd_delta": 0.00024249149999999988,
+  "rate_spike_threshold_fusdt_delta": 0.00020834399999999987
+}
