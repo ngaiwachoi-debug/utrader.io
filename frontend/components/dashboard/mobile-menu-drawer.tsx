@@ -3,7 +3,6 @@
 import { useRouter } from "next/navigation"
 import { signOut } from "next-auth/react"
 import { DollarSign, Activity, BarChart3, TrendingUp, CreditCard, UserPlus, Trophy, Terminal, Settings, Sun, Moon, Globe, LogOut } from "lucide-react"
-import { InstallAppButton } from "@/components/dashboard/install-app-button"
 import { useTheme } from "next-themes"
 import { useLanguage } from "@/lib/i18n"
 import { clearBackendTokenCache } from "@/lib/auth"
@@ -63,18 +62,18 @@ export function MobileMenuDrawer({
   }
 
   const handleLocaleChange = (value: string) => {
-    const locale = value as "en" | "zh" | "ko" | "ru" | "de" | "pt" | "fil" | "id" | "ja"
+    const locale = value as "en" | "zh" | "ko" | "ru" | "de"
     setLanguage(locale)
     const path = pathname ?? "/dashboard"
-    const localeRegex = /^\/(en|zh|ko|ru|de|pt|fil|id|ja)(\/|$)/
+    const localeRegex = /^\/(en|zh|ko|ru|de)(\/|$)/
     if (localeRegex.test(path)) {
-      const withoutLocale = path.replace(/^\/(en|zh|ko|ru|de|pt|fil|id|ja)/, "") || "/"
+      const withoutLocale = path.replace(/^\/(en|zh|ko|ru|de)/, "") || "/"
       const newPath = `/${locale}${withoutLocale === "/" ? "" : withoutLocale}`
       if (path !== newPath) router.push(newPath)
     }
   }
 
-  const localeLabels: Record<string, string> = { en: "English", zh: "中文", pt: "Português", ru: "Русский", ja: "日本語", de: "Deutsch", ko: "한국어", id: "Indonesia", fil: "Filipino" }
+  const localeLabels: Record<string, string> = { en: "English", zh: "中文", ko: "한국어", ru: "Русский", de: "Deutsch" }
 
   const handleLogout = () => {
     clearBackendTokenCache()
@@ -112,13 +111,8 @@ export function MobileMenuDrawer({
             })}
           </div>
 
-          {/* Install app / Create shortcut */}
-          <div className="mt-6 rounded-lg border border-border bg-secondary/30 px-3 py-2.5">
-            <InstallAppButton variant="drawer" />
-          </div>
-
           {/* Theme: sun / moon toggle like reference image */}
-          <div className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/30 px-3 py-2.5">
+          <div className="mt-6 flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/30 px-3 py-2.5">
             <span className="flex items-center gap-2 text-sm font-medium text-foreground">
               {t("header.theme")}
             </span>
@@ -161,13 +155,9 @@ export function MobileMenuDrawer({
               <SelectContent>
                 <SelectItem value="en">English</SelectItem>
                 <SelectItem value="zh">中文</SelectItem>
-                <SelectItem value="pt">Português</SelectItem>
-                <SelectItem value="ru">Русский</SelectItem>
-                <SelectItem value="ja">日本語</SelectItem>
-                <SelectItem value="de">Deutsch</SelectItem>
                 <SelectItem value="ko">한국어</SelectItem>
-                <SelectItem value="id">Indonesia</SelectItem>
-                <SelectItem value="fil">Filipino</SelectItem>
+                <SelectItem value="ru">Русский</SelectItem>
+                <SelectItem value="de">Deutsch</SelectItem>
               </SelectContent>
             </Select>
           </div>

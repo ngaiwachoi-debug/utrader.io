@@ -3,8 +3,6 @@
 import { RefreshCw, Play, Square, Loader2 } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useBotStatus } from "@/lib/bot-status-context"
-import { useCurrentUserId } from "@/lib/current-user-context"
-import { useUserStatus } from "@/lib/dashboard-data-context"
 
 type BotStatusBarProps = {
   /** Optional title next to the date (e.g. "Live Status", "Terminal") */
@@ -24,9 +22,6 @@ type BotStatusBarProps = {
 export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }: BotStatusBarProps) {
   const t = useT()
   const ctx = useBotStatus()
-  const userId = useCurrentUserId()
-  const userStatus = useUserStatus(userId ?? 0)
-  const hasApiKeys = userStatus.data?.has_keys === true
 
   if (!ctx) return null
 
@@ -37,7 +32,7 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
   const statusLoading = loading || isRevalidating
   const statusUnknown = botActive === null
   /** Show Start/Stop only when status is known and not loading (unless there's an error so user can retry) */
-  const showActions = hasApiKeys && !statusLoading && !statusUnknown
+  const showActions = !statusLoading && !statusUnknown
 
   const handleRefreshClick = async () => {
     if (cooling) return
@@ -66,28 +61,26 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
           </div>
         )}
       <div className="flex flex-wrap items-center gap-3">
-        {/* Status block: dot + label — only when user has API keys */}
-        {hasApiKeys && (
-          <div
-            className={`flex items-center gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs font-medium ${
-              statusLoading || statusUnknown ? "text-muted-foreground" : botActive ? "text-primary" : "text-destructive"
+        {/* Status block: dot + label */}
+        <div
+          className={`flex items-center gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs font-medium ${
+            statusLoading || statusUnknown ? "text-muted-foreground" : botActive ? "text-primary" : "text-destructive"
+          }`}
+          data-testid="bot-status-badge"
+        >
+          <span
+            className={`h-2 w-2 shrink-0 rounded-full ${
+              statusLoading || statusUnknown ? "bg-muted-foreground" : botActive ? "bg-primary" : "bg-destructive"
             }`}
-            data-testid="bot-status-badge"
-          >
-            <span
-              className={`h-2 w-2 shrink-0 rounded-full ${
-                statusLoading || statusUnknown ? "bg-muted-foreground" : botActive ? "bg-primary" : "bg-destructive"
-              }`}
-              aria-hidden
-            />
-            <span>
-              {statusLoading ? t("liveStatus.loadingStatus") : statusUnknown ? t("liveStatus.statusUnknown") : botActive ? t("liveStatus.botActive") : t("liveStatus.botStopped")}
-            </span>
-          </div>
-        )}
+            aria-hidden
+          />
+          <span>
+            {statusLoading ? t("liveStatus.loadingStatus") : statusUnknown ? t("liveStatus.statusUnknown") : botActive ? t("liveStatus.botActive") : t("liveStatus.botStopped")}
+          </span>
+        </div>
 
-        <div className={hasApiKeys ? "flex items-center gap-2 border-l border-border pl-3" : "flex items-center gap-2"}>
-          {/* Refresh: always shown */}
+        <div className="flex items-center gap-2 border-l border-border pl-3">
+          {/* Refresh: secondary action */}
           <button
             onClick={handleRefreshClick}
             disabled={cooling}
@@ -98,7 +91,7 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
             {cooling ? t("liveStatus.refreshIn", { n: refreshCooldownSec }) : t("liveStatus.refresh")}
           </button>
 
-          {/* Start / Stop: only when user has API keys and status is known */}
+          {/* Start / Stop: only when status is known and not loading */}
           {showActions && botActive === false && (
             <button
               onClick={handleStart}

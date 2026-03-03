@@ -34,7 +34,7 @@ export type WalletSummary = {
 }
 
 export type BotStatsData = { active: boolean; total_loaned: number }
-export type UserStatusData = { tokens_remaining: number | null; plan_tier: string | null; has_keys?: boolean }
+export type UserStatusData = { tokens_remaining: number | null; plan_tier: string | null }
 
 export type LendingStatsTrade = {
   id: number
@@ -367,13 +367,12 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
         const data = await res.json().catch(() => ({}))
         const tokens_remaining = typeof data.tokens_remaining === "number" ? data.tokens_remaining : null
         const plan_tier = typeof data.plan_tier === "string" ? data.plan_tier : null
-        const has_keys = data.has_keys === true
         updateState((prev) => ({
           ...prev,
           userStatus: {
             ...prev.userStatus,
             [userId]: {
-              data: { tokens_remaining, plan_tier, has_keys },
+              data: { tokens_remaining, plan_tier },
               fetchedAt: Date.now(),
               error: null,
               source: "live",

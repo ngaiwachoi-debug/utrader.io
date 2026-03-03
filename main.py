@@ -1417,7 +1417,6 @@ class UserStatusResponse(BaseModel):
     gross_profit_usd: float = 0.0
     pro_expiry: Optional[str] = None  # ISO 8601 UTC; null for free plan
     created_at: Optional[str] = None  # ISO 8601 UTC; users.created_at (Settings "Registration Date")
-    has_keys: bool = False  # whether user has Bitfinex API keys configured
 
 
 class TokenBalanceResponse(BaseModel):
@@ -4175,8 +4174,6 @@ def get_user_status(
         created_at_iso = None
         if getattr(user, "created_at", None) and user.created_at:
             created_at_iso = user.created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-        vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
-        has_keys = bool(vault and getattr(vault, "encrypted_key", None) and getattr(vault, "encrypted_secret", None))
         return UserStatusResponse(
             plan_tier=user.plan_tier or "trial",
             rebalance_interval=int(user.rebalance_interval or 0),
@@ -4187,7 +4184,6 @@ def get_user_status(
             gross_profit_usd=round(gross, 2),
             pro_expiry=pro_expiry_iso,
             created_at=created_at_iso,
-            has_keys=has_keys,
         )
     except HTTPException:
         raise
