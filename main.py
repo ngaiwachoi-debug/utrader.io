@@ -1794,8 +1794,8 @@ async def get_all_bot_stats(
         if raw_data:
             all_engines.append(json.loads(raw_data))
 
-    # Fixed: Consider DB bot_status so UI shows Running/Starting immediately (no lag until worker writes heartbeats)
-    active = len(all_engines) > 0 or (bot_status in ("running", "starting"))
+    # DB is source of truth for stop: once user clicks Stop we set bot_status=stopped; show stopped even if stale Redis heartbeats remain
+    active = bot_status in ("running", "starting")
     if not all_engines:
         return {
             "active": active,
@@ -2729,6 +2729,25 @@ async def connect_exchange_by_user(
 
 
 # --- Start / Stop Bot (idempotent; clear ARQ keys to allow re-enqueue after stop) ---
+STOP_BOT_DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stop_bot_debug.log")
+
+
+def _write_stop_bot_debug(user_id: int, status_before: str, aborted: Optional[bool], error: Optional[str]) -> None:
+    """Append one line to stop_bot_debug.log for debugging stop-bot failures."""
+    try:
+        log_dir = os.path.dirname(STOP_BOT_DEBUG_LOG)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        err = f" error={error!r}" if error else ""
+        line = f"{ts} user_id={user_id} status_before={status_before} aborted={aborted}{err}\n"
+        with open(STOP_BOT_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+    except Exception as e:
+        logger.warning("stop_bot_debug: failed to write %s: %s", STOP_BOT_DEBUG_LOG, e)
+
+
 ARQ_JOB_PREFIX = "arq:job:"
 ARQ_RESULT_PREFIX = "arq:result:"
 ARQ_QUEUE_NAME = "arq:queue"
@@ -2821,46 +2840,61 @@ async def stop_bot(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
-    await _bot_action_rate_limit(current_user.id)
-    await _check_stop_cooldown(current_user.id)
-    await _record_stop_success(current_user.id)  # record so next stop is cooldown-limited
+    user_id = current_user.id
+    logger.info("stop_bot ENTRY user_id=%s", user_id)
+    await _bot_action_rate_limit(user_id)
+    await _check_stop_cooldown(user_id)
+    await _record_stop_success(user_id)  # record so next stop is cooldown-limited
     from arq.jobs import Job
     status_before = getattr(current_user, "bot_status", None) or "stopped"
+    logger.info("stop_bot user_id=%s status_before=%s updating DB", user_id, status_before)
     # Plan C: DB first so UI never stuck on "starting" if job aborted before start
     try:
-        user = db.query(models.User).filter(models.User.id == current_user.id).first()
+        user = db.query(models.User).filter(models.User.id == user_id).first()
         if user:
             if hasattr(user, "bot_desired_state"):
                 user.bot_desired_state = "stopped"
             if hasattr(user, "bot_status"):
                 user.bot_status = "stopped"
             db.commit()
-    except Exception:
+            logger.info("stop_bot user_id=%s DB updated bot_status=stopped", user_id)
+        else:
+            logger.warning("stop_bot user_id=%s user not found in DB", user_id)
+    except Exception as e:
         try:
             db.rollback()
         except Exception:
             pass
+        logger.exception("stop_bot user_id=%s DB update failed: %s", user_id, e)
     aborted = False
+    job_id = f"bot_user_{user_id}"
     try:
         redis = await get_redis_or_raise()
-        job_id = f"bot_user_{current_user.id}"
+        logger.info("stop_bot user_id=%s job_id=%s calling job.abort(timeout=5)", user_id, job_id)
         job = Job(job_id=job_id, redis=redis)
         aborted = await job.abort(timeout=5)
+        logger.info("stop_bot user_id=%s job.abort() returned aborted=%s", user_id, aborted)
         await _clear_arq_job_keys(redis, job_id)
+        logger.info("stop_bot user_id=%s ARQ keys cleared", user_id)
     except asyncio.TimeoutError:
+        _write_stop_bot_debug(user_id, status_before, False, "job.abort() timed out (5s)")
         try:
             redis = await get_redis_or_raise()
-            await _clear_arq_job_keys(redis, f"bot_user_{current_user.id}")
-        except Exception:
-            pass
-        logger.warning("stop_bot user_id=%s abort timed out (5s), cleared keys", current_user.id)
-    except Exception:
+            await _clear_arq_job_keys(redis, job_id)
+        except Exception as e2:
+            logger.exception("stop_bot user_id=%s clear keys after timeout failed: %s", user_id, e2)
+        logger.warning("stop_bot user_id=%s abort timed out (5s), cleared keys", user_id)
+    except Exception as e:
+        logger.exception("stop_bot user_id=%s Redis/job.abort failed: %s", user_id, e)
+        _write_stop_bot_debug(user_id, status_before, False, str(e))
         try:
             redis = await get_redis_or_raise()
-            await _clear_arq_job_keys(redis, f"bot_user_{current_user.id}")
-        except Exception:
-            pass
-    logger.info("stop_bot user_id=%s action=stop aborted=%s bot_status_before=%s bot_status_after=stopped", current_user.id, aborted, status_before)
+            await _clear_arq_job_keys(redis, job_id)
+            logger.info("stop_bot user_id=%s ARQ keys cleared after exception", user_id)
+        except Exception as e2:
+            logger.exception("stop_bot user_id=%s clear_arq_job_keys failed: %s", user_id, e2)
+    logger.info("stop_bot EXIT user_id=%s aborted=%s bot_status_before=%s bot_status_after=stopped", user_id, aborted, status_before)
+    _write_stop_bot_debug(user_id, status_before, aborted, None)
     return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
 
 

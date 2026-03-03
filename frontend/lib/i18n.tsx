@@ -2,9 +2,10 @@
 
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react"
 
-export type Lang = "en" | "zh" | "ko" | "ru" | "de"
+export type Lang = "en" | "zh" | "ko" | "ru" | "de" | "pt" | "fil" | "id" | "ja"
 
-export const SUPPORTED_LOCALES: Lang[] = ["en", "zh", "ko", "ru", "de"]
+/** Order: English first, Chinese second, then by prevalence (Google/lang usage). */
+export const SUPPORTED_LOCALES: Lang[] = ["en", "zh", "pt", "id", "ja", "ru", "de", "ko", "fil"]
 
 function isLang(s: string): s is Lang {
   return SUPPORTED_LOCALES.includes(s as Lang)
@@ -13,7 +14,7 @@ function isLang(s: string): s is Lang {
 const STORAGE_KEY = "utrader_lang"
 const COOKIE_NAME = "utrader_lang"
 
-type TranslationEntry = { en: string; zh?: string; ko?: string; ru?: string; de?: string }
+type TranslationEntry = { en: string; zh?: string; ko?: string; ru?: string; de?: string; pt?: string; fil?: string; id?: string; ja?: string }
 
 const translations: Record<string, TranslationEntry> = {
   // Header
@@ -37,6 +38,11 @@ const translations: Record<string, TranslationEntry> = {
   "header.theme": { en: "Theme", zh: "主題", ko: "테마", ru: "Тема", de: "Design" },
   "header.themeLight": { en: "Switch to light theme", zh: "切換至淺色主題", ko: "라이트 테마로 전환", ru: "Переключить на светлую тему", de: "Zum hellen Design wechseln" },
   "header.themeDark": { en: "Switch to dark theme", zh: "切換至深色主題", ko: "다크 테마로 전환", ru: "Переключить на тёмную тему", de: "Zum dunklen Design wechseln" },
+  "header.installApp": { en: "Install app", zh: "安裝應用", ko: "앱 설치", ru: "Установить приложение", de: "App installieren" },
+  "header.installAppTitle": { en: "Create a shortcut or install the app", zh: "建立捷徑或安裝應用程式", ko: "바로가기 만들기 또는 앱 설치", ru: "Создать ярлык или установить приложение", de: "Verknüpfung erstellen oder App installieren" },
+  "header.installAppShortcut": { en: "Create desktop shortcut", zh: "建立桌面捷徑", ko: "바탕화면 바로가기 만들기", ru: "Создать ярлык на рабочем столе", de: "Desktop-Verknüpfung erstellen" },
+  "header.installAppChromeHint": { en: "In Chrome you can add this site as an app or shortcut:", zh: "在 Chrome 中可將此網站新增為應用程式或捷徑：", ko: "Chrome에서 이 사이트를 앱 또는 바로가기로 추가할 수 있습니다.", ru: "В Chrome можно добавить этот сайт как приложение или ярлык:", de: "In Chrome können Sie diese Seite als App oder Verknüpfung hinzufügen:" },
+  "header.installAppChromeSteps": { en: "Click the menu (⋮) → More tools → Create shortcut. Check \"Open as window\" for an app-like experience.", zh: "點選選單 (⋮) → 更多工具 → 建立捷徑。勾選「以視窗開啟」可獲得類似應用程式的體驗。", ko: "메뉴(⋮) → 더보기 도구 → 바로가기 만들기. \"창으로 열기\"를 선택하면 앱처럼 사용할 수 있습니다.", ru: "Меню (⋮) → Дополнительные инструменты → Создать ярлык. Включите «Открыть как окно» для режима приложения.", de: "Menü (⋮) → Weitere Tools → Verknüpfung erstellen. „Als Fenster öffnen“ für App-Erlebnis aktivieren." },
   "header.langEn": { en: "EN", zh: "EN", ko: "EN", ru: "EN", de: "EN" },
   "header.langZh": { en: "中文", zh: "中文", ko: "중문", ru: "Кит.", de: "Chin." },
 
@@ -389,7 +395,7 @@ export function LanguageProvider({ children }: { children: React.ReactNode }) {
       setLanguageState(stored)
     } else {
       const pathname = window.location.pathname
-      const localeMatch = pathname.match(/^\/(en|zh|ko|ru|de)(\/|$)/)
+      const localeMatch = pathname.match(/^\/(en|zh|ko|ru|de|pt|fil|id|ja)(\/|$)/)
       const localeFromPath = localeMatch?.[1]
       if (localeFromPath && isLang(localeFromPath)) {
         setLanguageState(localeFromPath)

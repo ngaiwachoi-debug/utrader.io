@@ -1,6 +1,6 @@
 "use client"
 
-import React, { createContext, useCallback, useContext, useEffect, useState } from "react"
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react"
 import { getBackendToken } from "@/lib/auth"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useBotStats } from "@/lib/dashboard-data-context"
@@ -44,7 +44,9 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
   const botActive = botStats.data?.active ?? null
   const [insufficientTokens, setInsufficientTokens] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
+  const startInProgressRef = useRef(false)
   const [isStopping, setIsStopping] = useState(false)
+  const stopInProgressRef = useRef(false)
   const [actionCooldownSec, setActionCooldownSec] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const loading = botStats.loading
@@ -69,6 +71,8 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
 
   const handleStart = useCallback(async () => {
     if (userId == null || actionCooldownSec > 0) return
+    if (startInProgressRef.current) return
+    startInProgressRef.current = true
     setActionCooldownSec(BOT_ACTION_COOLDOWN_SEC)
     try {
       setIsStarting(true)
@@ -102,35 +106,58 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
       const msg = e instanceof Error ? e.message : String(e)
       setError(msg === "Failed to fetch" || msg.includes("NetworkError") ? "API unreachable" : msg)
     } finally {
+      startInProgressRef.current = false
       setIsStarting(false)
     }
   }, [userId, refreshBotStatus, actionCooldownSec])
 
   const handleStop = useCallback(async () => {
     if (userId == null || actionCooldownSec > 0) return
+    if (stopInProgressRef.current) return
+    stopInProgressRef.current = true
+    const log = (msg: string, data?: object) => {
+      try {
+        console.log("[stop-bot]", msg, data ?? "")
+      } catch {
+        // no-op
+      }
+    }
     setActionCooldownSec(BOT_ACTION_COOLDOWN_SEC)
     try {
       setIsStopping(true)
       setError(null)
+      log("handleStop called", { userId })
       const token = await getBackendToken()
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      log("POST /stop-bot sending")
       const res = await fetch(`${API_BACKEND}/stop-bot`, { method: "POST", credentials: "include", headers })
+      const text = await res.text()
+      log("POST /stop-bot response", { status: res.status, ok: res.ok, bodyLength: text?.length })
       if (!res.ok) {
-        const text = await res.text()
         try {
           const j = text ? JSON.parse(text) : {}
           const detail = typeof j.detail === "string" ? j.detail : text
+          log("stop-bot error response", { status: res.status, detail: detail || text })
           setError(res.status === 429 ? (detail || "Too many start/stop requests. Please wait before trying again.") : (detail || "Stop failed"))
         } catch {
+          log("stop-bot error body parse failed", { text: text?.slice(0, 200) })
           setError(text || "Stop failed")
         }
       } else {
+        try {
+          const data = text ? JSON.parse(text) : {}
+          log("stop-bot success", data)
+        } catch {
+          log("stop-bot success body", { raw: text?.slice(0, 200) })
+        }
         await refreshBotStatus()
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
+      log("stop-bot exception", { message: msg, name: e instanceof Error ? e.name : undefined })
       setError(msg === "Failed to fetch" || msg.includes("NetworkError") ? "API unreachable" : msg)
     } finally {
+      stopInProgressRef.current = false
       setIsStopping(false)
     }
   }, [userId, refreshBotStatus, actionCooldownSec])

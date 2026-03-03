@@ -80,7 +80,7 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
         </div>
 
         <div className="flex items-center gap-2 border-l border-border pl-3">
-          {/* Refresh: secondary action */}
+          {/* Refresh */}
           <button
             onClick={handleRefreshClick}
             disabled={cooling}

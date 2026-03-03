@@ -67,7 +67,7 @@ type Health = { redis: string; db: string }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 
-const LOCALE_REGEX = /^\/(en|zh|ko|ru|de)(\/|$)/
+const LOCALE_REGEX = /^\/(en|zh|ko|ru|de|pt|fil|id|ja)(\/|$)/
 function getLocaleFromPath(path: string | null): string {
   return path?.match(LOCALE_REGEX)?.[1] ?? "en"
 }

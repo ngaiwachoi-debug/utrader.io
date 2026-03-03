@@ -182,7 +182,20 @@ async def run_bot_task(ctx, user_id: int):
                 loop_count += 1
                 if loop_count == 1:
                     await _term(redis, user_id, f"Heartbeat: Bot running. Next rebalance in {user.rebalance_interval} min.")
-                await asyncio.sleep(user.rebalance_interval * 60)
+                # Sleep in 5s chunks so Stop Bot (job.abort) can cancel within ~5s instead of after up to 40 min.
+                # Also check DB each chunk: if user clicked Stop, bot_desired_state is set and we exit even if abort didn't reach us.
+                sleep_sec = user.rebalance_interval * 60
+                for _ in range(max(1, sleep_sec // 5)):
+                    await asyncio.sleep(5)
+                    db.expire(user)
+                    user = db.query(models.User).filter(models.User.id == user_id).first()
+                    if user and getattr(user, "bot_desired_state", None) == "stopped":
+                        await _term(redis, user_id, "Shutdown: stop requested from dashboard.")
+                        print(f"[SHUTDOWN] User {user_id} bot_desired_state=stopped. Exiting.")
+                        user.bot_status = "stopped"
+                        db.commit()
+                        engine_task.cancel()
+                        raise asyncio.CancelledError()
                 db.expire(user)
                 user = db.query(models.User).filter(models.User.id == user_id).first()
         finally:

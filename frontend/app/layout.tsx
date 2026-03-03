@@ -15,6 +15,7 @@ export const metadata: Metadata = {
     icon: ["/icon-light-32x32.png", "/icon.svg"],
     apple: "/apple-icon.png",
   },
+  manifest: "/manifest.json",
 }
 
 export const viewport: Viewport = {

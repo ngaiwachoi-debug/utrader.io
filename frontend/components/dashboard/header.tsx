@@ -18,6 +18,7 @@ import {
 import { Spinner } from "@/components/ui/spinner"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useWallets, useUserStatus } from "@/lib/dashboard-data-context"
+import { InstallAppButton } from "@/components/dashboard/install-app-button"
 
 type HeaderProps = { onUpgradeClick?: () => void; onOpenMobileMenu?: () => void }
 
@@ -49,12 +50,12 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
   const tokenLow = tokensRemaining != null && tokensRemaining < 50
 
   const handleLocaleChange = (value: string) => {
-    const locale = value as "en" | "zh" | "ko" | "ru" | "de"
+    const locale = value as "en" | "zh" | "ko" | "ru" | "de" | "pt" | "fil" | "id" | "ja"
     setLanguage(locale)
     const path = pathname ?? "/dashboard"
-    const localeRegex = /^\/(en|zh|ko|ru|de)(\/|$)/
+    const localeRegex = /^\/(en|zh|ko|ru|de|pt|fil|id|ja)(\/|$)/
     if (localeRegex.test(path)) {
-      const withoutLocale = path.replace(/^\/(en|zh|ko|ru|de)/, "") || "/"
+      const withoutLocale = path.replace(/^\/(en|zh|ko|ru|de|pt|fil|id|ja)/, "") || "/"
       const newPath = `/${locale}${withoutLocale === "/" ? "" : withoutLocale}`
       if (path !== newPath) router.push(newPath)
     }
@@ -113,6 +114,7 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
             <button className="hidden sm:flex rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.help")}>
               <HelpCircle className="h-4 w-4" />
             </button>
+            <InstallAppButton />
             <button
               type="button"
               onClick={() => setTheme(isDark ? "light" : "dark")}
@@ -146,9 +148,13 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
               <SelectContent>
                 <SelectItem value="en">English</SelectItem>
                 <SelectItem value="zh">中文</SelectItem>
-                <SelectItem value="ko">한국어</SelectItem>
+                <SelectItem value="pt">Português</SelectItem>
+                <SelectItem value="id">Indonesia</SelectItem>
+                <SelectItem value="ja">日本語</SelectItem>
                 <SelectItem value="ru">Русский</SelectItem>
                 <SelectItem value="de">Deutsch</SelectItem>
+                <SelectItem value="ko">한국어</SelectItem>
+                <SelectItem value="fil">Filipino</SelectItem>
               </SelectContent>
             </Select>
           </div>
