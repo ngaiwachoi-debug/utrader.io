@@ -2,7 +2,7 @@ import createMiddleware from 'next-intl/middleware';
 import { withAuth } from "next-auth/middleware";
 import { NextRequest } from "next/request";
 
-const locales = ['en', 'zh'];
+const locales = ['en', 'zh', 'ko', 'ru', 'de'];
 const publicPages = ['/', '/login', '/dashboard', '/admin-login']; // Dashboard public for "Dev: Login as"; admin-login for admin Google sign-in
 
 const intlMiddleware = createMiddleware({

@@ -31,7 +31,7 @@ export default function AdminLoginPage() {
       <div className="w-full max-w-md rounded-xl border border-border bg-card p-8 shadow-lg">
         <div className="flex items-center gap-2 mb-8">
           <span className="text-xl font-semibold text-foreground">
-            uTrader<span className="text-emerald">.io</span> Admin
+            bifinexbot<span className="text-primary">.com</span> Admin
           </span>
         </div>
 
@@ -43,7 +43,7 @@ export default function AdminLoginPage() {
         <button
           type="button"
           onClick={() => signIn("google", { callbackUrl: `/${locale}/admin` })}
-          className="w-full flex items-center justify-center gap-2 rounded-lg bg-[#10b981] px-4 py-3 text-base font-semibold text-white hover:bg-emerald/90 transition-colors border-0"
+          className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-3 text-base font-semibold text-white hover:bg-primary/90 transition-colors border-0"
         >
           <svg className="h-5 w-5" viewBox="0 0 24 24">
             <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
@@ -55,7 +55,7 @@ export default function AdminLoginPage() {
         </button>
 
         <p className="mt-6 text-xs text-muted-foreground text-center">
-          <Link href={`/${locale}`} className="text-emerald hover:underline">
+          <Link href={`/${locale}`} className="text-primary hover:underline">
             ← Back to home
           </Link>
         </p>

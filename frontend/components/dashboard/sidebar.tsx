@@ -16,6 +16,7 @@ import {
   CreditCard,
   Terminal,
   UserPlus,
+  Trophy,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useT } from "@/lib/i18n"
@@ -38,6 +39,7 @@ const allNavItems = [
   { id: "true-roi", labelKey: "sidebar.trueRoi", icon: TrendingUp },
   { id: "subscription", labelKey: "sidebar.subscription", icon: CreditCard },
   { id: "referral-usdt", labelKey: "sidebar.referralUsdt", icon: UserPlus },
+  { id: "leaderboard", labelKey: "sidebar.leaderboard", icon: Trophy },
   { id: "terminal", labelKey: "sidebar.terminal", icon: Terminal },
   { id: "settings", labelKey: "sidebar.settings", icon: Settings },
 ]
@@ -61,16 +63,18 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle, planTie
         collapsed ? "w-16" : "w-56"
       )}
     >
-      {/* Logo */}
+      {/* Logo: top when expanded; moves to bottom when collapsed */}
       <div className="flex h-14 items-center justify-between border-b border-border px-4">
         <div className="flex items-center gap-2 overflow-hidden">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald">
-            <TrendingUp className="h-4 w-4 text-primary-foreground" />
-          </div>
           {!collapsed && (
-            <span className="text-sm font-semibold text-foreground whitespace-nowrap">
-              uTrader<span className="text-emerald">.io</span>
-            </span>
+            <>
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary">
+                <TrendingUp className="h-4 w-4 text-primary-foreground" />
+              </div>
+              <span className="text-sm font-semibold text-foreground whitespace-nowrap">
+                bifinexbot<span className="text-primary">.com</span>
+              </span>
+            </>
           )}
         </div>
         <button
@@ -94,7 +98,7 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle, planTie
                   className={cn(
                     "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all duration-200",
                     isActive
-                      ? "bg-emerald text-primary-foreground shadow-md shadow-emerald/20"
+                      ? "bg-primary text-primary-foreground shadow-md shadow-primary/20"
                       : "text-muted-foreground hover:bg-secondary hover:text-foreground"
                   )}
                 >
@@ -107,8 +111,15 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle, planTie
         </ul>
       </nav>
 
-      {/* User Area */}
+      {/* User Area: when collapsed, logo appears here above avatar */}
       <div className="border-t border-border p-3">
+        {collapsed && (
+          <div className="mb-3 flex justify-center">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary">
+              <TrendingUp className="h-4 w-4 text-primary-foreground" />
+            </div>
+          </div>
+        )}
         {signedIn ? (
           <>
             <div className="flex items-center gap-3">
@@ -136,7 +147,7 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle, planTie
           !collapsed && (
             <Link
               href="/login"
-              className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-emerald hover:bg-emerald/10 transition-colors"
+              className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-primary hover:bg-primary/10 transition-colors"
             >
               <User className="h-4 w-4" />
               <span>{t("sidebar.signIn")}</span>

@@ -14,7 +14,7 @@ import models
 from bot_engine import PortfolioManager
 
 EMAIL = (sys.argv[1] if len(sys.argv) > 1 else "choiwangai@gmail.com").strip().lower()
-RUN_SECONDS = 10
+RUN_SECONDS = 50
 
 
 async def main():

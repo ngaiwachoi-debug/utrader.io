@@ -76,7 +76,7 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
   const handleUpgrade = () => setActivePage("subscription")
 
   return (
-    <div className="min-h-screen bg-background flex flex-col" suppressHydrationWarning>
+    <div className="min-h-screen bg-background" suppressHydrationWarning>
       <BotStatusProvider onUpgradeClick={handleUpgrade}>
         <Sidebar
           activePage={activePage}
@@ -87,7 +87,7 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
         />
 
         <div
-          className={`transition-all duration-300 flex flex-col flex-1 min-h-0 ${sidebarCollapsed ? "md:ml-16" : "md:ml-56"}`}
+          className={`transition-all duration-300 ${sidebarCollapsed ? "md:ml-16" : "md:ml-56"}`}
         >
           <div className="w-full">
             <Header onUpgradeClick={handleUpgrade} onOpenMobileMenu={() => setMobileMenuOpen(true)} />
@@ -102,19 +102,15 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
             pathname={pathname}
           />
 
-          <main className="p-4 pb-20 md:pb-4 lg:p-6 flex flex-col flex-1 min-h-0">
+          <main className="p-4 pb-20 md:pb-4 lg:p-6">
             {activePage === "profit-center" && <ProfitCenter onUpgradeClick={handleUpgrade} />}
             {activePage === "live-status" && <LiveStatus />}
             {activePage === "market-status" && <MarketStatus />}
-            {activePage === "true-roi" && <TrueROI />}
+            {activePage === "true-roi" && <TrueROI planTier={planTier} onUpgradeClick={handleUpgrade} />}
             {activePage === "subscription" && <Subscription />}
             {activePage === "referral-usdt" && <ReferralUsdt />}
             {activePage === "leaderboard" && <Ranking />}
-            {activePage === "terminal" && (
-              <div className="flex flex-col flex-1 min-h-0">
-                <TerminalView />
-              </div>
-            )}
+            {activePage === "terminal" && <TerminalView />}
             {activePage === "settings" && <SettingsPage onUpgradeClick={handleUpgrade} />}
           </main>
         </div>

@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Crown, Users, Zap, Check, Loader2, ChevronDown, ChevronUp } from "lucide-react"
+import { Crown, Users, Zap, Check, Loader2, ChevronDown, ChevronUp, Coins, ArrowDownCircle } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
@@ -44,7 +44,6 @@ export function Subscription() {
   const [loadingTokens, setLoadingTokens] = useState(false)
   const [depositMessage, setDepositMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [bypassPayment, setBypassPayment] = useState(false)
-  const [howItWorksOpen, setHowItWorksOpen] = useState(false)
   const [faqOpen, setFaqOpen] = useState<string | null>(null)
 
   useEffect(() => {
@@ -120,6 +119,30 @@ export function Subscription() {
     const loadingKey = planInterval === "yearly" ? `${plan}_yearly` : plan
     setLoading(loadingKey)
     try {
+      if (bypassPayment) {
+        const res = await fetch(`${API_BASE}/api/v1/subscription/bypass`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          credentials: "include",
+          body: JSON.stringify({ plan, interval: planInterval }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (res.ok && data.status === "success") {
+          setDepositMessage({ type: "success", text: data.message ?? `${data.tokens_awarded} tokens added.` })
+          if (userId != null) {
+            const balanceRes = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, { credentials: "include", headers: { Authorization: `Bearer ${token}` } })
+            if (balanceRes.ok) {
+              const bal = await balanceRes.json()
+              setTokenBalance({ tokens_remaining: Number(bal.tokens_remaining) ?? 0, total_tokens_added: Number(bal.total_tokens_added) ?? 0, total_tokens_deducted: Number(bal.total_tokens_deducted) ?? 0 })
+              setTokenBalanceError(null)
+            }
+          }
+        } else {
+          alert(data.detail ?? data.message ?? "Subscription bypass failed.")
+        }
+        setLoading(null)
+        return
+      }
       const res = await fetch(`${API_BASE}/api/create-checkout-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -213,6 +236,80 @@ export function Subscription() {
       <div>
         <h1 className="text-2xl font-bold text-foreground">{t("subscription.title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{t("subscription.subtitle")}</p>
+
+        {/* Pay As You Go — top of page */}
+        <div className="mt-4 rounded-xl border border-border bg-card p-5">
+          <h3 className="text-base font-semibold text-foreground">{t("subscription.addTokens")}</h3>
+          <p className="mt-1 text-sm text-muted-foreground">{t("subscription.addTokensDesc")}</p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {PRESET_USD.map((amount) => (
+              <button
+                key={amount}
+                type="button"
+                onClick={() => {
+                  addTokenAmount(amount)
+                  setDepositMessage(null)
+                }}
+                className={`rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
+                  addTokensUsd === String(amount)
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "border-border bg-background text-foreground hover:bg-muted/50"
+                }`}
+              >
+                ${amount}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4 flex flex-wrap items-end gap-3">
+            <div className="flex-1 min-w-[120px]">
+              <label className="mb-1 block text-xs text-muted-foreground">{t("subscription.amountUsd")}</label>
+              <input
+                type="number"
+                min={1}
+                step={0.01}
+                value={addTokensUsd}
+                onChange={(e) => {
+                  setAddTokensUsd(e.target.value)
+                  setDepositMessage(null)
+                }}
+                className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
+                placeholder="10"
+              />
+            </div>
+            {SHOW_DEV_BILLING && (
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input type="checkbox" checked={bypassPayment} onChange={(e) => setBypassPayment(e.target.checked)} />
+                {t("subscription.bypassPaymentDev")}
+              </label>
+            )}
+            <button
+              onClick={handlePurchaseTokens}
+              disabled={loadingTokens}
+              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {loadingTokens ? (
+                <>
+                  <Loader2 className="mr-1.5 inline h-4 w-4 animate-spin" />
+                  {t("subscription.calculatingTokens")}
+                </>
+              ) : (
+                t("subscription.purchaseTokens")
+              )}
+            </button>
+          </div>
+          {previewTokens > 0 && (
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t("subscription.addTokensPreview", { n: previewTokens })}
+            </p>
+          )}
+          {depositMessage && (
+            <p
+              className={`mt-2 text-sm ${depositMessage.type === "success" ? "text-primary" : "text-destructive"}`}
+            >
+              {depositMessage.text}
+            </p>
+          )}
+        </div>
       </div>
 
       {/* Balance hero */}
@@ -221,11 +318,6 @@ export function Subscription() {
           <div className="h-3 w-24 rounded bg-muted animate-pulse" />
           <div className="mt-3 h-2 w-full rounded-full bg-muted animate-pulse" />
           <p className="mt-2 text-xs text-muted-foreground">…</p>
-        </div>
-      )}
-      {tokenBalanceError && (
-        <div className="rounded-xl border border-border bg-card px-5 py-4">
-          <p className="text-sm text-destructive">{tokenBalanceError}</p>
         </div>
       )}
       {tokenBalance != null && (() => {
@@ -255,27 +347,6 @@ export function Subscription() {
           </div>
         )
       })()}
-
-      {/* How tokens work */}
-      <div className="rounded-xl border border-border bg-muted/20 px-4 py-3">
-        <button
-          type="button"
-          onClick={() => setHowItWorksOpen(!howItWorksOpen)}
-          className="flex w-full items-center justify-between text-left text-sm font-semibold text-foreground"
-        >
-          {t("subscription.howItWorks")}
-          {howItWorksOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-        </button>
-        {howItWorksOpen && (
-          <div className="mt-3 space-y-2 text-xs text-muted-foreground">
-            <p>{t("subscription.howItWorksIntro")}</p>
-            <ul className="list-inside list-disc space-y-0.5">
-              <li>{t("subscription.howAdded")}</li>
-              <li>{t("subscription.howDeducted")}</li>
-            </ul>
-          </div>
-        )}
-      </div>
 
       {/* Plans */}
       <div>
@@ -478,14 +549,26 @@ export function Subscription() {
                 </tr>
                 <tr className="border-b border-border/50">
                   <td className="px-4 py-2.5">{t("subscription.featureTerminal")}</td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                </tr>
+                <tr className="border-b border-border/50">
+                  <td className="px-4 py-2.5">{t("subscription.featureGeneralSupport")}</td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                </tr>
+                <tr className="border-b border-border/50">
+                  <td className="px-4 py-2.5">{t("subscription.featurePrioritySupport")}</td>
                   <td className="px-4 py-2.5">—</td>
                   <td className="px-4 py-2.5">—</td>
                   <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
                 </tr>
                 <tr>
-                  <td className="px-4 py-2.5">{t("subscription.featurePrioritySupport")}</td>
-                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
-                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5">{t("subscription.featureTrueRoi")}</td>
+                  <td className="px-4 py-2.5">—</td>
+                  <td className="px-4 py-2.5">—</td>
                   <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
                 </tr>
               </tbody>
@@ -494,78 +577,38 @@ export function Subscription() {
         </div>
       </div>
 
-      {/* Pay As You Go */}
-      <div className="rounded-xl border border-border bg-card p-5">
-        <h3 className="text-base font-semibold text-foreground">{t("subscription.addTokens")}</h3>
-        <p className="mt-1 text-sm text-muted-foreground">{t("subscription.addTokensDesc")}</p>
-        <div className="mt-4 flex flex-wrap gap-2">
-          {PRESET_USD.map((amount) => (
-            <button
-              key={amount}
-              type="button"
-              onClick={() => {
-                addTokenAmount(amount)
-                setDepositMessage(null)
-              }}
-              className={`rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
-                addTokensUsd === String(amount)
-                  ? "border-primary bg-primary/10 text-primary"
-                  : "border-border bg-background text-foreground hover:bg-muted/50"
-              }`}
-            >
-              ${amount}
-            </button>
-          ))}
-        </div>
-        <div className="mt-4 flex flex-wrap items-end gap-3">
-          <div className="flex-1 min-w-[120px]">
-            <label className="mb-1 block text-xs text-muted-foreground">{t("subscription.amountUsd")}</label>
-            <input
-              type="number"
-              min={1}
-              step={0.01}
-              value={addTokensUsd}
-              onChange={(e) => {
-                setAddTokensUsd(e.target.value)
-                setDepositMessage(null)
-              }}
-              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
-              placeholder="10"
-            />
+      {/* How tokens work — always visible, professional copy */}
+      <div className="rounded-xl border border-border bg-muted/20 px-4 py-5">
+        <h3 className="text-sm font-semibold text-foreground flex items-center gap-2 mb-4">
+          <Coins className="h-4 w-4 text-primary" />
+          {t("subscription.howItWorks")}
+        </h3>
+        <p className="text-xs text-muted-foreground mb-4">
+          {t("subscription.howItWorksLead")}
+        </p>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="flex gap-3 rounded-lg bg-background/60 border border-border/50 p-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10">
+              <Coins className="h-4 w-4 text-primary" />
+            </div>
+            <div>
+              <p className="text-xs font-semibold text-foreground mb-0.5">{t("subscription.howEarnTitle")}</p>
+              <p className="text-xs text-muted-foreground">{t("subscription.howEarnBody")}</p>
+            </div>
           </div>
-          {SHOW_DEV_BILLING && (
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <input type="checkbox" checked={bypassPayment} onChange={(e) => setBypassPayment(e.target.checked)} />
-              {t("subscription.bypassPaymentDev")}
-            </label>
-          )}
-          <button
-            onClick={handlePurchaseTokens}
-            disabled={loadingTokens}
-            className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {loadingTokens ? (
-              <>
-                <Loader2 className="mr-1.5 inline h-4 w-4 animate-spin" />
-                {t("subscription.calculatingTokens")}
-              </>
-            ) : (
-              t("subscription.purchaseTokens")
-            )}
-          </button>
+          <div className="flex gap-3 rounded-lg bg-background/60 border border-border/50 p-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/10">
+              <ArrowDownCircle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+            </div>
+            <div>
+              <p className="text-xs font-semibold text-foreground mb-0.5">{t("subscription.howUseTitle")}</p>
+              <p className="text-xs text-muted-foreground">{t("subscription.howUseBody")}</p>
+            </div>
+          </div>
         </div>
-        {previewTokens > 0 && (
-          <p className="mt-2 text-sm text-muted-foreground">
-            {t("subscription.addTokensPreview", { n: previewTokens })}
-          </p>
-        )}
-        {depositMessage && (
-          <p
-            className={`mt-2 text-sm ${depositMessage.type === "success" ? "text-primary" : "text-destructive"}`}
-          >
-            {depositMessage.text}
-          </p>
-        )}
+        <p className="text-xs text-muted-foreground mt-3">
+          {t("subscription.howItWorksFooter")}
+        </p>
       </div>
 
       {/* Trust footer */}

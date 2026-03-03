@@ -1,86 +1,48 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect } from "react"
 import { toast } from "sonner"
-import { Copy, Wallet, UserPlus, Send, Loader2 } from "lucide-react"
+import { Copy, Wallet, UserPlus, Send, Loader2, RefreshCw, Users, History } from "lucide-react"
 import { getBackendToken } from "@/lib/auth"
 import { useCurrentUserId } from "@/lib/current-user-context"
+import { useReferralData } from "@/lib/dashboard-data-context"
+import { useT } from "@/lib/i18n"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
-
-type ReferralInfo = {
-  referral_code: string
-  referrer_id: number | null
-  referrer_email: string | null
-  total_usdt_credit_earned: number
-  usdt_withdraw_address?: string | null
-}
-
-type UsdtCredit = {
-  usdt_credit: number
-  locked_pending: number
-  available: number
-}
-
-type WithdrawalRow = {
-  id: number
-  amount: number
-  to_address?: string
-  address?: string
-  status: string
-  created_at: string | null
-  processed_at: string | null
-  rejection_note?: string | null
-}
-
-type RewardHistoryRow = {
-  created_at: string | null
-  burning_user_id: number
-  downline_email: string | null
-  amount_usdt_credit: number
-  level?: number
-}
+const REFRESH_COOLDOWN_SEC = 15
 
 export function ReferralUsdt() {
+  const t = useT()
   const userId = useCurrentUserId()
-  const [referralInfo, setReferralInfo] = useState<ReferralInfo | null>(null)
-  const [usdtCredit, setUsdtCredit] = useState<UsdtCredit | null>(null)
-  const [withdrawals, setWithdrawals] = useState<WithdrawalRow[]>([])
-  const [rewardHistory, setRewardHistory] = useState<RewardHistoryRow[]>([])
-  const [loading, setLoading] = useState(true)
+  const id = userId ?? 0
+  const referralData = useReferralData(id)
+  const { data, loading, error, isRevalidating, refetch } = referralData
+  const referralInfo = data?.referralInfo ?? null
+  const usdtCredit = data?.usdtCredit ?? null
+  const withdrawals = data?.withdrawals ?? []
+  const rewardHistory = data?.rewardHistory ?? []
+  const downline = data?.downline ?? []
+
   const [withdrawAmount, setWithdrawAmount] = useState("")
   const [submitting, setSubmitting] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
-
-  const fetchAll = useCallback(async () => {
-    const token = await getBackendToken()
-    if (!token || userId == null) {
-      setLoading(false)
-      return
-    }
-    setLoading(true)
-    try {
-      const [refRes, creditRes, histRes, rewardRes] = await Promise.all([
-        fetch(`${API_BASE}/api/v1/user/referral-info`, { headers: { Authorization: `Bearer ${token}` } }),
-        fetch(`${API_BASE}/api/v1/user/usdt-credit`, { headers: { Authorization: `Bearer ${token}` } }),
-        fetch(`${API_BASE}/api/v1/user/usdt-withdraw-history`, { headers: { Authorization: `Bearer ${token}` } }),
-        fetch(`${API_BASE}/api/v1/user/referral-reward-history?limit=50`, { headers: { Authorization: `Bearer ${token}` } }),
-      ])
-      if (refRes.ok) setReferralInfo(await refRes.json())
-      if (creditRes.ok) setUsdtCredit(await creditRes.json())
-      if (histRes.ok) setWithdrawals(await histRes.json())
-      if (rewardRes.ok) setRewardHistory(await rewardRes.json())
-      else setRewardHistory([])
-    } catch (e) {
-      if (process.env.NODE_ENV === "development") console.error("Referral/USDT fetch error", e)
-    } finally {
-      setLoading(false)
-    }
-  }, [userId])
+  const [tab, setTab] = useState<"usdt" | "referral">("usdt")
+  const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
+  const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
 
   useEffect(() => {
-    if (userId != null) void fetchAll()
-  }, [userId, fetchAll])
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((refreshCooldownUntil - Date.now()) / 1000))
+      setRefreshCooldownSec(remaining)
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [refreshCooldownUntil])
+
+  const handleRefresh = () => {
+    if (Date.now() < refreshCooldownUntil) return
+    setRefreshCooldownUntil(Date.now() + REFRESH_COOLDOWN_SEC * 1000)
+    void refetch()
+  }
 
   const copyReferralLink = () => {
     const code = referralInfo?.referral_code
@@ -122,7 +84,7 @@ export function ReferralUsdt() {
       toast.success("Withdrawal request submitted. It is pending until admin approval.")
       setWithdrawAmount("")
       setShowConfirm(false)
-      void fetchAll()
+      void refetch()
     } catch {
       toast.error("Request failed")
     } finally {
@@ -130,7 +92,7 @@ export function ReferralUsdt() {
     }
   }
 
-  if (loading && !referralInfo) {
+  if (loading && !data) {
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -144,28 +106,102 @@ export function ReferralUsdt() {
 
   return (
     <div className="space-y-8">
-      <h1 className="text-2xl font-bold text-foreground">Referral & USDT Credit</h1>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h1 className="text-2xl font-bold text-foreground">Referral & USDT Credit</h1>
+        <div className="flex items-center gap-2">
+          {isRevalidating && data && (
+            <span className="text-xs text-muted-foreground">Updating…</span>
+          )}
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={loading || refreshCooldownSec > 0}
+            className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground hover:bg-secondary disabled:opacity-50"
+          >
+            <RefreshCw className={`h-4 w-4 ${loading && !data ? "animate-spin" : ""}`} />
+            {refreshCooldownSec > 0 ? t("liveStatus.refreshIn", { n: refreshCooldownSec }) : "Refresh"}
+          </button>
+        </div>
+      </div>
 
-      {/* Referral Section */}
+      {error && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {/* Top row: summary stat cards */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div className="rounded-xl border border-border bg-card p-5">
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Total USDT Credit earned</p>
+          <p className="mt-1 text-2xl font-bold text-primary">{(referralInfo?.total_usdt_credit_earned ?? 0).toFixed(4)}</p>
+          <p className="text-xs text-muted-foreground mt-0.5">From referrals (L1/L2/L3)</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-5">
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">People signed up with your code</p>
+          <p className="mt-1 text-2xl font-bold text-foreground">{referralInfo?.referred_users_count ?? 0}</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            {(referralInfo?.referred_users_count ?? 0) === 0 ? "No one yet." : "Referred users"}
+          </p>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-5">
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Available to withdraw</p>
+          <p className="mt-1 text-2xl font-bold text-foreground">{(usdtCredit?.available ?? 0).toFixed(2)}</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            {usdtCredit && usdtCredit.locked_pending > 0 ? `Locked pending: ${usdtCredit.locked_pending.toFixed(2)}` : "USDT Credit"}
+          </p>
+        </div>
+      </div>
+
+      <div className="flex gap-2 mt-3 border-b border-border pb-2">
+        <button
+          type="button"
+          onClick={() => setTab("usdt")}
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            tab === "usdt"
+              ? "bg-primary text-primary-foreground"
+              : "bg-secondary/50 text-muted-foreground hover:bg-secondary"
+          }`}
+        >
+          USDT Credit
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("referral")}
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            tab === "referral"
+              ? "bg-primary text-primary-foreground"
+              : "bg-secondary/50 text-muted-foreground hover:bg-secondary"
+          }`}
+        >
+          Referral
+        </button>
+      </div>
+
+      {tab === "referral" && (
+      <>
+      {/* Card: Share your code */}
       <div className="rounded-xl border border-border bg-card p-5">
         <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground mb-4">
           <UserPlus className="h-5 w-5" />
-          Referral Program
+          Share your code
         </h2>
-        <div className="space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm text-muted-foreground">Your referral code:</span>
-            <code className="rounded bg-secondary px-2 py-1 text-sm font-mono">{referralInfo?.referral_code || "—"}</code>
-            <button
-              type="button"
-              onClick={copyCode}
-              className="inline-flex items-center gap-1 rounded-lg border border-border bg-secondary px-2 py-1 text-xs hover:bg-secondary/80"
-            >
-              <Copy className="h-3 w-3" /> Copy code
-            </button>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Your referral code</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <code className="rounded bg-secondary px-2 py-1 text-sm font-mono">{referralInfo?.referral_code || "—"}</code>
+              <button
+                type="button"
+                onClick={copyCode}
+                className="inline-flex items-center gap-1 rounded-lg border border-border bg-secondary px-2 py-1 text-xs hover:bg-secondary/80"
+              >
+                <Copy className="h-3 w-3" /> Copy code
+              </button>
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm text-muted-foreground">Referral link:</span>
+          <div className="space-y-2">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Referral link</p>
             <button
               type="button"
               onClick={copyReferralLink}
@@ -174,44 +210,92 @@ export function ReferralUsdt() {
               <Copy className="h-3 w-3" /> Copy link
             </button>
           </div>
-          <p className="text-2xl font-bold text-emerald">
-            Total USDT Credit earned: {(referralInfo?.total_usdt_credit_earned ?? 0).toFixed(4)} USDT
-          </p>
         </div>
-        {rewardHistory.length > 0 && (
-          <div className="mt-4">
-            <h3 className="text-sm font-medium text-foreground mb-2">Reward history</h3>
-            <div className="overflow-x-auto rounded-lg border border-border">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-border bg-secondary/50">
-                    <th className="text-left py-2 px-2">Date</th>
-                    <th className="text-left py-2 px-2">Downline</th>
-                    <th className="text-left py-2 px-2">Amount (USDT Credit)</th>
+      </div>
+
+      {/* Card: Referred users */}
+      <div className="rounded-xl border border-border bg-card p-5">
+        <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground mb-2">
+          <Users className="h-5 w-5" />
+          Referred users
+        </h2>
+        <p className="text-xs text-muted-foreground mb-4">People who signed up with your referral code and USDT Credit you earned from them (L1).</p>
+        {downline.length > 0 ? (
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border bg-secondary/50">
+                  <th className="text-left py-2.5 px-3">Referred user</th>
+                  <th className="text-left py-2.5 px-3">Joined</th>
+                  <th className="text-right py-2.5 px-3">USDT earned from them</th>
+                </tr>
+              </thead>
+              <tbody>
+                {downline.map((d) => (
+                  <tr key={d.user_id} className="border-b border-border/50">
+                    <td className="py-2.5 px-3 font-mono text-muted-foreground">{d.email_masked}</td>
+                    <td className="py-2.5 px-3 text-muted-foreground">{d.created_at ? new Date(d.created_at).toLocaleDateString(undefined, { dateStyle: "medium" }) : "—"}</td>
+                    <td className="py-2.5 px-3 text-right font-medium">{d.total_usdt_earned_from_them.toFixed(4)}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {rewardHistory.map((r, i) => (
-                    <tr key={i} className="border-b border-border/50">
-                      <td className="py-2 px-2 text-muted-foreground">{r.created_at ? new Date(r.created_at).toLocaleString() : "—"}</td>
-                      <td className="py-2 px-2">{r.downline_email ?? `User #${r.burning_user_id}`}</td>
-                      <td className="py-2 px-2">{r.amount_usdt_credit.toFixed(4)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                ))}
+              </tbody>
+            </table>
           </div>
+        ) : (
+          <p className="rounded-lg border border-border bg-secondary/30 py-4 px-4 text-sm text-muted-foreground text-center">
+            No one has signed up with your code yet. Share your referral link to start earning.
+          </p>
         )}
       </div>
 
-      {/* USDT Withdrawal Section */}
+      {/* Card: Reward history */}
       <div className="rounded-xl border border-border bg-card p-5">
-        <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground mb-4">
-          <Wallet className="h-5 w-5" />
-          USDT Credit Withdrawal
+        <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground mb-2">
+          <History className="h-5 w-5" />
+          Reward history
         </h2>
-        <p className="text-sm text-muted-foreground mb-3">
+        <p className="text-xs text-muted-foreground mb-4">Each row is one reward event (L1/L2/L3 from token burns or purchases).</p>
+        {rewardHistory.length > 0 ? (
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border bg-secondary/50">
+                  <th className="text-left py-2.5 px-3">Date</th>
+                  <th className="text-left py-2.5 px-3">Downline</th>
+                  <th className="text-left py-2.5 px-3">Level</th>
+                  <th className="text-right py-2.5 px-3">Amount (USDT Credit)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rewardHistory.map((r, i) => (
+                  <tr key={i} className="border-b border-border/50">
+                    <td className="py-2.5 px-3 text-muted-foreground">{r.created_at ? new Date(r.created_at).toLocaleString() : "—"}</td>
+                    <td className="py-2.5 px-3">{r.downline_email ?? `User #${r.burning_user_id}`}</td>
+                    <td className="py-2.5 px-3">L{r.level ?? 1}</td>
+                    <td className="py-2.5 px-3 text-right">{r.amount_usdt_credit.toFixed(4)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="rounded-lg border border-border bg-secondary/30 py-4 px-4 text-sm text-muted-foreground text-center">
+            No one has signed up with your code yet.
+          </p>
+        )}
+      </div>
+      </>
+      )}
+
+      {tab === "usdt" && (
+      <>
+      {/* Card: Balance & withdraw */}
+      <div className="rounded-xl border border-border bg-card p-5">
+        <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground mb-2">
+          <Wallet className="h-5 w-5" />
+          USDT Credit withdrawal
+        </h2>
+        <p className="text-sm text-muted-foreground mb-4">
           Withdrawals are processed manually by admin. Request will stay Pending until approved or rejected.
         </p>
         <div className="grid gap-2 mb-4">
@@ -221,9 +305,7 @@ export function ReferralUsdt() {
               <span className="ml-2 text-amber-600">(Locked pending: {usdtCredit.locked_pending.toFixed(2)})</span>
             )}
           </p>
-          <p className="text-sm font-medium text-foreground">
-            Available: {(usdtCredit?.available ?? 0).toFixed(2)} USDT Credit
-          </p>
+          <p className="text-sm font-medium text-foreground">Available: {(usdtCredit?.available ?? 0).toFixed(2)} USDT Credit</p>
         </div>
         {referralInfo?.usdt_withdraw_address ? (
           <>
@@ -245,7 +327,7 @@ export function ReferralUsdt() {
                 type="button"
                 onClick={() => setShowConfirm(true)}
                 disabled={!withdrawAmount || parseFloat(withdrawAmount) < 1 || (usdtCredit != null && parseFloat(withdrawAmount) > usdtCredit.available)}
-                className="rounded-lg bg-emerald px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-emerald/90 disabled:opacity-50 inline-flex items-center gap-2"
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 inline-flex items-center gap-2"
               >
                 <Send className="h-4 w-4" /> Request withdrawal
               </button>
@@ -254,48 +336,53 @@ export function ReferralUsdt() {
         ) : (
           <p className="text-sm text-amber-600">Save a USDT withdrawal address in Settings before requesting a withdrawal.</p>
         )}
+      </div>
 
-        {/* Withdrawal history */}
-        <div className="mt-6">
-          <h3 className="text-sm font-medium text-foreground mb-2">Withdrawal history</h3>
-          <div className="overflow-x-auto rounded-lg border border-border">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border bg-secondary/50">
-                  <th className="text-left py-2 px-2">Date</th>
-                  <th className="text-left py-2 px-2">Amount</th>
-                  <th className="text-left py-2 px-2">Address</th>
-                  <th className="text-left py-2 px-2">Status</th>
-                  <th className="text-left py-2 px-2">Note</th>
-                </tr>
-              </thead>
-              <tbody>
-                {withdrawals.length === 0 ? (
-                  <tr><td colSpan={5} className="py-4 px-2 text-center text-muted-foreground">No withdrawals yet</td></tr>
-                ) : (
-                  withdrawals.map((w) => (
-                    <tr key={w.id} className={`border-b border-border/50 ${w.status === "pending" ? "bg-amber-500/10" : ""}`}>
-                      <td className="py-2 px-2 text-muted-foreground">{w.created_at ? new Date(w.created_at).toLocaleString() : "—"}</td>
-                      <td className="py-2 px-2">{w.amount.toFixed(2)}</td>
-                      <td className="py-2 px-2 font-mono text-xs truncate max-w-[120px]" title={w.to_address ?? w.address}>{w.to_address ?? w.address}</td>
-                      <td className="py-2 px-2">
-                        <span className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${
-                          w.status === "pending" ? "bg-amber-500/20 text-amber-700 dark:text-amber-400" :
-                          w.status === "approved" ? "bg-emerald/20 text-emerald-700 dark:text-emerald-400" :
-                          "bg-red-500/20 text-red-700 dark:text-red-400"
-                        }`}>
-                          {w.status}
-                        </span>
-                      </td>
-                      <td className="py-2 px-2 text-muted-foreground text-xs">{w.rejection_note ?? "—"}</td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
+      {/* Card: Withdrawal history */}
+      <div className="rounded-xl border border-border bg-card p-5">
+        <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground mb-4">
+          <History className="h-5 w-5" />
+          Withdrawal history
+        </h2>
+        <div className="overflow-x-auto rounded-lg border border-border">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border bg-secondary/50">
+                <th className="text-left py-2.5 px-3">Date</th>
+                <th className="text-left py-2.5 px-3">Amount</th>
+                <th className="text-left py-2.5 px-3">Address</th>
+                <th className="text-left py-2.5 px-3">Status</th>
+                <th className="text-left py-2.5 px-3">Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              {withdrawals.length === 0 ? (
+                <tr><td colSpan={5} className="py-4 px-3 text-center text-muted-foreground">No withdrawals yet</td></tr>
+              ) : (
+                withdrawals.map((w) => (
+                  <tr key={w.id} className={`border-b border-border/50 ${w.status === "pending" ? "bg-amber-500/10" : ""}`}>
+                    <td className="py-2.5 px-3 text-muted-foreground">{w.created_at ? new Date(w.created_at).toLocaleString() : "—"}</td>
+                    <td className="py-2.5 px-3">{w.amount.toFixed(2)}</td>
+                    <td className="py-2.5 px-3 font-mono text-xs truncate max-w-[120px]" title={w.to_address ?? w.address}>{w.to_address ?? w.address}</td>
+                    <td className="py-2.5 px-3">
+                      <span className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${
+                        w.status === "pending" ? "bg-amber-500/20 text-amber-700 dark:text-amber-400" :
+                        w.status === "approved" ? "bg-chart-1/20 text-chart-1" :
+                        "bg-red-500/20 text-red-700 dark:text-red-400"
+                      }`}>
+                        {w.status}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-muted-foreground text-xs">{w.rejection_note ?? "—"}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
+      </>
+      )}
 
       {/* Confirm modal */}
       {showConfirm && (
@@ -306,7 +393,7 @@ export function ReferralUsdt() {
             </p>
             <div className="flex gap-2 justify-end">
               <button type="button" onClick={() => setShowConfirm(false)} disabled={submitting} className="rounded-lg border border-border px-4 py-2 text-sm">Cancel</button>
-              <button type="button" onClick={handleWithdrawSubmit} disabled={submitting} className="rounded-lg bg-emerald px-4 py-2 text-sm text-primary-foreground inline-flex items-center gap-2">
+              <button type="button" onClick={handleWithdrawSubmit} disabled={submitting} className="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground inline-flex items-center gap-2">
                 {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
                 Confirm
               </button>

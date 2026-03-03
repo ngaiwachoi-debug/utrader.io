@@ -30,7 +30,7 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
     if (status !== "authenticated" && !session?.user) {
       const hasDevToken =
         typeof window !== "undefined" &&
-        sessionStorage.getItem("utrader_dev_backend_token")
+        sessionStorage.getItem("bifinexbot_dev_backend_token")
       if (!hasDevToken) {
         setUserId(null)
         setIsLoading(false)
@@ -66,7 +66,7 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
     }
     const hasDevToken =
       typeof window !== "undefined" &&
-      sessionStorage.getItem("utrader_dev_backend_token")
+      sessionStorage.getItem("bifinexbot_dev_backend_token")
     if (status === "unauthenticated" && !hasDevToken) {
       setUserId(null)
       setIsLoading(false)

@@ -430,6 +430,15 @@ def _refresh_ranking_snapshot(db: Session) -> None:
                 "lent_usd": round(1000 + rng.uniform(0, 99000), 2),
             })
         rows.sort(key=lambda x: x["yield_pct"], reverse=True)
+        # plan_tier by rank: top 5 whales, 6-20 ai_ultra, 21-50 pro, 51-100 trial
+        def _plan_tier_for_rank(r: int) -> str:
+            if r <= 5:
+                return "whales"
+            if r <= 20:
+                return "ai_ultra"
+            if r <= 50:
+                return "pro"
+            return "trial"
         db.query(models.RankingSnapshot).delete()
         for r, row in enumerate(rows, start=1):
             db.add(models.RankingSnapshot(
@@ -437,6 +446,7 @@ def _refresh_ranking_snapshot(db: Session) -> None:
                 user_display=row["user_display"],
                 yield_pct=row["yield_pct"],
                 lent_usd=row["lent_usd"],
+                plan_tier=_plan_tier_for_rank(r),
             ))
         db.commit()
         logger.info("ranking_snapshot refreshed: 100 rows (seed=%s)", seed)
@@ -549,16 +559,19 @@ def _reconcile_cached_vs_fresh(db: Session, user_id: int, date_utc: date, dry_ru
         token_ledger_svc.deduct_tokens(db, user_id, diff_usd)
         after = before - diff_usd
     else:
-        # Overcharged: refund (add)
-        after = before + abs(diff_usd)
-        log_msg = "Reconciliation: Refunded %.6f tokens (overcharged)" % abs(diff_usd)
+        # Overcharged: do not auto-add tokens; only clear cache and log. Refunds are via admin rollback or scripts only.
+        after = before
+        log_msg = "Reconciliation: overcharged %.6f tokens (no auto-refund; use admin rollback if needed)" % abs(diff_usd)
         if dry_run:
             logger.info(
-                "trace_id=%s | user_id=%s date_utc=%s [DRY RUN] %s balance_before=%.2f would_be_after=%.2f",
-                get_trace_id(), user_id, date_utc, log_msg, before, after,
+                "trace_id=%s | user_id=%s date_utc=%s [DRY RUN] %s balance_before=%.2f",
+                get_trace_id(), user_id, date_utc, log_msg, before,
             )
             return True
-        token_ledger_svc.add_tokens(db, user_id, abs(diff_usd), "deduction_rollback")
+        logger.warning(
+            "trace_id=%s | user_id=%s date_utc=%s %s balance=%.2f",
+            get_trace_id(), user_id, date_utc, log_msg, before,
+        )
     if hasattr(snap, "last_cached_daily_gross_usd"):
         snap.last_cached_daily_gross_usd = None
     db.commit()
@@ -987,7 +1000,7 @@ async def _alert_admins_deduction_failure(message: str) -> None:
             async with aiohttp.ClientSession() as session:
                 await session.post(
                     webhook_url,
-                    json={"text": f"[uTrader] {message}"},
+                    json={"text": f"[bifinexbot] {message}"},
                     timeout=aiohttp.ClientTimeout(total=10),
                 )
         except Exception as e:
@@ -1076,7 +1089,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="utrader.io API", lifespan=lifespan)
+app = FastAPI(title="bifinexbot.com API", lifespan=lifespan)
 
 # NextAuth JWT (from /api/auth/token). Set NEXTAUTH_SECRET in env to enable.
 # Strip so CRLF/whitespace from .env don't break JWT verification.
@@ -1404,6 +1417,7 @@ class UserStatusResponse(BaseModel):
     gross_profit_usd: float = 0.0
     pro_expiry: Optional[str] = None  # ISO 8601 UTC; null for free plan
     created_at: Optional[str] = None  # ISO 8601 UTC; users.created_at (Settings "Registration Date")
+    has_keys: bool = False  # whether user has Bitfinex API keys configured
 
 
 class TokenBalanceResponse(BaseModel):
@@ -1557,6 +1571,33 @@ class AdminTokenAdjustResponse(BaseModel):
     tokens_remaining: float
 
 
+class TokenAddLogEntry(BaseModel):
+    """Admin token-add log entry."""
+    id: Optional[int] = None
+    user_id: int
+    email: Optional[str] = None
+    amount: float
+    reason: str
+    created_at: str
+
+
+class TokenAddHistoryEntry(BaseModel):
+    """User-facing token add history entry (no user_id)."""
+    amount: float
+    reason: str
+    created_at: str
+
+
+class MyDeductionLogEntry(BaseModel):
+    """User-facing deduction log entry for /api/v1/users/me/deduction-history (no user_id/email)."""
+    gross_profit: float
+    tokens_deducted: float
+    tokens_remaining_after: Optional[float] = None
+    total_used_tokens: Optional[float] = None
+    timestamp: str
+    account_switch_note: Optional[str] = None
+
+
 class ApiFailureOut(BaseModel):
     id: str
     ts: str
@@ -1626,6 +1667,7 @@ class RankingRow(BaseModel):
     user_display: str
     yield_pct: float
     lent_usd: Optional[float] = None
+    plan_tier: Optional[str] = None  # trial, pro, ai_ultra, whales
 
 
 class RankingSummary(BaseModel):
@@ -1705,6 +1747,7 @@ class UserOverviewOut(BaseModel):
     api_key_status: Optional[Dict[str, Any]] = None
     withdrawals: List[Dict[str, Any]]
     deduction_history: List[Dict[str, Any]]
+    token_add_history: List[Dict[str, Any]] = []
     audit_entries: List[Dict[str, Any]]
     edits_locked: bool = False  # True during daily fee window (09:55–10:35 UTC); admin should not edit then
 
@@ -1905,18 +1948,30 @@ def get_ranking(
     )
     summary = None
     if total > 0:
-        total_paid_row = db.execute(
-            text("SELECT COALESCE(SUM(COALESCE(lent_usd,0) * yield_pct / 100.0), 0) FROM ranking_snapshot")
-        ).scalar()
-        total_paid_out_usd = float(total_paid_row) if total_paid_row is not None else 0.0
+        today = date.today()
+        seed = today.year * 10000 + today.month * 100 + today.day
+        rng = random.Random(seed)
+        reference_date = date(2024, 1, 1)
+        days_since = (today - reference_date).days
+        if days_since < 0:
+            days_since = 0
+        active_traders = rng.randint(3000, 6000)
+        total_payouts = 50000 + days_since * 120
+        total_paid_out_usd = round(2_000_000 + days_since * 85000, 2)
         summary = RankingSummary(
-            total_paid_out_usd=round(total_paid_out_usd, 2),
-            total_payouts=total,
-            active_traders=total,
+            total_paid_out_usd=total_paid_out_usd,
+            total_payouts=total_payouts,
+            active_traders=active_traders,
         )
     return RankingResponse(
         items=[
-            RankingRow(rank=r.rank, user_display=r.user_display, yield_pct=r.yield_pct, lent_usd=r.lent_usd)
+            RankingRow(
+                rank=r.rank,
+                user_display=r.user_display,
+                yield_pct=r.yield_pct,
+                lent_usd=r.lent_usd,
+                plan_tier=getattr(r, "plan_tier", None),
+            )
             for r in rows
         ],
         total=total,
@@ -2088,6 +2143,64 @@ async def get_my_token_balance_v1(
     except Exception as e:
         logger.exception("token_balance_api user_id=%s error=%s", current_user.id, e)
         raise HTTPException(status_code=500, detail=f"Internal error retrieving token balance: {str(e)}")
+
+
+@app.get("/api/v1/users/me/token-add-history", response_model=List[TokenAddHistoryEntry])
+async def get_my_token_add_history(
+    limit: int = Query(50, ge=1, le=200),
+    current_user: models.User = Depends(_get_current_user_for_token_balance),
+    db: Session = Depends(database.get_db),
+):
+    """Token add history for the current user (newest first)."""
+    if not hasattr(models, "TokenLedger"):
+        return []
+    rows = (
+        db.query(models.TokenLedger)
+        .filter(
+            models.TokenLedger.user_id == current_user.id,
+            models.TokenLedger.activity_type == "add",
+        )
+        .order_by(models.TokenLedger.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        TokenAddHistoryEntry(
+            amount=float(r.amount or 0),
+            reason=r.reason or "",
+            created_at=r.created_at.isoformat() + "Z" if r.created_at else "",
+        )
+        for r in rows
+    ]
+
+
+@app.get("/api/v1/users/me/deduction-history", response_model=List[MyDeductionLogEntry])
+async def get_my_deduction_history(
+    limit: int = Query(100, ge=1, le=200),
+    current_user: models.User = Depends(_get_current_user_for_token_balance),
+    db: Session = Depends(database.get_db),
+):
+    """Deduction log for the current user (newest first). From deduction_log table."""
+    if not hasattr(models, "DeductionLog"):
+        return []
+    rows = (
+        db.query(models.DeductionLog)
+        .filter(models.DeductionLog.user_id == current_user.id)
+        .order_by(models.DeductionLog.timestamp_utc.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        MyDeductionLogEntry(
+            gross_profit=float(r.daily_gross_profit_usd or 0),
+            tokens_deducted=float(r.tokens_deducted or 0),
+            tokens_remaining_after=float(r.tokens_remaining_after) if r.tokens_remaining_after is not None else None,
+            total_used_tokens=float(r.total_used_tokens) if r.total_used_tokens is not None else None,
+            timestamp=r.timestamp_utc.isoformat() + "Z" if r.timestamp_utc else "",
+            account_switch_note=r.account_switch_note,
+        )
+        for r in rows
+    ]
 
 
 @app.post("/api/keys/test")
@@ -4062,6 +4175,8 @@ def get_user_status(
         created_at_iso = None
         if getattr(user, "created_at", None) and user.created_at:
             created_at_iso = user.created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        vault = db.query(models.APIVault).filter(models.APIVault.user_id == user_id).first()
+        has_keys = bool(vault and getattr(vault, "encrypted_key", None) and getattr(vault, "encrypted_secret", None))
         return UserStatusResponse(
             plan_tier=user.plan_tier or "trial",
             rebalance_interval=int(user.rebalance_interval or 0),
@@ -4072,6 +4187,7 @@ def get_user_status(
             gross_profit_usd=round(gross, 2),
             pro_expiry=pro_expiry_iso,
             created_at=created_at_iso,
+            has_keys=has_keys,
         )
     except HTTPException:
         raise
@@ -4449,6 +4565,44 @@ def admin_deduction_logs(
             )
             for e in out
         ]
+
+
+@app.get("/admin/token-add/logs", response_model=List[TokenAddLogEntry])
+def admin_token_add_logs(
+    limit: int = Query(100, ge=1, le=500),
+    user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    start_date: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
+    _: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Recent token add log entries (newest first) from token_ledger where activity_type='add'."""
+    if not hasattr(models, "TokenLedger"):
+        return []
+    q = (
+        db.query(models.TokenLedger, models.User.email)
+        .outerjoin(models.User, models.TokenLedger.user_id == models.User.id)
+        .filter(models.TokenLedger.activity_type == "add")
+        .order_by(models.TokenLedger.created_at.desc())
+    )
+    if user_id is not None:
+        q = q.filter(models.TokenLedger.user_id == user_id)
+    if start_date:
+        q = q.filter(models.TokenLedger.created_at >= datetime.fromisoformat(start_date + "T00:00:00"))
+    if end_date:
+        q = q.filter(models.TokenLedger.created_at <= datetime.fromisoformat(end_date + "T23:59:59.999999"))
+    rows = q.limit(limit).all()
+    return [
+        TokenAddLogEntry(
+            id=ledger.id,
+            user_id=ledger.user_id,
+            email=email,
+            amount=float(ledger.amount or 0),
+            reason=ledger.reason or "",
+            created_at=ledger.created_at.isoformat() + "Z" if ledger.created_at else "",
+        )
+        for ledger, email in rows
+    ]
 
 
 @app.post("/admin/deduction/trigger")
@@ -5573,6 +5727,23 @@ def admin_user_overview(
     deduction_history = []
     with _deduction_logs_lock:
         deduction_history = [e for e in _deduction_logs if e.get("user_id") == user_id][-50:]
+    token_add_history = []
+    if hasattr(models, "TokenLedger"):
+        for ledger in (
+            db.query(models.TokenLedger)
+            .filter(
+                models.TokenLedger.user_id == user_id,
+                models.TokenLedger.activity_type == "add",
+            )
+            .order_by(models.TokenLedger.created_at.desc())
+            .limit(50)
+            .all()
+        ):
+            token_add_history.append({
+                "amount": float(ledger.amount or 0),
+                "reason": ledger.reason or "",
+                "created_at": ledger.created_at.isoformat() + "Z" if ledger.created_at else "",
+            })
     audit_entries = []
     try:
         for a in db.query(models.AdminAuditLog).order_by(models.AdminAuditLog.ts.desc()).limit(200).all():
@@ -5589,7 +5760,7 @@ def admin_user_overview(
         pass
     audit_entries = audit_entries[:30]
     edits_locked = _is_api_key_lock_window()
-    return UserOverviewOut(user=user_dict, token_balance=token_balance, usdt_credit=usdt_credit, profit_snapshot=profit_snapshot, referral=referral, api_key_status=api_key_status, withdrawals=withdrawals, deduction_history=deduction_history, audit_entries=audit_entries, edits_locked=edits_locked)
+    return UserOverviewOut(user=user_dict, token_balance=token_balance, usdt_credit=usdt_credit, profit_snapshot=profit_snapshot, referral=referral, api_key_status=api_key_status, withdrawals=withdrawals, deduction_history=deduction_history, token_add_history=token_add_history, audit_entries=audit_entries, edits_locked=edits_locked)
 
 
 def _aggregate_lent_per_currency(credits_data: Any) -> dict:
@@ -6111,6 +6282,11 @@ class CreateCheckoutPayload(BaseModel):
     interval: str  # "monthly" | "yearly"
 
 
+class SubscriptionBypassPayload(BaseModel):
+    plan: str  # "pro" | "ai_ultra" | "whales"
+    interval: str  # "monthly" | "yearly"
+
+
 class CreateCheckoutTokensPayload(BaseModel):
     amount_usd: float  # e.g. 10 → user gets 1000 tokens (1 USD = 100 tokens)
 
@@ -6235,6 +6411,58 @@ def _get_stripe_price_id(plan: str, interval: str) -> str:
         if plan == "whales":
             return STRIPE_PRICE_WHALES_MONTHLY or ""
     return ""
+
+
+@app.post("/api/v1/subscription/bypass")
+def subscription_bypass(
+    payload: SubscriptionBypassPayload,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Dev-only: apply subscription (plan_tier, pro_expiry, token award) without Stripe.
+    Requires ALLOW_DEV_CONNECT=1. Whales monthly = 200 USD equivalent, 40000 tokens.
+    """
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    plan = (payload.plan or "").lower()
+    interval = (payload.interval or "monthly").lower()
+    if plan not in ("pro", "ai_ultra", "whales") or interval not in ("monthly", "yearly"):
+        raise HTTPException(status_code=400, detail="Invalid plan or interval.")
+    interval_days = 365 if interval == "yearly" else 30
+    if plan in PLAN_REBALANCE_MIN:
+        current_user.plan_tier = plan
+        current_user.rebalance_interval = PLAN_REBALANCE_MIN[plan]
+    now = datetime.utcnow()
+    base = current_user.pro_expiry if current_user.pro_expiry and current_user.pro_expiry > now else now
+    current_user.pro_expiry = base + timedelta(days=interval_days)
+    tokens_to_award = (
+        PLAN_TOKEN_AWARD_YEARLY.get(plan, 0)
+        if interval == "yearly"
+        else PLAN_TOKEN_AWARD_MONTHLY.get(plan, 0)
+    )
+    if tokens_to_award > 0:
+        reason = "subscription_yearly" if interval == "yearly" else "subscription_monthly"
+        token_ledger_svc.add_tokens(db, current_user.id, float(tokens_to_award), reason)
+        usd_value = tokens_to_award / 100.0
+        apply_referral_rewards_on_purchase(db, current_user.id, usd_value)
+        logger.info(
+            "subscription_bypass user_id=%s plan=%s interval=%s tokens_added=%s",
+            current_user.id, plan, interval, tokens_to_award,
+        )
+    if current_user.referred_by:
+        referrer = db.query(models.User).filter(models.User.id == current_user.referred_by).first()
+        if referrer:
+            ref_base = referrer.pro_expiry if referrer.pro_expiry and referrer.pro_expiry > now else now
+            referrer.pro_expiry = ref_base + timedelta(days=7)
+    db.commit()
+    return {
+        "status": "success",
+        "plan": plan,
+        "interval": interval,
+        "tokens_awarded": tokens_to_award,
+        "message": f"Subscription applied. {tokens_to_award} tokens added.",
+    }
 
 
 @app.post("/api/create-checkout-session")

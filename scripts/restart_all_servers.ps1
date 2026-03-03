@@ -29,21 +29,17 @@ Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*arq*' -and
 Remove-Item "$root\frontend\.next\dev\lock" -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 
-# 4) Start backend (foreground in this window - or use Start-Process to open new windows)
-Write-Host "Starting backend on port $port..."
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$root'; python -m uvicorn main:app --host 127.0.0.1 --port $port"
+# 4) Start backend, worker, and frontend in this terminal (Cursor) as background jobs
+Write-Host "Starting backend, worker, and frontend in this terminal..."
+$jobBackend = Start-Job -ScriptBlock { param($r) Set-Location $r; python -m uvicorn main:app --host 127.0.0.1 --port 8000 } -ArgumentList $root
+$jobWorker  = Start-Job -ScriptBlock { param($r) Set-Location $r; python scripts/run_worker.py } -ArgumentList $root
+$jobFrontend = Start-Job -ScriptBlock { param($r) Set-Location (Join-Path $r "frontend"); npm run dev } -ArgumentList $root
 
-Start-Sleep -Seconds 3
-
-# 5) Start worker in new window
-Write-Host "Starting ARQ worker..."
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$root'; python scripts/run_worker.py"
-
-Start-Sleep -Seconds 2
-
-# 6) Start frontend in new window
-Write-Host "Starting frontend..."
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$root\frontend'; npm run dev"
-
-Write-Host "`nDone. Backend, worker, and frontend started in separate windows."
 Write-Host "Backend: http://127.0.0.1:8000  |  Frontend: http://localhost:3000"
+Write-Host "Streaming output (Ctrl+C to stop script; jobs may keep running).`n"
+try {
+    Receive-Job -Wait -Id $jobBackend.Id, $jobWorker.Id, $jobFrontend.Id
+} finally {
+    Get-Job | Where-Object { $_.Id -in @($jobBackend.Id, $jobWorker.Id, $jobFrontend.Id) } | Stop-Job -ErrorAction SilentlyContinue
+    Get-Job | Where-Object { $_.Id -in @($jobBackend.Id, $jobWorker.Id, $jobFrontend.Id) } | Remove-Job -Force -ErrorAction SilentlyContinue
+}

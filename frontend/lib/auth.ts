@@ -4,7 +4,7 @@
  * Dev: optional sessionStorage token (set by "Dev: Login as ...") when bypassing Google.
  */
 
-const DEV_BACKEND_TOKEN_KEY = "utrader_dev_backend_token"
+const DEV_BACKEND_TOKEN_KEY = "bifinexbot_dev_backend_token"
 
 let cachedBackendToken: string | null = null
 let cacheExpiry = 0
@@ -62,7 +62,7 @@ export function clearBackendTokenCache(): void {
 }
 
 // Legacy keys for backward compat (NextAuth replaces these)
-export const TOKEN_KEY = "utrader_id_token"
+export const TOKEN_KEY = "bifinexbot_id_token"
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null

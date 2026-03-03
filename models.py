@@ -224,6 +224,19 @@ class DeductionLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TokenLedger(Base):
+    """Append-only log for every token add (and optionally deduct). Table: token_ledger."""
+    __tablename__ = "token_ledger"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    activity_type = Column(String(16), nullable=False)  # 'add' or 'deduct'
+    amount = Column(Float, nullable=False)
+    reason = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    extra = Column("metadata", JSONB, nullable=True)  # DB column name 'metadata' is reserved in Declarative
+
+
 class AdminNotification(Base):
     """Global or per-user announcement."""
     __tablename__ = "admin_notifications"
@@ -264,6 +277,7 @@ class RankingSnapshot(Base):
     user_display = Column(String(255), nullable=False)  # fake email/name
     yield_pct = Column(Float, nullable=False)  # 15–32
     lent_usd = Column(Float, default=0.0, nullable=True)  # optional fake lent
+    plan_tier = Column(String(32), nullable=True)  # trial, pro, ai_ultra, whales
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

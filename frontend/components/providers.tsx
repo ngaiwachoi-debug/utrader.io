@@ -7,7 +7,7 @@ import { LanguageProvider } from "@/lib/i18n"
 export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <SessionProvider>
-      <ThemeProvider attribute="class" defaultTheme="dark" enableSystem storageKey="utrader-theme">
+      <ThemeProvider attribute="class" defaultTheme="system" enableSystem storageKey="bifinexbot-theme">
         <LanguageProvider>
           {children}
         </LanguageProvider>

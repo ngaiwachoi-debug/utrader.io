@@ -26,6 +26,7 @@ import {
   CheckCircle,
 } from "lucide-react"
 import { useCurrentUserId } from "@/lib/current-user-context"
+import { useReferralData } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
 import {
   calculateTotalBudget,
@@ -45,7 +46,23 @@ type TokenBalanceState = {
   updated_at: string | null
 }
 
-type SettingsTab = "general" | "notifications" | "api-keys" | "community"
+type TokenAddHistoryEntry = { amount: number; reason: string; created_at: string }
+
+function tokenAddReasonLabel(reason: string): string {
+  const map: Record<string, string> = {
+    registration: "Sign-up bonus",
+    admin_add: "Admin adjustment",
+    admin_bulk_add: "Admin adjustment",
+    deposit_usd: "Deposit",
+    subscription_monthly: "Subscription",
+    subscription_yearly: "Subscription",
+    deduction_rollback: "Refund",
+    migration_backfill: "Migration",
+  }
+  return map[reason] ?? reason
+}
+
+type SettingsTab = "general" | "notifications" | "api-keys" | "community" | "token-activity"
 
 const INSUFFICIENT_TOKENS_MSG = "Please add tokens to run the bot. A minimum balance of 1 token is required."
 
@@ -54,6 +71,8 @@ type SettingsPageProps = { onUpgradeClick?: () => void }
 export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const t = useT()
   const userId = useCurrentUserId()
+  const id = userId ?? 0
+  const { data: referralCacheData } = useReferralData(id)
   const { data: session, status } = useSession()
   const signedIn = status === "authenticated" && !!session?.user
   const [activeTab, setActiveTab] = useState<SettingsTab>("general")
@@ -61,9 +80,11 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const [darkMode, setDarkMode] = useState(true)
   const [dailyEmail, setDailyEmail] = useState(false)
 
-  // USDT withdrawal address (from referral-info)
+  // USDT withdrawal address (from referral cache or referral-info API)
+  const cachedAddress = referralCacheData?.referralInfo?.usdt_withdraw_address ?? ""
   const [usdtWithdrawAddress, setUsdtWithdrawAddress] = useState<string>("")
   const [usdtAddressSaving, setUsdtAddressSaving] = useState(false)
+  const usdtAddressInitialized = useRef(false)
 
   // Account & Membership: plan and registration (from user-status)
   const [planTier, setPlanTier] = useState<string>("Trial User")
@@ -76,6 +97,10 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
   const [tokenBalanceError, setTokenBalanceError] = useState<string | null>(null)
   const tokenBalanceLastFetch = useRef<number>(0)
+
+  // Token add history: from /api/v1/users/me/token-add-history
+  const [tokenAddHistory, setTokenAddHistory] = useState<TokenAddHistoryEntry[]>([])
+  const [tokenAddHistoryLoading, setTokenAddHistoryLoading] = useState(false)
 
   const fetchTokenBalance = async () => {
     const token = await getBackendToken()
@@ -134,6 +159,26 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
     }
   }
 
+  const fetchTokenAddHistory = async () => {
+    const token = await getBackendToken()
+    if (!token) return
+    setTokenAddHistoryLoading(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/users/me/token-add-history?limit=50`, {
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setTokenAddHistory(Array.isArray(data) ? data : [])
+      }
+    } catch {
+      setTokenAddHistory([])
+    } finally {
+      setTokenAddHistoryLoading(false)
+    }
+  }
+
   useEffect(() => {
     if (userId == null) {
       setPlanTier("Trial User")
@@ -143,9 +188,11 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
       setTokenBalance(null)
       setTokenBalanceLoading(false)
       setTokenBalanceError(null)
+      setTokenAddHistory([])
       return
     }
     fetchTokenBalance()
+    fetchTokenAddHistory()
     const interval = setInterval(fetchTokenBalance, TOKEN_BALANCE_POLL_MS)
     return () => clearInterval(interval)
   }, [userId])
@@ -177,8 +224,18 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
     fetchUserStatus()
   }, [userId])
 
+  // Prefer referral cache for USDT address to avoid duplicate request when user already opened Referral page
+  useEffect(() => {
+    const addr = (cachedAddress ?? "").trim()
+    if (addr && !usdtAddressInitialized.current) {
+      usdtAddressInitialized.current = true
+      setUsdtWithdrawAddress(addr)
+    }
+  }, [cachedAddress])
+
   useEffect(() => {
     if (userId == null) return
+    if (cachedAddress) return
     const fetchRef = async () => {
       try {
         const token = await getBackendToken()
@@ -186,14 +243,16 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
         const res = await fetch(`${API_BASE}/api/v1/user/referral-info`, { headers: { Authorization: `Bearer ${token}` } })
         if (res.ok) {
           const data = await res.json()
-          setUsdtWithdrawAddress((data.usdt_withdraw_address ?? "").trim())
+          const addr = (data.usdt_withdraw_address ?? "").trim()
+          setUsdtWithdrawAddress(addr)
+          usdtAddressInitialized.current = true
         }
       } catch {
         // ignore
       }
     }
     fetchRef()
-  }, [userId])
+  }, [userId, cachedAddress])
 
   const saveUsdtAddress = async () => {
     const token = await getBackendToken()
@@ -223,6 +282,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
     { id: "api-keys", labelKey: "settings.tabs.apiKeys" },
     { id: "notifications", labelKey: "settings.tabs.notifications" },
     { id: "community", labelKey: "settings.tabs.community" },
+    { id: "token-activity", labelKey: "settings.tabs.tokenActivity" },
   ]
 
   // Calculated token usage (memoized)
@@ -257,7 +317,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
                 <span className="text-base font-semibold text-foreground">
                   {session?.user?.name || session?.user?.email || t("Common.user")}
                 </span>
-                <span className="rounded-full bg-emerald px-2.5 py-0.5 text-[10px] font-semibold text-primary-foreground">
+                <span className="rounded-full bg-primary px-2.5 py-0.5 text-[10px] font-semibold text-primary-foreground">
                   {planTier}
                 </span>
               </div>
@@ -347,6 +407,44 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
             </>
           )}
         </div>
+
+        {/* Token added history */}
+        <div className="mt-4">
+          <span className="text-xs font-medium text-foreground">{t("settings.tokenAddedHistory")}</span>
+          {tokenAddHistoryLoading ? (
+            <p className="text-xs text-muted-foreground mt-1">Loading…</p>
+          ) : tokenAddHistory.length === 0 ? (
+            <p className="text-xs text-muted-foreground mt-1">No token add history yet.</p>
+          ) : (
+            <div className="mt-1 overflow-x-auto max-h-40 border border-border rounded-md">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-border bg-muted/50">
+                    <th className="text-left py-1.5 px-2">Date</th>
+                    <th className="text-left py-1.5 px-2">Amount</th>
+                    <th className="text-left py-1.5 px-2">Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tokenAddHistory.slice(0, 30).map((e, i) => (
+                    <tr key={i} className="border-b border-border/50">
+                      <td className="py-1.5 px-2">
+                        {e.created_at ? (() => {
+                          try {
+                            const d = new Date(e.created_at)
+                            return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
+                          } catch { return e.created_at }
+                          })() : "—"}
+                      </td>
+                      <td className="py-1.5 px-2">{e.amount}</td>
+                      <td className="py-1.5 px-2">{tokenAddReasonLabel(e.reason)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Tabs */}
@@ -381,6 +479,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
         {activeTab === "notifications" && <NotificationsTab dailyEmail={dailyEmail} setDailyEmail={setDailyEmail} />}
         {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} userId={userId} />}
         {activeTab === "community" && <CommunityTab />}
+        {activeTab === "token-activity" && <TokenActivityTab />}
       </div>
     </div>
   )
@@ -419,13 +518,13 @@ function GeneralTab({
               value={usdtWithdrawAddress}
               onChange={(e) => setUsdtWithdrawAddress(e.target.value)}
               placeholder="T... or 0x..."
-              className="mt-1 flex-1 rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground font-mono outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+              className="mt-1 flex-1 rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground font-mono outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
             />
             <button
               type="button"
               onClick={onSaveUsdtAddress}
               disabled={usdtAddressSaving}
-              className="mt-1 rounded-lg bg-emerald px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-emerald/90 disabled:opacity-50"
+              className="mt-1 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {usdtAddressSaving ? "Saving…" : "Save"}
             </button>
@@ -433,14 +532,14 @@ function GeneralTab({
         </div>
         <div>
           <label className="text-sm font-medium text-foreground">Base Currency</label>
-          <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
+          <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50">
             <option>USD</option>
             <option>USDt</option>
           </select>
         </div>
         <div>
           <label className="text-sm font-medium text-foreground">Time Zone</label>
-          <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50">
+          <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50">
             <option>UTC</option>
             <option>EST</option>
             <option>PST</option>
@@ -511,7 +610,7 @@ function NotificationsTab({
 
       {/* Save Button */}
       <div className="flex justify-end">
-        <button className="rounded-lg bg-emerald px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-emerald-dark transition-colors">
+        <button className="rounded-lg bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors">
           Save Notification Settings
         </button>
       </div>
@@ -818,7 +917,7 @@ function ApiKeysTab({
     <div className="flex flex-col gap-6">
       <div>
         <div className="flex items-center gap-2 mb-1">
-          <Link2 className="h-5 w-5 text-emerald" />
+          <Link2 className="h-5 w-5 text-primary" />
           <h3 className="text-lg font-semibold text-foreground">Connect Bitfinex Account</h3>
         </div>
         <p className="text-xs text-muted-foreground">Enter your read-only API keys to start automated lending. Only one key can be stored.</p>
@@ -831,7 +930,7 @@ function ApiKeysTab({
             <span className="text-sm font-semibold text-foreground">Current Configuration</span>
             <div className="flex items-center gap-2">
               {lastTestedAt ? (
-                <span className="rounded-full bg-emerald/20 px-2.5 py-0.5 text-xs font-medium text-emerald">{t("settings.verified")}</span>
+                <span className="rounded-full bg-primary/20 px-2.5 py-0.5 text-xs font-medium text-primary">{t("settings.verified")}</span>
               ) : (
                 <span className="rounded-full bg-amber-500/20 px-2.5 py-0.5 text-xs font-medium text-amber-500">{t("settings.notTested")}</span>
               )}
@@ -839,7 +938,7 @@ function ApiKeysTab({
                 type="button"
                 onClick={handleTestKeys}
                 disabled={testingKeys}
-                className="flex items-center gap-1.5 rounded-lg bg-emerald px-3 py-1.5 text-xs font-semibold text-primary-foreground hover:bg-emerald-dark disabled:opacity-60"
+                className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${testingKeys ? "animate-spin" : ""}`} />
                 {testingKeys ? "Testing…" : t("settings.testApiKeys")}
@@ -891,13 +990,13 @@ function ApiKeysTab({
             <h3 className="text-lg font-semibold text-foreground">{t("settings.apiKeyTestResult")}</h3>
             <p className="mt-2 text-sm text-foreground">{t("settings.keysWorkingCorrectly")}</p>
             <div className="flex justify-center my-6">
-              <CheckCircle className="h-16 w-16 text-emerald" />
+              <CheckCircle className="h-16 w-16 text-primary" />
             </div>
-            <p className="text-sm font-medium text-emerald">{t("settings.connectionSuccessful")}</p>
+            <p className="text-sm font-medium text-primary">{t("settings.connectionSuccessful")}</p>
             <p className="text-xs text-muted-foreground">{t("settings.keysVerifiedReady")}</p>
             {testResult.fundingWallet != null && (
-              <div className="mt-4 rounded-lg border border-emerald/30 bg-emerald/10 p-4 flex items-center gap-2">
-                <CheckCircle className="h-5 w-5 text-emerald shrink-0" />
+              <div className="mt-4 rounded-lg border border-primary/30 bg-primary/10 p-4 flex items-center gap-2">
+                <CheckCircle className="h-5 w-5 text-primary shrink-0" />
                 <span className="text-sm font-medium text-foreground">
                   {t("settings.fundingWalletAvailable", {
                     amount: `$${Number(testResult.fundingWallet).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
@@ -929,17 +1028,17 @@ function ApiKeysTab({
       )}
 
       {/* Security Notice */}
-      <div className="flex items-center justify-between rounded-lg border border-emerald/30 bg-emerald/5 px-4 py-3">
+      <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="flex h-5 w-5 items-center justify-center rounded-full border border-emerald/30">
-            <span className="h-2 w-2 rounded-full bg-emerald"></span>
+          <span className="flex h-5 w-5 items-center justify-center rounded-full border border-primary/30">
+            <span className="h-2 w-2 rounded-full bg-primary"></span>
           </span>
-          <Lock className="h-3.5 w-3.5 text-emerald" />
+          <Lock className="h-3.5 w-3.5 text-primary" />
           <span className="text-xs text-foreground">
             Read-only access {"·"} Your funds stay secure
           </span>
         </div>
-        <a href="#" className="text-xs font-medium text-emerald hover:text-emerald-light transition-colors">
+        <a href="#" className="text-xs font-medium text-primary hover:text-primary transition-colors">
           {"Need help? \u2192"}
         </a>
       </div>
@@ -954,7 +1053,7 @@ function ApiKeysTab({
             value={bfxKey}
             onChange={(e) => setBfxKey(e.target.value)}
             placeholder="Enter your Bitfinex API Key"
-            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
           />
         </div>
         <div>
@@ -965,7 +1064,7 @@ function ApiKeysTab({
               value={bfxSecret}
               onChange={(e) => setBfxSecret(e.target.value)}
               placeholder="Enter your Bitfinex API Secret"
-              className="w-full rounded-lg border border-border bg-secondary px-3 py-2.5 pr-10 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+              className="w-full rounded-lg border border-border bg-secondary px-3 py-2.5 pr-10 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
             />
             <button
               onClick={() => setShowSecret(!showSecret)}
@@ -983,7 +1082,7 @@ function ApiKeysTab({
             value={geminiKey}
             onChange={(e) => setGeminiKey(e.target.value)}
             placeholder="Optional: for AI features"
-            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-emerald/50 focus:ring-1 focus:ring-emerald/50"
+            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
           />
         </div>
       </div>
@@ -1051,13 +1150,13 @@ function ApiKeysTab({
           <ol className="flex flex-col gap-1 text-xs text-muted-foreground">
             <li>{"1. Go to Bitfinex \u2192 Settings \u2192 API"}</li>
             <li>{"2. Enable: "}
-              <span className="text-emerald">Account History</span>, {" "}
-              <span className="text-emerald">Margin Funding</span>, {" "}
-              <span className="text-emerald">Wallets</span>, {" "}
-              <span className="text-emerald">Settings</span>
+              <span className="text-primary">Account History</span>, {" "}
+              <span className="text-primary">Margin Funding</span>, {" "}
+              <span className="text-primary">Wallets</span>, {" "}
+              <span className="text-primary">Settings</span>
             </li>
             <li>{"3. Move funds to "}
-              <span className="text-emerald">Funding wallet</span>
+              <span className="text-primary">Funding wallet</span>
             </li>
           </ol>
         </div>
@@ -1065,7 +1164,7 @@ function ApiKeysTab({
           href="https://www.bitfinex.com"
           target="_blank"
           rel="noopener noreferrer"
-          className="flex items-center gap-2 rounded-lg border border-border bg-secondary px-4 py-2.5 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors"
+          className="flex items-center gap-2 rounded-lg border border-border bg-secondary px-4 py-2.5 text-xs font-medium text-foreground hover:border-primary/50 transition-colors"
         >
           <ExternalLink className="h-3.5 w-3.5" />
           Open Bitfinex
@@ -1077,10 +1176,158 @@ function ApiKeysTab({
         <button
           onClick={handleSave}
           disabled={loading}
-          className="rounded-lg bg-emerald px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-emerald-dark disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+          className="rounded-lg bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
         >
           {loading ? "Saving…" : "Save API Keys"}
         </button>
+      </div>
+    </div>
+  )
+}
+
+/* ===================== TOKEN ACTIVITY TAB ===================== */
+type DeductionHistoryEntry = {
+  gross_profit: number
+  tokens_deducted: number
+  tokens_remaining_after: number | null
+  total_used_tokens: number | null
+  timestamp: string
+  account_switch_note: string | null
+}
+
+function TokenActivityTab() {
+  const t = useT()
+  const [addLog, setAddLog] = useState<TokenAddHistoryEntry[]>([])
+  const [deductionLog, setDeductionLog] = useState<DeductionHistoryEntry[]>([])
+  const [addLoading, setAddLoading] = useState(true)
+  const [deductionLoading, setDeductionLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      const token = await getBackendToken()
+      if (!token || cancelled) return
+      setAddLoading(true)
+      setDeductionLoading(true)
+      try {
+        const [addRes, dedRes] = await Promise.all([
+          fetch(`${API_BASE}/api/v1/users/me/token-add-history?limit=200`, {
+            credentials: "include",
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          fetch(`${API_BASE}/api/v1/users/me/deduction-history?limit=200`, {
+            credentials: "include",
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+        ])
+        if (cancelled) return
+        if (addRes.ok) {
+          const data = await addRes.json()
+          setAddLog(Array.isArray(data) ? data : [])
+        } else {
+          setAddLog([])
+        }
+        if (dedRes.ok) {
+          const data = await dedRes.json()
+          setDeductionLog(Array.isArray(data) ? data : [])
+        } else {
+          setDeductionLog([])
+        }
+      } finally {
+        if (!cancelled) {
+          setAddLoading(false)
+          setDeductionLoading(false)
+        }
+      }
+    }
+    run()
+    return () => { cancelled = true }
+  }, [])
+
+  const formatDate = (iso: string) => {
+    try {
+      const d = new Date(iso)
+      return d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
+    } catch {
+      return iso
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-8">
+      <div>
+        <h3 className="text-lg font-semibold text-foreground">{t("settings.tokenActivityTitle")}</h3>
+        <p className="text-xs text-muted-foreground mt-1">All token additions and deductions for your account (newest first).</p>
+      </div>
+
+      {/* Token add log */}
+      <div>
+        <h4 className="text-sm font-semibold text-foreground mb-2 flex items-center gap-2">
+          <BarChart3 className="h-4 w-4 text-muted-foreground" />
+          {t("settings.tokenAddLog")}
+        </h4>
+        {addLoading ? (
+          <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : addLog.length === 0 ? (
+          <p className="text-xs text-muted-foreground">{t("settings.noTokenAddHistory")}</p>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-border max-h-64">
+            <table className="w-full text-xs">
+              <thead className="bg-muted/50 sticky top-0">
+                <tr className="border-b border-border">
+                  <th className="text-left py-2 px-3 font-medium">Date</th>
+                  <th className="text-left py-2 px-3 font-medium">Amount</th>
+                  <th className="text-left py-2 px-3 font-medium">Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {addLog.map((e, i) => (
+                  <tr key={i} className="border-b border-border/50 hover:bg-muted/30">
+                    <td className="py-2 px-3">{formatDate(e.created_at)}</td>
+                    <td className="py-2 px-3 font-medium">+{Number(e.amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                    <td className="py-2 px-3">{tokenAddReasonLabel(e.reason)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Token deduction log */}
+      <div>
+        <h4 className="text-sm font-semibold text-foreground mb-2 flex items-center gap-2">
+          <TrendingDown className="h-4 w-4 text-muted-foreground" />
+          {t("settings.tokenDeductionLog")}
+        </h4>
+        {deductionLoading ? (
+          <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : deductionLog.length === 0 ? (
+          <p className="text-xs text-muted-foreground">{t("settings.noDeductionHistory")}</p>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-border max-h-64">
+            <table className="w-full text-xs">
+              <thead className="bg-muted/50 sticky top-0">
+                <tr className="border-b border-border">
+                  <th className="text-left py-2 px-3 font-medium">Date</th>
+                  <th className="text-left py-2 px-3 font-medium">Gross profit (USD)</th>
+                  <th className="text-left py-2 px-3 font-medium">Tokens deducted</th>
+                  <th className="text-left py-2 px-3 font-medium">Balance after</th>
+                </tr>
+              </thead>
+              <tbody>
+                {deductionLog.map((e, i) => (
+                  <tr key={i} className="border-b border-border/50 hover:bg-muted/30">
+                    <td className="py-2 px-3">{formatDate(e.timestamp)}</td>
+                    <td className="py-2 px-3">{Number(e.gross_profit).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                    <td className="py-2 px-3 font-medium text-destructive">−{Number(e.tokens_deducted).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                    <td className="py-2 px-3">{e.tokens_remaining_after != null ? Number(e.tokens_remaining_after).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -1092,10 +1339,10 @@ function CommunityTab() {
     <div className="flex flex-col gap-6">
       <div>
         <div className="flex items-center gap-2 mb-1">
-          <MessageSquare className="h-5 w-5 text-emerald" />
+          <MessageSquare className="h-5 w-5 text-primary" />
           <h3 className="text-lg font-semibold text-foreground">{"Community & Support"}</h3>
         </div>
-        <p className="text-xs text-muted-foreground">Connect with other uTrader.io users and get real-time support</p>
+        <p className="text-xs text-muted-foreground">Connect with other bifinexbot.com users and get real-time support</p>
       </div>
 
       {/* Telegram */}
@@ -1107,10 +1354,10 @@ function CommunityTab() {
           <h4 className="text-base font-semibold text-foreground">Join Our Telegram Community</h4>
         </div>
         <ul className="flex flex-col gap-2 text-sm text-muted-foreground mb-4">
-          <li><span className="text-emerald font-medium">Get instant support</span> from our team and experienced users</li>
+          <li><span className="text-primary font-medium">Get instant support</span> from our team and experienced users</li>
           <li><span className="text-chart-3 font-medium">Share strategies</span> and learn from successful lenders</li>
           <li><span className="text-chart-2 font-medium">Receive updates</span> about new features and market insights</li>
-          <li><span className="text-destructive font-medium">Connect with the community</span> with uTrader.io users</li>
+          <li><span className="text-destructive font-medium">Connect with the community</span> with bifinexbot.com users</li>
         </ul>
         <button className="flex items-center gap-2 rounded-lg bg-[#229ED9] px-4 py-2.5 text-sm font-semibold text-foreground hover:bg-[#229ED9]/80 transition-colors">
           <Send className="h-4 w-4" />
@@ -1127,7 +1374,7 @@ function CommunityTab() {
             <h4 className="text-sm font-semibold text-foreground">Learning Hub</h4>
           </div>
           <p className="text-xs text-muted-foreground mb-4">Comprehensive guides and tutorials for crypto lending success</p>
-          <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors">
+          <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-primary/50 transition-colors">
             Explore Guides
           </button>
         </div>
@@ -1139,7 +1386,7 @@ function CommunityTab() {
             <h4 className="text-sm font-semibold text-foreground">Security Center</h4>
           </div>
           <p className="text-xs text-muted-foreground mb-4">Learn about our security measures and best practices</p>
-          <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors">
+          <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-primary/50 transition-colors">
             Security Guide
           </button>
         </div>
@@ -1154,7 +1401,7 @@ function CommunityTab() {
           <h4 className="text-sm font-semibold text-foreground">Follow us on X</h4>
         </div>
         <p className="text-xs text-muted-foreground mb-4">Follow us for the latest news, updates, and market analysis.</p>
-        <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-emerald/50 transition-colors">
+        <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-primary/50 transition-colors">
           Follow on X
         </button>
       </div>
@@ -1181,7 +1428,7 @@ function ToggleSwitch({
         disabled
           ? "bg-secondary cursor-not-allowed opacity-50"
           : checked
-          ? "bg-emerald"
+          ? "bg-primary"
           : "bg-secondary"
       }`}
     >

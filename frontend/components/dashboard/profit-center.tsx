@@ -1,18 +1,17 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import {
   DollarSign,
-  TrendingUp,
-  BarChart3,
   Clock,
   RefreshCw,
+  Wallet,
 } from "lucide-react"
 import { Spinner } from "@/components/ui/spinner"
-import { useDateRange } from "@/lib/date-range-context"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
+import { useLendingStats, useUserStatus, type LendingStatsTrade } from "@/lib/dashboard-data-context"
 import {
   AreaChart,
   Area,
@@ -26,8 +25,14 @@ import {
 } from "recharts"
 
 const API_BACKEND = "/api-backend"
+const REFRESH_COOLDOWN_SEC = 15
 
 type TradeForChart = { mts_create: number; amount: number; interest_usd: number }
+const tradeToChart = (t: LendingStatsTrade): TradeForChart => ({
+  mts_create: t.mts_create,
+  amount: t.amount,
+  interest_usd: t.interest_usd,
+})
 
 /** Chart range from 7d/30d/90d relative to today (so trades are not filtered out by wrong year). */
 function chartRangeFromTimeRange(timeRange: string): { start: Date; end: Date } {
@@ -83,167 +88,107 @@ type ProfitCenterProps = { onUpgradeClick?: () => void }
 export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const t = useT()
   const userId = useCurrentUserId()
-  const { range } = useDateRange()
+  const id = userId ?? 0
+  const lendingStats = useLendingStats(id)
+  const userStatus = useUserStatus(id)
   const [timeRange, setTimeRange] = useState("30d")
-  const [grossProfit, setGrossProfit] = useState<number | null>(null)
-  const [netProfit, setNetProfit] = useState<number | null>(null)
-  const [chartHistory, setChartHistory] = useState<{ date: string; volume: number; interest: number }[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null)
-  const [lendingDataSource, setLendingDataSource] = useState<"live" | "cache" | null>(null)
-  const [lendingRateLimited, setLendingRateLimited] = useState(false)
-  const [tradesCount, setTradesCount] = useState<number | null>(null)
-  const [fundingTrades, setFundingTrades] = useState<Array<{ id: number; currency: string; mts_create: number; amount: number; rate: number; period: number; interest_usd: number }>>([])
-  const [refreshing, setRefreshing] = useState(false)
-  const [calculationBreakdown, setCalculationBreakdown] = useState<{
-    trades_count: number
-    per_currency: Array<{ currency: string; interest_ccy: number; ticker_price_usd: number; interest_usd: number }>
-    total_gross_usd: number
-    formula_note?: string
-  } | null>(null)
   const [showBreakdown, setShowBreakdown] = useState(false)
+  const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
+  const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
+  const [refreshing, setRefreshing] = useState(false)
+  const [tokenBalance, setTokenBalance] = useState<{
+    tokens_remaining: number
+    total_tokens_added: number
+    total_tokens_deducted: number
+  } | null>(null)
+  const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
+
+  const data = lendingStats.data
+  const loading = lendingStats.loading && !data
+  const error = lendingStats.error
+  const grossProfit = data?.gross_profit ?? null
+  const netProfit = data?.net_profit ?? null
+  const tokensRemaining = tokenBalance?.tokens_remaining ?? userStatus.data?.tokens_remaining ?? null
+  const planTierRaw = userStatus.data?.plan_tier ?? "trial"
+  const planTier = (typeof planTierRaw === "string" ? planTierRaw : "trial").trim().toLowerCase().replace(/\s+/g, "_")
+  const tier = planTier === "ai ultra" ? "ai_ultra" : planTier
+  const isWhales = tier === "whales" || tier === "whales_ai"
+  const upgradeLabelKey =
+    isWhales ? null
+    : tier === "ai_ultra" ? "dashboard.upgradeToWhalesAi"
+    : tier === "pro" ? "dashboard.upgradeToAiUltra"
+    : "dashboard.upgradeToPro"
+  const lendingDataSource = lendingStats.source
+  const lendingRateLimited = lendingStats.rateLimited
+  const tradesCount = data?.total_trades_count ?? null
+  const fundingTrades = useMemo(() => data?.trades ?? [], [data?.trades])
+  const calculationBreakdown = data?.calculation_breakdown ?? null
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((refreshCooldownUntil - Date.now()) / 1000))
+      setRefreshCooldownSec(remaining)
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [refreshCooldownUntil])
 
   useEffect(() => {
     if (userId == null) {
-      setGrossProfit(null)
-      setNetProfit(null)
-      setChartHistory([])
-      setTokensRemaining(null)
-      setLendingDataSource(null)
-      setLendingRateLimited(false)
-      setTradesCount(null)
-      setFundingTrades([])
-      setCalculationBreakdown(null)
-      setLoading(false)
+      setTokenBalance(null)
+      setTokenBalanceLoading(false)
       return
     }
-    const fetchStats = async () => {
+    let cancelled = false
+    const run = async () => {
+      setTokenBalanceLoading(true)
       try {
-        setLoading(true)
-        setError(null)
         const token = await getBackendToken()
-        const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-
-        // Gross Profit and Net Profit: single direct backend source (server is source of truth)
-        const lendingRes = await fetch(`${API_BACKEND}/stats/${userId}/lending`, { credentials: "include", headers })
-        const src = lendingRes.headers.get("X-Data-Source")
-        setLendingDataSource(src === "cache" ? "cache" : "live")
-        setLendingRateLimited(lendingRes.headers.get("X-Rate-Limited") === "true")
-        if (lendingRes.ok) {
-          try {
-            let lendingData: { gross_profit?: number; db_snapshot_gross?: number; net_profit?: number; trades?: unknown[]; total_trades_count?: number; calculation_breakdown?: unknown } | null = await lendingRes.json()
-            // If normal response has zero gross profit, try persisted DB snapshot (works even when cache/API returned 0)
-            if (typeof lendingData?.gross_profit === "number" && lendingData.gross_profit === 0) {
-              const dbRes = await fetch(`${API_BACKEND}/stats/${userId}/lending?source=db`, { credentials: "include", headers })
-              const dbData = dbRes.ok ? await dbRes.json() : null
-              if (dbRes.ok && typeof dbData?.gross_profit === "number" && dbData.gross_profit > 0) {
-                lendingData = dbData
-                setLendingDataSource("db")
-              }
-            }
-            // Use db_snapshot_gross when API returned 0 but sent snapshot (e.g. cache body had 0, backend merged db_snapshot_gross)
-            let gross =
-              typeof lendingData?.gross_profit === "number" && lendingData.gross_profit > 0
-                ? lendingData.gross_profit
-                : typeof lendingData?.db_snapshot_gross === "number" && (lendingData?.db_snapshot_gross ?? 0) > 0
-                  ? (lendingData?.db_snapshot_gross ?? 0)
-                  : 0
-            let net =
-              typeof lendingData?.net_profit === "number" && (lendingData?.net_profit ?? 0) > 0
-                ? (lendingData?.net_profit ?? 0)
-                : gross > 0
-                  ? Math.round(gross * (1 - 0.15) * 100) / 100
-                  : 0
-            setGrossProfit(gross)
-            setNetProfit(net)
-            const trades = Array.isArray(lendingData?.trades) ? lendingData.trades : []
-            setCalculationBreakdown(lendingData?.calculation_breakdown ?? null)
-            let tradesForChart = trades as TradeForChart[]
-            // When lending returns no trades but we have gross profit, fetch trades once for chart (cache/db path omits trades)
-            if (tradesForChart.length === 0 && gross > 0) {
-              try {
-                const ftRes = await fetch(`${API_BACKEND}/api/funding-trades`, { credentials: "include", headers })
-                if (ftRes.ok) {
-                  const ftData = await ftRes.json()
-                  tradesForChart = Array.isArray(ftData?.trades) ? (ftData.trades as TradeForChart[]) : []
-                }
-              } catch {
-                // keep trades empty
-              }
-            }
-            setFundingTrades(tradesForChart)
-            setTradesCount(
-              typeof lendingData?.total_trades_count === "number"
-                ? lendingData.total_trades_count
-                : tradesForChart.length
-            )
-            if (tradesForChart.length === 0) setChartHistory([])
-            // else: chart derived in useEffect below when fundingTrades/timeRange change
-          } catch (err) {
-            setGrossProfit(0)
-            setNetProfit(0)
-            setFundingTrades([])
-            setTradesCount(null)
-            setCalculationBreakdown(null)
-            setChartHistory([])
+        if (!token || cancelled) return
+        const res = await fetch(`${API_BACKEND}/api/v1/users/me/token-balance`, {
+          credentials: "include",
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (cancelled) return
+        if (res.ok) {
+          const data = await res.json()
+          if (!cancelled) {
+            setTokenBalance({
+              tokens_remaining: Number(data.tokens_remaining) ?? 0,
+              total_tokens_added: Number(data.total_tokens_added) ?? 0,
+              total_tokens_deducted: Number(data.total_tokens_deducted) ?? 0,
+            })
           }
         } else {
-          setGrossProfit(0)
-          setNetProfit(0)
-          setFundingTrades([])
-          setTradesCount(null)
-          setCalculationBreakdown(null)
-          setChartHistory([])
+          if (!cancelled) setTokenBalance(null)
         }
-
-        const statusRes = await fetch(`${API_BACKEND}/user-status/${userId}`, { credentials: "include", headers })
-        if (statusRes.ok) {
-          const statusData = await statusRes.json()
-          const tr = statusData.tokens_remaining
-          setTokensRemaining(typeof tr === "number" ? tr : null)
-        }
-      } catch (e) {
-        const isNetworkError =
-          (e instanceof TypeError && (e as Error).message === "Failed to fetch") ||
-          (e instanceof Error && (e.message === "Failed to fetch" || e.message.includes("NetworkError")))
-        setError(isNetworkError ? t("dashboard.apiUnreachable") : t("dashboard.unableToLoadProfit"))
-        if (!isNetworkError) console.error("Failed to fetch stats", e)
-        setChartHistory([])
+      } catch {
+        if (!cancelled) setTokenBalance(null)
       } finally {
-        setLoading(false)
+        if (!cancelled) setTokenBalanceLoading(false)
       }
     }
+    run()
+    return () => { cancelled = true }
+  }, [userId])
 
-    fetchStats()
-  }, [userId, range.start, range.end, timeRange, t])
-
-  // Re-derive chart when user changes 7d/30d/90d (no refetch)
-  useEffect(() => {
-    if (userId == null || fundingTrades.length === 0) return
+  // Derive chart from trades (useMemo avoids setState-in-useEffect loop when fundingTrades ref changes)
+  const chartHistory = useMemo(() => {
+    if (userId == null || fundingTrades.length === 0) return []
     const { start, end } = chartRangeFromTimeRange(timeRange)
-    setChartHistory(deriveChartHistoryFromTrades(fundingTrades as TradeForChart[], start, end))
+    const tradesForChart = fundingTrades.map(tradeToChart)
+    return deriveChartHistoryFromTrades(tradesForChart, start, end)
   }, [timeRange, userId, fundingTrades])
 
-  const refreshFromServer = async () => {
+  const handleRefresh = async () => {
     if (userId == null) return
+    if (Date.now() < refreshCooldownUntil) return
+    setRefreshCooldownUntil(Date.now() + REFRESH_COOLDOWN_SEC * 1000)
     setRefreshing(true)
     try {
       const token = await getBackendToken()
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
       const res = await fetch(`${API_BACKEND}/api/refresh-lending-stats`, { method: "POST", credentials: "include", headers })
-      if (res.ok) {
-        const data = await res.json()
-        setGrossProfit(typeof data.gross_profit === "number" ? data.gross_profit : 0)
-        setNetProfit(typeof data.net_profit === "number" ? data.net_profit : 0)
-        const trades = Array.isArray(data.trades) ? data.trades : []
-        setFundingTrades(trades)
-        setTradesCount(typeof data.total_trades_count === "number" ? data.total_trades_count : trades.length)
-        setCalculationBreakdown(data.calculation_breakdown ?? null)
-        setLendingDataSource("live")
-        const { start, end } = chartRangeFromTimeRange(timeRange)
-        setChartHistory(deriveChartHistoryFromTrades(trades as TradeForChart[], start, end))
-      }
+      if (res.ok) await lendingStats.refetch()
     } finally {
       setRefreshing(false)
     }
@@ -275,12 +220,12 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         </div>
         <button
           type="button"
-          onClick={refreshFromServer}
-          disabled={refreshing || loading}
+          onClick={handleRefresh}
+          disabled={refreshing || loading || refreshCooldownSec > 0}
           className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground hover:bg-secondary disabled:opacity-50"
         >
           <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-          {refreshing ? "Refreshing…" : "Refresh Gross Profit"}
+          {refreshing ? "Refreshing…" : refreshCooldownSec > 0 ? `${t("liveStatus.refreshIn", { n: refreshCooldownSec })}` : "Refresh Gross Profit"}
         </button>
       </div>
 
@@ -290,28 +235,67 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         </div>
       )}
 
-      {/* Token credit – upfront so user sees balance before profit detail */}
-      <div className="rounded-xl border border-emerald/20 bg-card p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald/10">
-              <Clock className="h-5 w-5 text-emerald" />
-            </div>
-            <div>
-              <p className="text-sm font-semibold text-foreground">Token credit</p>
-              <p className="text-xs text-muted-foreground">0.1 USD gross profit = 1 token used</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-sm font-bold text-emerald">
-              {tokensRemaining !== null ? `${Math.round(tokensRemaining)} tokens remaining` : "—"}
+      {/* Token credit – allocation breakdown like LiveStatus (total added, remaining vs used) */}
+      <div className="rounded-xl border border-primary/20 bg-card p-5">
+        <div className="flex items-center gap-2 mb-1">
+          <Wallet className="h-5 w-5 text-primary" />
+          <h3 className="text-sm font-semibold text-foreground">{t("dashboard.tokenCredit")}</h3>
+        </div>
+        <p className="text-xs text-muted-foreground mb-4">{t("dashboard.tokenUsageRule")}</p>
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          {tokenBalanceLoading && !tokenBalance ? (
+            <span className="text-xl font-bold text-primary">…</span>
+          ) : (
+            <span className="text-xl font-bold text-primary">
+              {tokenBalance != null
+                ? `${Math.round(tokenBalance.total_tokens_added).toLocaleString()} ${t("dashboard.totalTokensAdded")}`
+                : "—"}
             </span>
+          )}
+          {onUpgradeClick && upgradeLabelKey && (
             <button
-              onClick={() => onUpgradeClick?.()}
-              className="rounded-lg bg-emerald px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+              onClick={() => onUpgradeClick()}
+              className="rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
             >
-              {t("dashboard.upgradeToPro")}
+              {t(upgradeLabelKey)}
             </button>
+          )}
+        </div>
+        <div className="mb-4">
+          <div className="flex justify-between text-xs text-muted-foreground mb-1.5">
+            <span>{t("dashboard.tokenBreakdown")}</span>
+          </div>
+          <div className="h-3 w-full rounded-full bg-secondary overflow-hidden flex">
+            <div
+              className="h-full bg-primary transition-all"
+              style={{
+                width: `${(() => {
+                  const total = tokenBalance?.total_tokens_added ?? 0
+                  const rem = tokenBalance?.tokens_remaining ?? tokensRemaining ?? 0
+                  return total > 0 ? Math.min(100, (100 * rem) / total) : 0
+                })()}%`,
+              }}
+            />
+            <div
+              className="h-full bg-amber-500/80 transition-all"
+              style={{
+                width: `${(() => {
+                  const total = tokenBalance?.total_tokens_added ?? 0
+                  const used = tokenBalance?.total_tokens_deducted ?? 0
+                  return total > 0 ? Math.min(100, (100 * used) / total) : 0
+                })()}%`,
+              }}
+            />
+          </div>
+          <div className="flex gap-4 mt-1.5 text-xs">
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-4 rounded-full bg-primary" />
+              {t("dashboard.tokensRemaining")}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-4 rounded-full bg-amber-500/80" />
+              {t("dashboard.tokensUsed")}
+            </span>
           </div>
         </div>
       </div>
@@ -324,7 +308,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
             <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
               Gross Profit
             </span>
-            <DollarSign className="h-4 w-4 text-emerald" />
+            <DollarSign className="h-4 w-4 text-primary" />
           </div>
           <div className="mt-3 flex items-baseline gap-2">
             {loading && grossProfit === null ? (
@@ -355,7 +339,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
               <button
                 type="button"
                 onClick={() => setShowBreakdown(!showBreakdown)}
-                className="text-xs font-medium text-emerald hover:underline"
+                className="text-xs font-medium text-primary hover:underline"
               >
                 {showBreakdown ? "Hide" : "Show"} calculation breakdown
               </button>
@@ -377,7 +361,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
                           <td className="py-1 font-medium">{row.currency}</td>
                           <td className="py-1 text-right font-mono">{row.interest_ccy.toFixed(6)}</td>
                           <td className="py-1 text-right font-mono">{row.ticker_price_usd.toFixed(4)}</td>
-                          <td className="py-1 text-right font-mono text-emerald">${row.interest_usd.toFixed(4)}</td>
+                          <td className="py-1 text-right font-mono text-primary">${row.interest_usd.toFixed(4)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -550,7 +534,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
                     <td className="px-5 py-2.5 text-right font-mono">{t.amount.toFixed(4)}</td>
                     <td className="px-5 py-2.5 text-right font-mono">{(t.rate * 100).toFixed(2)}%</td>
                     <td className="px-5 py-2.5 text-right font-mono">{t.period}</td>
-                    <td className="px-5 py-2.5 text-right font-mono text-emerald">${t.interest_usd.toFixed(4)}</td>
+                    <td className="px-5 py-2.5 text-right font-mono text-primary">${t.interest_usd.toFixed(4)}</td>
                   </tr>
                 ))}
               </tbody>

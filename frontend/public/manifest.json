@@ -1,0 +1,13 @@
+{
+  "name": "bifinexbot.com - Crypto Lending",
+  "short_name": "bifinexbot",
+  "description": "Professional automated crypto lending platform.",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#10b981",
+  "background_color": "#0f172a",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

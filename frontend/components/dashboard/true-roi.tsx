@@ -5,6 +5,7 @@ import {
   DollarSign,
   Activity,
   ArrowUpRight,
+  CreditCard,
 } from "lucide-react"
 import { useDateRange } from "@/lib/date-range-context"
 import { useT } from "@/lib/i18n"
@@ -40,8 +41,41 @@ const navHistory = [
   { date: "Feb 25", nav: 1.0005, capital: 0 },
 ]
 
-export function TrueROI() {
+type TrueROIProps = {
+  planTier?: string
+  onUpgradeClick?: () => void
+}
+
+export function TrueROI({ planTier = "trial", onUpgradeClick }: TrueROIProps) {
   const t = useT()
+  const tier = (planTier ?? "trial").toString().trim().toLowerCase().replace(/\s+/g, "_")
+  const isWhales = tier === "whales" || tier === "whales_ai"
+
+  if (!isWhales) {
+    return (
+      <div className="flex flex-col gap-6">
+        <div>
+          <h1 className="text-2xl font-bold text-foreground">{t("dashboard.trueRoiTitle")}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">{t("dashboard.trueRoiDesc")}</p>
+        </div>
+        <div className="flex flex-col items-center justify-center rounded-xl border border-border bg-card py-16 px-6 text-center">
+          <TrendingUp className="h-12 w-12 text-muted-foreground/50 mb-4" />
+          <p className="text-sm text-muted-foreground max-w-md">{t("dashboard.trueRoiWhalesOnly")}</p>
+          {onUpgradeClick && (
+            <button
+              type="button"
+              onClick={onUpgradeClick}
+              className="mt-6 inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+            >
+              <CreditCard className="h-4 w-4" />
+              {t("sidebar.subscription")}
+            </button>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   const { range } = useDateRange()
   const year = range.start.getFullYear()
   const filteredNavHistory = navHistory.filter((d) => {

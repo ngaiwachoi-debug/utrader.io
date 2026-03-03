@@ -21,6 +21,7 @@ type Overview = {
   api_key_status?: Record<string, unknown>
   withdrawals: Record<string, unknown>[]
   deduction_history: Record<string, unknown>[]
+  token_add_history?: { amount: number; reason: string; created_at: string }[]
   audit_entries: Record<string, unknown>[]
   edits_locked?: boolean
 }
@@ -83,7 +84,7 @@ export default function AdminUserDetailPage() {
   if (error || (!loading && !overview)) {
     return (
       <div className="min-h-screen p-4">
-        <Link href="/admin" className="text-sm text-emerald hover:underline flex items-center gap-1 mb-4"><ArrowLeft className="h-4 w-4" /> Back to Admin</Link>
+        <Link href="/admin" className="text-sm text-chart-1 hover:underline flex items-center gap-1 mb-4"><ArrowLeft className="h-4 w-4" /> Back to Admin</Link>
         <p className="text-destructive">{error || "User not found."}</p>
       </div>
     )
@@ -103,7 +104,7 @@ export default function AdminUserDetailPage() {
 
   return (
     <div className="min-h-screen bg-background p-4">
-      <Link href="/admin" className="text-sm text-emerald hover:underline flex items-center gap-1 mb-4">
+      <Link href="/admin" className="text-sm text-chart-1 hover:underline flex items-center gap-1 mb-4">
         <ArrowLeft className="h-4 w-4" /> Back to Admin
       </Link>
 
@@ -128,7 +129,7 @@ export default function AdminUserDetailPage() {
             <p>Created: {u.created_at ? new Date(String(u.created_at)).toLocaleString() : "—"}</p>
             <p>Referral code: {String(u.referral_code ?? "—")} · Referred by: {u.referred_by != null ? String(u.referred_by) : "—"}</p>
             {profileMessage && (
-              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${profileMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{profileMessage.text}</p>
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${profileMessage.type === "success" ? "text-chart-1" : "text-destructive"}`}>{profileMessage.text}</p>
             )}
             <div className="flex flex-col gap-3 mt-2">
               <div className="flex flex-wrap items-center gap-2">
@@ -177,8 +178,33 @@ export default function AdminUserDetailPage() {
             ) : (
               <p>No balance row.</p>
             )}
+            {((overview.token_add_history) ?? []).length > 0 && (
+              <div className="mt-3">
+                <p className="text-xs font-medium text-muted-foreground mb-1">Token add history (recent)</p>
+                <div className="overflow-x-auto max-h-48 border border-border rounded-md">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-border bg-muted/50">
+                        <th className="text-left py-1.5 px-2">Time</th>
+                        <th className="text-left py-1.5 px-2">Amount</th>
+                        <th className="text-left py-1.5 px-2">Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(overview.token_add_history ?? []).slice(0, 20).map((e, i) => (
+                        <tr key={i} className="border-b border-border/50">
+                          <td className="py-1.5 px-2">{e.created_at}</td>
+                          <td className="py-1.5 px-2">{e.amount}</td>
+                          <td className="py-1.5 px-2">{e.reason}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
             {tokenMessage && (
-              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${tokenMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{tokenMessage.text}</p>
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${tokenMessage.type === "success" ? "text-chart-1" : "text-destructive"}`}>{tokenMessage.text}</p>
             )}
             <div className="flex flex-wrap gap-4 mt-3">
               <div className="flex items-center gap-2">
@@ -293,7 +319,7 @@ export default function AdminUserDetailPage() {
               <p>No USDT credit row.</p>
             )}
             {usdtMessage && (
-              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${usdtMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{usdtMessage.text}</p>
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${usdtMessage.type === "success" ? "text-chart-1" : "text-destructive"}`}>{usdtMessage.text}</p>
             )}
             <div className="flex gap-2 mt-2">
               <Input type="number" placeholder="+ or - amount" className="w-28" value={adjustUsdt} onChange={(e) => { setAdjustUsdt(e.target.value); setUsdtMessage(null) }} disabled={editsDisabled} />
@@ -316,7 +342,7 @@ export default function AdminUserDetailPage() {
           <CardContent className="text-sm">
             {(overview.api_key_status && overview.api_key_status.has_keys === true) ? "Keys set" : "No keys"}
             {apiKeyMessage && (
-              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${apiKeyMessage.type === "success" ? "text-emerald" : "text-destructive"}`}>{apiKeyMessage.text}</p>
+              <p className={`mt-2 text-xs break-words whitespace-pre-wrap max-w-2xl ${apiKeyMessage.type === "success" ? "text-chart-1" : "text-destructive"}`}>{apiKeyMessage.text}</p>
             )}
             {Boolean(overview.api_key_status?.has_keys) && (
               <Button size="sm" variant="destructive" className="ml-2 mt-1" type="button" disabled={editsDisabled || !token} onClick={async () => {

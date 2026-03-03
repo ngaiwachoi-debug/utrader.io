@@ -27,6 +27,10 @@ def _tokens_remaining_for_user(db, user_id: int) -> float:
     return 0.0
 
 
+# Terminal logs: keep last N lines per user, key expires after TTL (cost-effective for many users)
+TERMINAL_MAX_LINES = 100
+TERMINAL_KEY_TTL_SEC = 3600  # 1 hour
+
 async def _term(redis, user_id: int, msg: str) -> None:
     """Push one timestamped line to terminal_logs for the user (so Terminal tab shows it)."""
     if not redis:
@@ -35,7 +39,8 @@ async def _term(redis, user_id: int, msg: str) -> None:
     try:
         key = f"terminal_logs:{user_id}"
         await redis.rpush(key, line)
-        await redis.ltrim(key, -300, -1)
+        await redis.ltrim(key, -TERMINAL_MAX_LINES, -1)
+        await redis.expire(key, TERMINAL_KEY_TTL_SEC)
     except Exception:
         pass
 
@@ -132,7 +137,8 @@ async def run_bot_task(ctx, user_id: int):
                 key = f"terminal_logs:{user_id}"
                 for line in log_lines:
                     await redis.rpush(key, line)
-                await redis.ltrim(key, -300, -1)
+                await redis.ltrim(key, -TERMINAL_MAX_LINES, -1)
+                await redis.expire(key, TERMINAL_KEY_TTL_SEC)
             del log_lines[:]
 
         # Launch portfolio engines in the background

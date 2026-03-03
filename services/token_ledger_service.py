@@ -1,9 +1,32 @@
 """
-Balance-only token service. Single source of truth: user_token_balance.tokens_remaining.
-No ledger table; all reads/writes use tokens_remaining and purchased_tokens.
+Token service: user_token_balance is source of truth; token_ledger logs every add for history.
 """
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+
+try:
+    import models
+    _has_token_ledger = hasattr(models, "TokenLedger")
+except Exception:
+    _has_token_ledger = False
+
+
+def _token_ledger_table_exists(db: Session) -> bool:
+    """Return True if token_ledger table exists. Uses information_schema to avoid failing the transaction."""
+    global _has_token_ledger
+    if not _has_token_ledger:
+        return False
+    try:
+        r = db.execute(
+            text("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'token_ledger'")
+        ).fetchone()
+        if not r:
+            _has_token_ledger = False
+            return False
+        return True
+    except Exception:
+        _has_token_ledger = False
+        return False
 
 PURCHASED_REASONS = frozenset({
     "deposit_usd", "subscription_monthly", "subscription_yearly",
@@ -52,6 +75,15 @@ def add_tokens(
             {"uid": user_id, "amt": amount, "purchased": purchased_delta},
         )
         db.flush()
+        if _has_token_ledger and _token_ledger_table_exists(db):
+            db.add(models.TokenLedger(
+                    user_id=user_id,
+                    activity_type="add",
+                    amount=amount,
+                    reason=reason,
+                    extra=None,
+                ))
+            db.flush()
         return get_tokens_remaining(db, user_id)
     except Exception:
         try:
@@ -66,6 +98,15 @@ def add_tokens(
                 {"uid": user_id, "amt": amount, "purchased": purchased_delta},
             )
             db.flush()
+            if _has_token_ledger and _token_ledger_table_exists(db):
+                db.add(models.TokenLedger(
+                    user_id=user_id,
+                    activity_type="add",
+                    amount=amount,
+                    reason=reason,
+                    extra=None,
+                ))
+                db.flush()
         except Exception:
             pass
         return get_tokens_remaining(db, user_id)

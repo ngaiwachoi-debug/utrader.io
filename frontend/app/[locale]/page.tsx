@@ -52,7 +52,7 @@ export default function LandingPage() {
       <header className="sticky top-0 z-50 border-b border-border bg-card/80 backdrop-blur-md">
         <div className="flex h-14 items-center justify-between px-4 lg:px-6">
           <Link href="/" className="text-sm font-semibold text-foreground">
-            uTrader<span className="text-emerald">.io</span>
+            bifinexbot<span className="text-primary">.com</span>
           </Link>
           <div className="flex items-center gap-3">
             <Link
@@ -69,7 +69,7 @@ export default function LandingPage() {
             </Link>
             <Link
               href="/login"
-              className="rounded-lg bg-emerald px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-emerald/90 transition-colors"
+              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
             >
               {t("landing.startFreeTrial")}
             </Link>
@@ -79,13 +79,13 @@ export default function LandingPage() {
 
       {/* Hero */}
       <section className="px-4 lg:px-6 py-16 lg:py-24 text-center">
-        <p className="text-sm font-medium uppercase tracking-wider text-emerald mb-4">
+        <p className="text-sm font-medium uppercase tracking-wider text-primary mb-4">
           {t("landing.heroBadge")}
         </p>
         <h1 className="text-4xl lg:text-5xl font-bold text-foreground mb-4 max-w-3xl mx-auto">
           {t("landing.heroTitle")}
         </h1>
-        <p className="text-2xl lg:text-3xl font-semibold text-emerald mb-6">
+        <p className="text-2xl lg:text-3xl font-semibold text-primary mb-6">
           {t("landing.heroSubtitle")}
         </p>
         <p className="text-muted-foreground max-w-2xl mx-auto mb-10">
@@ -95,7 +95,7 @@ export default function LandingPage() {
           <button
             type="button"
             onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
-            className="inline-flex items-center gap-2 rounded-lg bg-[#10b981] px-6 py-3 text-base font-semibold text-white hover:bg-emerald/90 transition-colors"
+            className="inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-base font-semibold text-white hover:bg-primary/90 transition-colors"
           >
             <Zap className="h-5 w-5" />
             {t("login.signInWithGoogle")}
@@ -125,21 +125,21 @@ export default function LandingPage() {
       <section className="px-4 lg:px-6 py-16 border-t border-border">
         <div className="max-w-5xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-8">
           <div className="rounded-xl border border-border bg-card p-6 text-center">
-            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary mb-4">
               <TrendingUp className="h-6 w-6" />
             </div>
             <h3 className="font-semibold text-foreground mb-2">{t("landing.feature1Title")}</h3>
             <p className="text-sm text-muted-foreground">{t("landing.feature1Desc")}</p>
           </div>
           <div className="rounded-xl border border-border bg-card p-6 text-center">
-            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary mb-4">
               <Shield className="h-6 w-6" />
             </div>
             <h3 className="font-semibold text-foreground mb-2">{t("landing.feature2Title")}</h3>
             <p className="text-sm text-muted-foreground">{t("landing.feature2Desc")}</p>
           </div>
           <div className="rounded-xl border border-border bg-card p-6 text-center">
-            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald/10 text-emerald mb-4">
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary mb-4">
               <BarChart3 className="h-6 w-6" />
             </div>
             <h3 className="font-semibold text-foreground mb-2">{t("landing.feature3Title")}</h3>
@@ -156,7 +156,7 @@ export default function LandingPage() {
         <button
           type="button"
           onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
-          className="inline-flex items-center gap-2 rounded-lg bg-[#10b981] px-6 py-3 text-base font-semibold text-white hover:bg-emerald/90 transition-colors"
+          className="inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-base font-semibold text-white hover:bg-primary/90 transition-colors"
         >
           {t("login.signInWithGoogle")}
         </button>

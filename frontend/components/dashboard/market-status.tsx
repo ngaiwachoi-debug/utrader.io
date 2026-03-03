@@ -85,7 +85,7 @@ export function MarketStatus() {
   return (
     <div className="flex flex-col gap-6">
       <div>
-        <p className="text-xs font-medium uppercase tracking-wider text-emerald">Bitfinex Lending</p>
+        <p className="text-xs font-medium uppercase tracking-wider text-primary">Bitfinex Lending</p>
         <h1 className="text-2xl font-bold text-foreground">{t("marketStatus.title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{t("marketStatus.subtitle")}</p>
       </div>
@@ -95,7 +95,7 @@ export function MarketStatus() {
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-muted-foreground">Total Market Volume (24h)</span>
-            <DollarSign className="h-4 w-4 text-emerald" />
+            <DollarSign className="h-4 w-4 text-primary" />
           </div>
           <p className="mt-2 text-2xl font-bold text-foreground">$775.3M</p>
           <p className="text-xs text-muted-foreground">USD + USDt combined</p>
@@ -103,9 +103,9 @@ export function MarketStatus() {
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-muted-foreground">Avg. USD Lend Rate</span>
-            <TrendingUp className="h-4 w-4 text-emerald" />
+            <TrendingUp className="h-4 w-4 text-primary" />
           </div>
-          <p className="mt-2 text-2xl font-bold text-emerald">2.63%</p>
+          <p className="mt-2 text-2xl font-bold text-primary">2.63%</p>
           <p className="text-xs text-muted-foreground">Current FRR</p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
@@ -130,7 +130,7 @@ export function MarketStatus() {
       <div className="rounded-xl border border-border bg-card">
         <div className="border-b border-border p-4">
           <div className="flex items-center gap-2">
-            <PieChart className="h-4 w-4 text-emerald" />
+            <PieChart className="h-4 w-4 text-primary" />
             <h3 className="text-sm font-semibold text-foreground">Market Overview</h3>
           </div>
           <p className="text-xs text-muted-foreground mt-1">Rates and volume by currency</p>
@@ -156,7 +156,7 @@ export function MarketStatus() {
               <span className="text-right font-mono text-foreground">{item.rate}</span>
               <span
                 className={`text-right font-mono ${
-                  item.dailyChange.startsWith("+") ? "text-emerald" : "text-destructive"
+                  item.dailyChange.startsWith("+") ? "text-primary" : "text-destructive"
                 }`}
               >
                 {item.dailyChange}
@@ -171,7 +171,7 @@ export function MarketStatus() {
       <div className="rounded-xl border border-border bg-card">
         <div className="border-b border-border p-4">
           <div className="flex items-center gap-2">
-            <BookOpen className="h-4 w-4 text-emerald" />
+            <BookOpen className="h-4 w-4 text-primary" />
             <h3 className="text-sm font-semibold text-foreground">{t("marketStatus.lendingLedger")}</h3>
           </div>
           <p className="text-xs text-muted-foreground mt-1">{t("liveStatus.lendingLedgerDesc")}</p>
@@ -181,7 +181,7 @@ export function MarketStatus() {
               id="ledger-currency"
               value={ledgerSymbol}
               onChange={(e) => setLedgerSymbol(e.target.value)}
-              className="rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground focus:outline-none focus:ring-2 focus:ring-emerald/50"
+              className="rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
             >
               {ledgerSymbols.length === 0 && <option value="fUSD">USD</option>}
               {ledgerSymbols.map(({ value, label }) => (
@@ -190,9 +190,9 @@ export function MarketStatus() {
             </select>
           </div>
         </div>
-        <div className="m-5 rounded-xl bg-emerald/10 border border-emerald/20 p-5">
+        <div className="m-5 rounded-xl bg-primary/10 border border-primary/20 p-5">
           <p className="text-xs text-muted-foreground">{t("liveStatus.currentAnnualRate")}</p>
-          <p className="text-3xl font-bold text-emerald mt-1">
+          <p className="text-3xl font-bold text-primary mt-1">
             {ledgerLoading ? "…" : ledgerCurrentRate ?? "—"}
           </p>
           <p className="text-xs text-muted-foreground mt-1">
@@ -230,7 +230,7 @@ export function MarketStatus() {
                   <td className="px-5 py-3 font-mono text-muted-foreground">{row.rateRange}</td>
                   <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground sm:table-cell">{row.maxDays}</td>
                   <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground md:table-cell">{row.cumulative}</td>
-                  <td className="px-5 py-3 text-right font-bold font-mono text-emerald">{row.rate}</td>
+                  <td className="px-5 py-3 text-right font-bold font-mono text-primary">{row.rate}</td>
                   <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground lg:table-cell">{row.amount}</td>
                   <td className="hidden px-5 py-3 text-right font-mono text-muted-foreground sm:table-cell">{row.count}</td>
                   <td className="px-5 py-3 text-right font-mono text-foreground">{row.total}</td>

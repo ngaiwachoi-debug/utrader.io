@@ -3,6 +3,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react"
 import { getBackendToken } from "@/lib/auth"
 import { useCurrentUserId } from "@/lib/current-user-context"
+import { useBotStats } from "@/lib/dashboard-data-context"
 
 const API_BACKEND = "/api-backend"
 const BOT_STATUS_POLL_MS = 90000
@@ -15,6 +16,8 @@ type BotStatusContextValue = {
   botActive: boolean | null
   setBotActive: (v: boolean | null) => void
   loading: boolean
+  /** True when refetching in background (cached data shown but status may change) */
+  isRevalidating: boolean
   error: string | null
   setError: (v: string | null) => void
   /** True when Start returned 400 with INSUFFICIENT_TOKENS; show message + button to Subscription tab */
@@ -36,31 +39,21 @@ type BotStatusProviderProps = { children: React.ReactNode; onUpgradeClick?: () =
 
 export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProviderProps) {
   const userId = useCurrentUserId()
-  const [botActive, setBotActive] = useState<boolean | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const id = userId ?? 0
+  const botStats = useBotStats(id)
+  const botActive = botStats.data?.active ?? null
   const [insufficientTokens, setInsufficientTokens] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
   const [isStopping, setIsStopping] = useState(false)
   const [actionCooldownSec, setActionCooldownSec] = useState(0)
+  const [error, setError] = useState<string | null>(null)
+  const loading = botStats.loading
+  const isRevalidating = botStats.isRevalidating ?? false
 
-  const refreshBotStatus = useCallback(async () => {
-    if (userId == null) return
-    const token = await getBackendToken()
-    const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-    const res = await fetch(`${API_BACKEND}/bot-stats/${userId}`, { credentials: "include", headers })
-    if (res.ok) {
-      const data = await res.json()
-      if (typeof data.active === "boolean") setBotActive(data.active)
-    }
-  }, [userId])
+  const refreshBotStatus = useCallback(() => botStats.refetch(), [botStats.refetch])
 
   useEffect(() => {
-    if (userId == null) {
-      setBotActive(null)
-      return
-    }
-    refreshBotStatus()
+    if (userId == null) return
     const t = setInterval(refreshBotStatus, BOT_STATUS_POLL_MS)
     return () => clearInterval(t)
   }, [userId, refreshBotStatus])
@@ -90,14 +83,18 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
         try {
           const j = text ? JSON.parse(text) : {}
           const detail = typeof j.detail === "string" ? j.detail : ""
-          const isInsufficient = j.code === "INSUFFICIENT_TOKENS" || (detail && String(detail).toLowerCase().includes("minimum balance"))
-          setError(isInsufficient ? INSUFFICIENT_TOKENS_MESSAGE : (detail || text || "Start failed"))
-          setInsufficientTokens(!!isInsufficient)
+          if (res.status === 429) {
+            setError(detail || "Too many start/stop requests. Please wait before trying again.")
+          } else {
+            const isInsufficient = j.code === "INSUFFICIENT_TOKENS" || (detail && String(detail).toLowerCase().includes("minimum balance"))
+            setError(isInsufficient ? INSUFFICIENT_TOKENS_MESSAGE : (detail || text || "Start failed"))
+            setInsufficientTokens(!!isInsufficient)
+          }
         } catch {
           setError(text || "Start failed")
         }
       } else if (data && (data.bot_status === "running" || data.bot_status === "starting")) {
-        setBotActive(true)
+        await refreshBotStatus()
       } else {
         await refreshBotStatus()
       }
@@ -121,13 +118,14 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
       if (!res.ok) {
         const text = await res.text()
         try {
-          const j = JSON.parse(text)
-          setError(j.detail || text)
+          const j = text ? JSON.parse(text) : {}
+          const detail = typeof j.detail === "string" ? j.detail : text
+          setError(res.status === 429 ? (detail || "Too many start/stop requests. Please wait before trying again.") : (detail || "Stop failed"))
         } catch {
           setError(text || "Stop failed")
         }
       } else {
-        setBotActive(false)
+        await refreshBotStatus()
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -135,13 +133,14 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
     } finally {
       setIsStopping(false)
     }
-  }, [userId, actionCooldownSec])
+  }, [userId, refreshBotStatus, actionCooldownSec])
 
   const value: BotStatusContextValue = {
     botActive,
-    setBotActive,
+    setBotActive: () => { void refreshBotStatus() },
     loading,
-    error,
+    isRevalidating,
+    error: error ?? botStats.error,
     setError,
     insufficientTokens,
     isStarting,

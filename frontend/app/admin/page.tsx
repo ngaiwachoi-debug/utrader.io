@@ -12,6 +12,7 @@ import {
   Users,
   Bot,
   Coins,
+  CirclePlus,
   Activity,
   FileText,
   LogOut,
@@ -65,6 +66,11 @@ type DeductionEntry = {
 type Health = { redis: string; db: string }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+
+const LOCALE_REGEX = /^\/(en|zh|ko|ru|de|pt|fil|id|ja)(\/|$)/
+function getLocaleFromPath(path: string | null): string {
+  return path?.match(LOCALE_REGEX)?.[1] ?? "en"
+}
 
 function BotStatusBadge({ status }: { status: string | null | undefined }) {
   const s = (status ?? "").toLowerCase()
@@ -147,6 +153,7 @@ const SECTIONS = [
   { id: "apiKeys", label: "API Keys", icon: Key },
   { id: "bot", label: "Bot Control", icon: Bot },
   { id: "deduction", label: "Deduction", icon: Coins },
+  { id: "tokenAdd", label: "Token add log", icon: CirclePlus },
   { id: "usdtCredit", label: "USDT Credit", icon: Wallet },
   { id: "withdrawals", label: "Withdrawals", icon: CreditCard },
   { id: "referrals", label: "Referrals", icon: UserPlus },
@@ -208,10 +215,15 @@ export default function AdminPage() {
   const [auditFilterEmail, setAuditFilterEmail] = useState("")
   const [deductionStartDate, setDeductionStartDate] = useState("")
   const [deductionEndDate, setDeductionEndDate] = useState("")
+  const [tokenAddLogs, setTokenAddLogs] = useState<{ id?: number; user_id: number; email?: string; amount: number; reason: string; created_at: string }[]>([])
+  const [tokenAddLoading, setTokenAddLoading] = useState(false)
+  const [tokenAddUserId, setTokenAddUserId] = useState("")
+  const [tokenAddStartDate, setTokenAddStartDate] = useState("")
+  const [tokenAddEndDate, setTokenAddEndDate] = useState("")
 
   const handleSessionExpired = useCallback(() => {
     clearBackendTokenCache()
-    const locale = pathname?.startsWith("/zh") ? "zh" : "en"
+    const locale = getLocaleFromPath(pathname)
     signOut({ callbackUrl: `/${locale}/admin-login` })
     window.location.href = `/${locale}/admin-login`
   }, [signOut, pathname])
@@ -311,6 +323,31 @@ export default function AdminPage() {
   useEffect(() => {
     if (section === "deduction" && backendToken) void fetchDeductionLogs(backendToken)
   }, [section, backendToken, fetchDeductionLogs])
+
+  const fetchTokenAddLogs = useCallback(async (token: string) => {
+    try {
+      setTokenAddLoading(true)
+      const params = new URLSearchParams({ limit: "100" })
+      if (tokenAddUserId) params.set("user_id", tokenAddUserId)
+      if (tokenAddStartDate) params.set("start_date", tokenAddStartDate)
+      if (tokenAddEndDate) params.set("end_date", tokenAddEndDate)
+      const res = await fetch(`${API_BASE}/admin/token-add/logs?${params}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.status === 401) { handleSessionExpired(); return }
+      if (!res.ok) return
+      const data = await res.json()
+      setTokenAddLogs(Array.isArray(data) ? data : [])
+    } catch {
+      // ignore
+    } finally {
+      setTokenAddLoading(false)
+    }
+  }, [handleSessionExpired, tokenAddUserId, tokenAddStartDate, tokenAddEndDate])
+
+  useEffect(() => {
+    if (section === "tokenAdd" && backendToken) void fetchTokenAddLogs(backendToken)
+  }, [section, backendToken, fetchTokenAddLogs])
 
   useEffect(() => {
     if (section === "health" && backendToken) void fetchHealth(backendToken)
@@ -625,7 +662,7 @@ export default function AdminPage() {
   }
 
   if (sessionStatus === "unauthenticated") {
-    const locale = pathname?.startsWith("/zh") ? "zh" : "en"
+    const locale = getLocaleFromPath(pathname)
     router.replace(`/${locale}/admin-login`)
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -1023,6 +1060,56 @@ export default function AdminPage() {
               </CardContent>
             </Card>
           </div>
+        )}
+
+        {section === "tokenAdd" && (
+          <Card>
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle>Token add log</CardTitle>
+              <Button size="sm" variant="outline" onClick={() => backendToken && fetchTokenAddLogs(backendToken)}>
+                <RefreshCw className="h-4 w-4 mr-1" /> Refresh
+              </Button>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground mb-3">All token add events (registration, admin, deposit, subscription, etc.).</p>
+              <div className="flex flex-wrap gap-2 mb-3">
+                <span className="text-xs text-muted-foreground self-center">Filter:</span>
+                <Input type="number" placeholder="User ID" className="w-28" value={tokenAddUserId} onChange={(e) => setTokenAddUserId(e.target.value)} />
+                <Input type="date" placeholder="From" className="w-40" value={tokenAddStartDate} onChange={(e) => setTokenAddStartDate(e.target.value)} />
+                <Input type="date" placeholder="To" className="w-40" value={tokenAddEndDate} onChange={(e) => setTokenAddEndDate(e.target.value)} />
+                <Button size="sm" variant="outline" onClick={() => backendToken && fetchTokenAddLogs(backendToken)}>Apply</Button>
+              </div>
+              {tokenAddLoading ? (
+                <p className="text-sm text-muted-foreground">Loading…</p>
+              ) : (
+                <div className="overflow-x-auto max-h-96">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border">
+                        <th className="text-left py-2 px-2">User ID</th>
+                        <th className="text-left py-2 px-2">Email</th>
+                        <th className="text-left py-2 px-2">Time</th>
+                        <th className="text-left py-2 px-2">Amount</th>
+                        <th className="text-left py-2 px-2">Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tokenAddLogs.map((e, i) => (
+                        <tr key={e.id ?? i} className="border-b border-border/50">
+                          <td className="py-2 px-2">{e.user_id}</td>
+                          <td className="py-2 px-2">{e.email ?? "—"}</td>
+                          <td className="py-2 px-2">{e.created_at}</td>
+                          <td className="py-2 px-2">{e.amount}</td>
+                          <td className="py-2 px-2">{e.reason}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {tokenAddLogs.length === 0 && !tokenAddLoading && <p className="text-sm text-muted-foreground py-4">No token add logs yet.</p>}
+                </div>
+              )}
+            </CardContent>
+          </Card>
         )}
 
         {section === "usdtCredit" && (

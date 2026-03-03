@@ -29,7 +29,7 @@ SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 API_BASE = os.environ.get("E2E_API_BASE", "http://127.0.0.1:8000")
 FRONTEND_BASE = os.environ.get("E2E_FRONTEND_BASE", "http://localhost:3000")
 TEST_EMAIL = "e2e-auto-test@gmail.com"
-DEV_TOKEN_KEY = "utrader_dev_backend_token"
+DEV_TOKEN_KEY = "bifinexbot_dev_backend_token"
 
 # ---------------------------------------------------------------------------
 # DB connection (DATABASE_URL or DB_HOST/DB_USER/DB_PASSWORD/DB_NAME)

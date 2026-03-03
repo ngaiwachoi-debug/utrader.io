@@ -1,14 +1,12 @@
 "use client"
 
-import { useEffect, useState, useRef, useCallback } from "react"
+import { useEffect, useState, useRef } from "react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useBotStatus } from "@/lib/bot-status-context"
 import { getBackendToken } from "@/lib/auth"
-import { Terminal, ChevronDown, ChevronRight, Copy, ArrowDown } from "lucide-react"
+import { Terminal } from "lucide-react"
 import { BotStatusBar } from "@/components/dashboard/bot-status-bar"
-
-const SCROLL_THRESHOLD_PX = 50
 
 type TerminalSummary = {
   strategy?: string
@@ -49,12 +47,8 @@ export function TerminalView() {
   const [summary, setSummary] = useState<TerminalSummary>(null)
   const [planTier, setPlanTier] = useState<string>("trial")
   const [pollIntervalMs, setPollIntervalMs] = useState(FIRST_5_MIN_POLL_MS)
-  const [checksOpen, setChecksOpen] = useState(false)
-  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
-  const [copyFeedback, setCopyFeedback] = useState(false)
   const botStartedAt = useRef<number>(0)
-  const logContainerRef = useRef<HTMLPreElement | null>(null)
-  const userHasScrolledUp = useRef(false)
+  const preRef = useRef<HTMLPreElement>(null)
 
   // Fetch user-status for plan_tier when tab mounts
   useEffect(() => {
@@ -107,48 +101,10 @@ export function TerminalView() {
     return () => clearInterval(interval)
   }, [userId, pollIntervalMs])
 
-  const handleLogScroll = useCallback(() => {
-    const el = logContainerRef.current
-    if (!el) return
-    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_THRESHOLD_PX
-    if (atBottom) {
-      userHasScrolledUp.current = false
-      setShowScrollToBottom(false)
-    } else {
-      userHasScrolledUp.current = true
-      setShowScrollToBottom(true)
-    }
-  }, [])
-
+  // Auto-scroll to bottom when new logs load
   useEffect(() => {
-    if (!userHasScrolledUp.current && logContainerRef.current) {
-      const el = logContainerRef.current
-      const run = () => {
-        el.scrollTop = el.scrollHeight
-      }
-      requestAnimationFrame(run)
-    }
+    preRef.current?.scrollTo({ top: preRef.current.scrollHeight, behavior: "smooth" })
   }, [logLines])
-
-  const scrollToBottom = useCallback(() => {
-    const el = logContainerRef.current
-    if (el) {
-      el.scrollTop = el.scrollHeight
-      userHasScrolledUp.current = false
-      setShowScrollToBottom(false)
-    }
-  }, [])
-
-  const handleCopyLog = useCallback(async () => {
-    const text = logLines.length > 0 ? logLines.join("\n") : t("dashboard.terminalPlaceholder")
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopyFeedback(true)
-      setTimeout(() => setCopyFeedback(false), 2000)
-    } catch {
-      setCopyFeedback(false)
-    }
-  }, [logLines, t])
 
   if (userId == null) {
     return (
@@ -163,27 +119,12 @@ export function TerminalView() {
 
   const terminalContent = logLines.length > 0 ? logLines.join("\n") : t("dashboard.terminalPlaceholder")
 
-  const checksTable: { step: number; check: string; success: string; failure: string; stateOnFailure: string }[] = [
-    { step: 1, check: "API Request Authentication", success: "User is logged in (valid JWT/session; current_user exists)", failure: "Return 401 UNAUTHORIZED (Not authenticated)", stateOnFailure: "No state changes" },
-    { step: 2, check: "Set Desired State", success: "bot_desired_state updated to running in DB + commit succeeds", failure: "Return 500 INTERNAL_SERVER_ERROR (Failed to update intent)", stateOnFailure: "bot_desired_state remains stopped" },
-    { step: 3, check: "Token Threshold Check (Q6)", success: "Calculated token balance (total_added - total_deducted) > 0", failure: "Return 400 INSUFFICIENT_TOKENS (Tokens must be greater than 0)", stateOnFailure: "bot_desired_state stays running (intent), bot_status remains stopped" },
-    { step: 4, check: "Idempotency Check (Q7)", success: "NOT (bot_status in [running, starting] AND bot_desired_state = running)", failure: "Return 200 OK (Bot already running or queued)", stateOnFailure: "No state changes (no enqueue, no bot_status update)" },
-    { step: 5, check: "Vault/API Key Check", success: "User has valid API keys stored in vault", failure: "Return 400 BAD_REQUEST (Missing/invalid API keys)", stateOnFailure: "bot_desired_state = running, bot_status = stopped" },
-    { step: 6, check: "Enqueue Bot Task", success: "_enqueue_bot_task succeeds (job added to ARQ queue)", failure: "Return 500 INTERNAL_SERVER_ERROR (Failed to queue bot job)", stateOnFailure: "bot_desired_state = running, bot_status = stopped" },
-    { step: 7, check: "Update Bot Status", success: "bot_status updated to starting in DB + commit succeeds", failure: "Return 500 INTERNAL_SERVER_ERROR (Failed to update bot status)", stateOnFailure: "bot_desired_state = running, bot_status remains stopped" },
-    { step: 8, check: "Worker Startup Reconcile", success: "Worker loads user, bot_desired_state = running (matches intent)", failure: "Worker sets bot_desired_state = stopped + bot_status = stopped (commit)", stateOnFailure: "Both states reset to stopped; worker exits" },
-    { step: 9, check: "Worker Vault/Config Check", success: "Worker validates API keys/plan config (same as Step 5)", failure: "Worker sets both states to stopped (commit) + logs error", stateOnFailure: "Both states = stopped; worker exits" },
-    { step: 10, check: "Worker Token Check", success: "Worker rechecks token balance > 0 (prevents race conditions)", failure: "Worker sets both states to stopped (commit) + logs Token exhaustion", stateOnFailure: "Both states = stopped; worker exits" },
-    { step: 11, check: "Worker Set Running State", success: "Worker updates bot_status to running (commit)", failure: "Worker sets both states to stopped (commit) + logs Failed to start bot", stateOnFailure: "Both states = stopped; worker exits" },
-    { step: 12, check: "Worker Kill-Switch Loop (Q4)", success: "bot_desired_state remains running (no stop signal) during loop iterations", failure: "Worker sets both states to stopped (commit) + cancels engine", stateOnFailure: "Both states = stopped; bot stops" },
-  ]
-
   const idleEntries = summary?.idle_per_currency_usd
     ? Object.entries(summary.idle_per_currency_usd).filter(([, v]) => v > 0)
     : []
 
   return (
-    <div className="flex flex-col flex-1 min-h-0 gap-6 min-h-[calc(100vh-12rem)]">
+    <div className="flex min-h-0 flex-1 flex-col gap-6">
       <BotStatusBar title={t("sidebar.terminal")} />
       <p className="text-sm text-muted-foreground -mt-2">{t("dashboard.terminalDesc")}</p>
 
@@ -241,86 +182,18 @@ export function TerminalView() {
         </div>
       )}
 
-      {/* Recent activity (log lines) – fills remaining space */}
-      <div className="rounded-xl border border-border bg-card font-mono text-sm flex flex-col flex-1 min-h-0">
-        <div className="flex items-center justify-between gap-2 border-b border-border bg-muted/50 px-4 py-2 flex-shrink-0">
-          <div className="flex items-center gap-2 min-w-0">
-            <Terminal className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-            <span className="text-muted-foreground text-xs truncate">
-              Recent activity (cached, refresh every {pollIntervalMs >= 60000 ? `${pollIntervalMs / 60000}m` : `${pollIntervalMs / 1000}s`})
-            </span>
-          </div>
-          <div className="flex items-center gap-2 flex-shrink-0">
-            <button
-              type="button"
-              onClick={handleCopyLog}
-              className="rounded-md border border-border bg-background px-2 py-1.5 text-xs font-medium text-foreground hover:bg-muted transition-colors inline-flex items-center gap-1.5"
-            >
-              <Copy className="h-3.5 w-3.5" />
-              {copyFeedback ? t("dashboard.terminalCopied") : t("dashboard.terminalCopy")}
-            </button>
-            {showScrollToBottom && (
-              <button
-                type="button"
-                onClick={scrollToBottom}
-                className="rounded-md border border-border bg-background px-2 py-1.5 text-xs font-medium text-foreground hover:bg-muted transition-colors inline-flex items-center gap-1.5"
-              >
-                <ArrowDown className="h-3.5 w-3.5" />
-                {t("dashboard.terminalScrollToBottom")}
-              </button>
-            )}
-          </div>
+      {/* Recent activity (log lines) — fills remaining space, max viewport height, scrolls to bottom on new logs */}
+      <div className="flex min-h-0 flex-1 flex-col rounded-xl border border-border bg-card font-mono text-sm max-h-[calc(100vh-14rem)] min-h-[240px]">
+        <div className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/50 px-4 py-2">
+          <Terminal className="h-4 w-4 text-muted-foreground" />
+          <span className="text-muted-foreground">Recent activity (cached, refresh every {pollIntervalMs >= 60000 ? `${pollIntervalMs / 60000}m` : `${pollIntervalMs / 1000}s`})</span>
         </div>
         <pre
-          ref={logContainerRef}
-          onScroll={handleLogScroll}
-          role="log"
-          aria-label="Trading terminal output"
-          className="flex-1 min-h-[200px] overflow-auto p-4 text-muted-foreground whitespace-pre-wrap leading-relaxed"
+          ref={preRef}
+          className="min-h-[120px] flex-1 overflow-auto p-4 text-muted-foreground whitespace-pre-wrap"
         >
           {terminalContent}
         </pre>
-      </div>
-
-      {/* Collapsible: Developer – Start bot checks */}
-      <div className="rounded-xl border border-border bg-card overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setChecksOpen((o) => !o)}
-          className="w-full flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2 text-left hover:bg-muted/70 transition-colors"
-        >
-          {checksOpen ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
-          <h2 className="text-sm font-semibold text-foreground">Developer: Start bot checks &amp; outcomes</h2>
-        </button>
-        {checksOpen && (
-          <>
-            <p className="text-xs text-muted-foreground px-4 pt-2">Success condition, failure outcome, and state changes on failure per step.</p>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs border-collapse">
-                <thead>
-                  <tr className="border-b border-border bg-muted/30">
-                    <th className="p-2 font-medium text-foreground">#</th>
-                    <th className="p-2 font-medium text-foreground">Check</th>
-                    <th className="p-2 font-medium text-foreground">Success condition</th>
-                    <th className="p-2 font-medium text-foreground">Failure outcome</th>
-                    <th className="p-2 font-medium text-foreground">State changes on failure</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {checksTable.map((row) => (
-                    <tr key={row.step} className="border-b border-border/50 hover:bg-muted/20">
-                      <td className="p-2 text-muted-foreground font-mono">{row.step}</td>
-                      <td className="p-2 font-medium text-foreground">{row.check}</td>
-                      <td className="p-2 text-muted-foreground max-w-[200px]">{row.success}</td>
-                      <td className="p-2 text-destructive/90 max-w-[200px]">{row.failure}</td>
-                      <td className="p-2 text-muted-foreground max-w-[220px]">{row.stateOnFailure}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
       </div>
     </div>
   )
