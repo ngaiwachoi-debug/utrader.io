@@ -148,13 +148,13 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
               <SelectContent>
                 <SelectItem value="en">English</SelectItem>
                 <SelectItem value="zh">中文</SelectItem>
-                <SelectItem value="ko">한국어</SelectItem>
-                <SelectItem value="ru">Русский</SelectItem>
-                <SelectItem value="de">Deutsch</SelectItem>
                 <SelectItem value="pt">Português</SelectItem>
-                <SelectItem value="fil">Filipino</SelectItem>
-                <SelectItem value="id">Indonesia</SelectItem>
+                <SelectItem value="ru">Русский</SelectItem>
                 <SelectItem value="ja">日本語</SelectItem>
+                <SelectItem value="de">Deutsch</SelectItem>
+                <SelectItem value="ko">한국어</SelectItem>
+                <SelectItem value="id">Indonesia</SelectItem>
+                <SelectItem value="fil">Filipino</SelectItem>
               </SelectContent>
             </Select>
           </div>

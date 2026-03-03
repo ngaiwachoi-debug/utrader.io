@@ -4,7 +4,8 @@ import React, { createContext, useCallback, useContext, useEffect, useState } fr
 
 export type Lang = "en" | "zh" | "ko" | "ru" | "de" | "pt" | "fil" | "id" | "ja"
 
-export const SUPPORTED_LOCALES: Lang[] = ["en", "zh", "ko", "ru", "de", "pt", "fil", "id", "ja"]
+/** Order: English first, Chinese second, then by global/Google language usage (Portuguese, Russian, Japanese, German, Korean, Indonesian, Filipino). */
+export const SUPPORTED_LOCALES: Lang[] = ["en", "zh", "pt", "ru", "ja", "de", "ko", "id", "fil"]
 
 function isLang(s: string): s is Lang {
   return SUPPORTED_LOCALES.includes(s as Lang)

@@ -74,7 +74,7 @@ export function MobileMenuDrawer({
     }
   }
 
-  const localeLabels: Record<string, string> = { en: "English", zh: "中文", ko: "한국어", ru: "Русский", de: "Deutsch", pt: "Português", fil: "Filipino", id: "Indonesia", ja: "日本語" }
+  const localeLabels: Record<string, string> = { en: "English", zh: "中文", pt: "Português", ru: "Русский", ja: "日本語", de: "Deutsch", ko: "한국어", id: "Indonesia", fil: "Filipino" }
 
   const handleLogout = () => {
     clearBackendTokenCache()
@@ -161,13 +161,13 @@ export function MobileMenuDrawer({
               <SelectContent>
                 <SelectItem value="en">English</SelectItem>
                 <SelectItem value="zh">中文</SelectItem>
-                <SelectItem value="ko">한국어</SelectItem>
-                <SelectItem value="ru">Русский</SelectItem>
-                <SelectItem value="de">Deutsch</SelectItem>
                 <SelectItem value="pt">Português</SelectItem>
-                <SelectItem value="fil">Filipino</SelectItem>
-                <SelectItem value="id">Indonesia</SelectItem>
+                <SelectItem value="ru">Русский</SelectItem>
                 <SelectItem value="ja">日本語</SelectItem>
+                <SelectItem value="de">Deutsch</SelectItem>
+                <SelectItem value="ko">한국어</SelectItem>
+                <SelectItem value="id">Indonesia</SelectItem>
+                <SelectItem value="fil">Filipino</SelectItem>
               </SelectContent>
             </Select>
           </div>
