@@ -12,14 +12,14 @@ PURCHASED_REASONS = frozenset({
 
 
 def get_tokens_remaining(db: Session, user_id: int) -> float:
-    """Return tokens_remaining for user (0 if no row). Uses raw SQL for reliability."""
+    """Return tokens_remaining for user (0 if no row), rounded to 2 decimals. Uses raw SQL for reliability."""
     try:
         r = db.execute(
             text("SELECT tokens_remaining FROM user_token_balance WHERE user_id = :uid"),
             {"uid": user_id},
         ).fetchone()
         if r is not None and r[0] is not None:
-            return max(0.0, float(r[0]))
+            return round(max(0.0, float(r[0])), 2)
     except Exception:
         pass
     return 0.0
@@ -32,9 +32,10 @@ def add_tokens(
     reason: str,
 ) -> float:
     """
-    Add amount to user's balance. If reason is in PURCHASED_REASONS, also add to purchased_tokens.
-    Creates row if missing. Returns new tokens_remaining. Uses raw SQL only (no balance-row check).
+    Add amount to user's balance (rounded to 2 decimals). If reason is in PURCHASED_REASONS, also add to purchased_tokens.
+    Creates row if missing. Returns new tokens_remaining rounded to 2 decimals.
     """
+    amount = round(float(amount), 2)
     if amount <= 0:
         return get_tokens_remaining(db, user_id)
     purchased_delta = amount if reason in PURCHASED_REASONS else 0.0
@@ -72,9 +73,10 @@ def add_tokens(
 
 def deduct_tokens(db: Session, user_id: int, amount: float) -> float:
     """
-    Deduct amount from user's balance. Balance never goes below 0.
-    Returns new tokens_remaining.
+    Deduct amount from user's balance (amount rounded to 2 decimals). Balance never goes below 0.
+    Returns new tokens_remaining rounded to 2 decimals.
     """
+    amount = round(float(amount), 2)
     if amount <= 0:
         return get_tokens_remaining(db, user_id)
     try:

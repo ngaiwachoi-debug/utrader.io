@@ -1,9 +1,9 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { useSearchParams, useRouter } from "next/navigation"
+import { useSearchParams, useRouter, usePathname } from "next/navigation"
 import { useSession } from "next-auth/react"
-import { DollarSign, Activity, TrendingUp, Settings, BarChart3, CreditCard, Terminal, UserPlus } from "lucide-react"
+import { DollarSign, Activity, Settings, CreditCard } from "lucide-react"
 import { Sidebar } from "@/components/dashboard/sidebar"
 import { Header } from "@/components/dashboard/header"
 import { ProfitCenter } from "@/components/dashboard/profit-center"
@@ -12,15 +12,15 @@ import { MarketStatus } from "@/components/dashboard/market-status"
 import { TrueROI } from "@/components/dashboard/true-roi"
 import { Subscription } from "@/components/dashboard/subscription"
 import { ReferralUsdt } from "@/components/dashboard/referral-usdt"
+import { Ranking } from "@/components/dashboard/ranking"
 import { TerminalView } from "@/components/dashboard/terminal-view"
 import { SettingsPage } from "@/components/dashboard/settings"
+import { MobileMenuDrawer } from "@/components/dashboard/mobile-menu-drawer"
 import { useT } from "@/lib/i18n"
 import { DateRangeProvider } from "@/lib/date-range-context"
 import { CurrentUserProvider, useCurrentUserId } from "@/lib/current-user-context"
 import { BotStatusProvider } from "@/lib/bot-status-context"
-import { getBackendToken } from "@/lib/auth"
-
-const API_BACKEND = "/api-backend"
+import { DashboardDataProvider, useDashboardData, useUserStatus } from "@/lib/dashboard-data-context"
 
 function normalizePlanTier(raw: string): string {
   const s = (raw ?? "trial").toString().trim().toLowerCase()
@@ -45,7 +45,9 @@ export default function DashboardPage() {
   return (
     <CurrentUserProvider>
       <DateRangeProvider>
-        <DashboardLayout searchParams={searchParams} />
+        <DashboardDataProvider>
+          <DashboardLayout searchParams={searchParams} />
+        </DashboardDataProvider>
       </DateRangeProvider>
     </CurrentUserProvider>
   )
@@ -53,38 +55,28 @@ export default function DashboardPage() {
 
 function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof useSearchParams> | null }) {
   const t = useT()
+  const pathname = usePathname()
   const userId = useCurrentUserId()
+  const id = userId ?? 0
+  const { prefetch } = useDashboardData()
+  const userStatus = useUserStatus(id)
+  const planTier = normalizePlanTier(userStatus.data?.plan_tier ?? "trial")
   const [activePage, setActivePage] = useState("profit-center")
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
-  const [planTier, setPlanTier] = useState<string>("trial")
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+
+  useEffect(() => {
+    if (userId != null) prefetch(userId)
+  }, [userId, prefetch])
 
   useEffect(() => {
     if (searchParams?.get("page") === "subscription") setActivePage("subscription")
   }, [searchParams])
 
-  useEffect(() => {
-    if (userId == null) {
-      setPlanTier("trial")
-      return
-    }
-    let cancelled = false
-    getBackendToken().then((token) => {
-      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-      return fetch(`${API_BACKEND}/user-status/${userId}`, { credentials: "include", headers })
-    }).then((res) => (res.ok ? res.json() : { plan_tier: "trial" }))
-      .then((data) => {
-        if (cancelled) return
-        const raw = (data.plan_tier ?? "trial").toString().trim().toLowerCase()
-        setPlanTier(normalizePlanTier(raw))
-      })
-      .catch(() => { if (!cancelled) setPlanTier("trial") })
-    return () => { cancelled = true }
-  }, [userId])
-
   const handleUpgrade = () => setActivePage("subscription")
 
   return (
-    <div className="min-h-screen bg-background" suppressHydrationWarning>
+    <div className="min-h-screen bg-background flex flex-col" suppressHydrationWarning>
       <BotStatusProvider onUpgradeClick={handleUpgrade}>
         <Sidebar
           activePage={activePage}
@@ -95,20 +87,34 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
         />
 
         <div
-          className={`transition-all duration-300 ${sidebarCollapsed ? "md:ml-16" : "md:ml-56"}`}
+          className={`transition-all duration-300 flex flex-col flex-1 min-h-0 ${sidebarCollapsed ? "md:ml-16" : "md:ml-56"}`}
         >
           <div className="w-full">
-            <Header onUpgradeClick={handleUpgrade} />
+            <Header onUpgradeClick={handleUpgrade} onOpenMobileMenu={() => setMobileMenuOpen(true)} />
           </div>
 
-          <main className="p-4 pb-20 md:pb-4 lg:p-6">
+          <MobileMenuDrawer
+            open={mobileMenuOpen}
+            onOpenChange={setMobileMenuOpen}
+            activePage={activePage}
+            onPageChange={setActivePage}
+            t={t}
+            pathname={pathname}
+          />
+
+          <main className="p-4 pb-20 md:pb-4 lg:p-6 flex flex-col flex-1 min-h-0">
             {activePage === "profit-center" && <ProfitCenter onUpgradeClick={handleUpgrade} />}
             {activePage === "live-status" && <LiveStatus />}
             {activePage === "market-status" && <MarketStatus />}
             {activePage === "true-roi" && <TrueROI />}
             {activePage === "subscription" && <Subscription />}
             {activePage === "referral-usdt" && <ReferralUsdt />}
-            {activePage === "terminal" && <TerminalView />}
+            {activePage === "leaderboard" && <Ranking />}
+            {activePage === "terminal" && (
+              <div className="flex flex-col flex-1 min-h-0">
+                <TerminalView />
+              </div>
+            )}
             {activePage === "settings" && <SettingsPage onUpgradeClick={handleUpgrade} />}
           </main>
         </div>
@@ -131,11 +137,7 @@ function MobileNav({
   const items = [
     { id: "profit-center", labelKey: "nav.profit", Icon: DollarSign },
     { id: "live-status", labelKey: "nav.live", Icon: Activity },
-    { id: "market-status", labelKey: "sidebar.marketStatus", Icon: BarChart3 },
-    { id: "true-roi", labelKey: "nav.roi", Icon: TrendingUp },
     { id: "subscription", labelKey: "sidebar.subscription", Icon: CreditCard },
-    { id: "referral-usdt", labelKey: "sidebar.referralUsdt", Icon: UserPlus },
-    { id: "terminal", labelKey: "sidebar.terminal", Icon: Terminal },
     { id: "settings", labelKey: "nav.settings", Icon: Settings },
   ]
 
@@ -148,7 +150,7 @@ function MobileNav({
             key={item.id}
             onClick={() => onPageChange(item.id)}
             className={`flex flex-col items-center gap-0.5 px-3 py-1.5 text-xs font-medium transition-colors ${
-              isActive ? "text-emerald" : "text-muted-foreground"
+              isActive ? "text-primary" : "text-muted-foreground"
             }`}
           >
             <item.Icon className="h-4 w-4" />

@@ -57,6 +57,7 @@ def apply_referral_rewards(
         level_1_id=level_1_id,
         level_2_id=level_2_id,
         level_3_id=level_3_id,
+        tokens_burned=purchased_tokens_burned,
         reward_l1=reward_l1,
         reward_l2=reward_l2,
         reward_l3=reward_l3,

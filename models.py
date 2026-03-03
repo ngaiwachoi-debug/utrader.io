@@ -201,6 +201,7 @@ class ReferralReward(Base):
     level_1_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     level_2_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     level_3_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    tokens_burned = Column(Float, nullable=False)  # purchased tokens burned that triggered this reward
     reward_l1 = Column(Float, default=0.0)
     reward_l2 = Column(Float, default=0.0)
     reward_l3 = Column(Float, default=0.0)
@@ -253,3 +254,24 @@ class AdminAuditLog(Base):
     email = Column(String(255), nullable=False)
     action = Column(String(64), nullable=False)
     detail = Column(Text, nullable=True)  # JSON string
+
+
+class RankingSnapshot(Base):
+    """Top 100 leaderboard (fake data). Refreshed once per day after 10:00 UTC profit calculation."""
+    __tablename__ = "ranking_snapshot"
+
+    rank = Column(Integer, primary_key=True)  # 1..100
+    user_display = Column(String(255), nullable=False)  # fake email/name
+    yield_pct = Column(Float, nullable=False)  # 15–32
+    lent_usd = Column(Float, default=0.0, nullable=True)  # optional fake lent
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ReferralGainSnapshot(Base):
+    """Top 100 referral gain (fake data). Refreshed once per day after 10:00 UTC profit calculation."""
+    __tablename__ = "referral_gain_snapshot"
+
+    rank = Column(Integer, primary_key=True)  # 1..100
+    user_display = Column(String(255), nullable=False)  # fake email (Gmail-style)
+    usdt_gain_daily = Column(Float, nullable=False)  # 500–10000
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

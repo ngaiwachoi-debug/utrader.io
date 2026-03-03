@@ -85,10 +85,10 @@ try {
     fail "bot-stats after invalid keys" $_.Exception.Message
 }
 
-# 6) Manual start
+# 6) Manual start (with user JWT)
 Write-Host "6. Manual start bot"
 try {
-    $r = Invoke-RestMethod -Uri "$API_BASE/start-bot/$USER_ID" -Method POST -ContentType "application/json"
+    $r = Invoke-RestMethod -Uri "$API_BASE/start-bot/$USER_ID" -Method POST -Headers $headers -ContentType "application/json"
     if ($r.message -match "queued|running|success") { pass "Start bot accepted" }
     else { fail "Start bot" $r.message }
 } catch {
@@ -117,10 +117,10 @@ try {
     fail "Terminal logs" $_.Exception.Message
 }
 
-# 9) Stop bot
+# 9) Stop bot (with user JWT)
 Write-Host "9. Stop bot"
 try {
-    $r = Invoke-RestMethod -Uri "$API_BASE/stop-bot/$USER_ID" -Method POST -ContentType "application/json"
+    $r = Invoke-RestMethod -Uri "$API_BASE/stop-bot/$USER_ID" -Method POST -Headers $headers -ContentType "application/json"
     if ($r.message -match "success|Shutdown") { pass "Stop bot accepted" }
     else { fail "Stop bot" $r.message }
 } catch {
@@ -135,10 +135,10 @@ try {
     fail "Bot stopped" $_.Exception.Message
 }
 
-# 10) Start again
+# 10) Start again (with user JWT)
 Write-Host "10. Start bot again"
 try {
-    $r = Invoke-RestMethod -Uri "$API_BASE/start-bot/$USER_ID" -Method POST -ContentType "application/json"
+    $r = Invoke-RestMethod -Uri "$API_BASE/start-bot/$USER_ID" -Method POST -Headers $headers -ContentType "application/json"
     if ($r.message -match "queued|running|success") { pass "Start again accepted" }
     else { fail "Start again" $r.message }
 } catch {

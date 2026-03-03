@@ -73,7 +73,7 @@ function BotStatusBadge({ status }: { status: string | null | undefined }) {
   const running = s === "running"
   const error = !stopped && !starting && !running && (s === "error" || s === "failed" || s.length > 0)
   const circleClass = running
-    ? "bg-emerald-500"
+    ? "bg-primary"
     : starting
       ? "bg-yellow-500"
       : error
@@ -547,7 +547,15 @@ export default function AdminPage() {
         void fetchDeductionLogs(backendToken)
         return true
       }
-      toast.error("Deduction trigger failed")
+      let message = "Deduction trigger failed"
+      try {
+        const errBody = await res.json()
+        if (typeof errBody?.detail === "string") message = errBody.detail
+      } catch {
+        const text = await res.text()
+        if (text) message = text.slice(0, 200)
+      }
+      toast.error(message)
       return false
     } finally {
       setTriggerLoading(false)
@@ -663,7 +671,7 @@ export default function AdminPage() {
             type="button"
             onClick={() => setSection(id)}
             className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm w-full text-left transition-colors ${
-              section === id ? "bg-emerald/10 text-emerald font-medium" : "text-muted-foreground hover:bg-secondary"
+              section === id ? "bg-primary/10 text-primary font-medium" : "text-muted-foreground hover:bg-secondary"
             }`}
           >
             <Icon className="h-4 w-4 shrink-0" />
@@ -728,7 +736,7 @@ export default function AdminPage() {
                         <tr key={u.id} className="border-b border-border/50">
                           <td className="py-2 px-2">{u.id}</td>
                           <td className="py-2 px-2 font-medium">
-                            <Link href={`/admin/users/${u.id}`} className="text-emerald hover:underline">{u.email}</Link>
+                            <Link href={`/admin/users/${u.id}`} className="text-primary hover:underline">{u.email}</Link>
                           </td>
                           <td className="py-2 px-2">{u.plan_tier}</td>
                           <td className="py-2 px-2">{u.tokens_remaining != null ? u.tokens_remaining.toFixed(0) : "—"}</td>
@@ -1139,7 +1147,7 @@ export default function AdminPage() {
                           <td className="py-2 px-2 flex gap-1">
                             {w.status === "pending" && (
                               <>
-                                <Button size="sm" className="h-7 text-xs bg-emerald" onClick={async () => { if (!backendToken || !confirm(`Approve withdrawal #${w.id} (${w.amount} USDT Credit for ${w.email})?`)) return; const res = await fetch(`${API_BASE}/admin/withdrawals/${w.id}/approve`, { method: "POST", headers: { Authorization: `Bearer ${backendToken}` } }); if (res.ok) { toast.success("Withdrawal approved"); void fetchWithdrawals(backendToken) } else toast.error("Approve failed") }}>Approve</Button>
+                                <Button size="sm" className="h-7 text-xs bg-primary" onClick={async () => { if (!backendToken || !confirm(`Approve withdrawal #${w.id} (${w.amount} USDT Credit for ${w.email})?`)) return; const res = await fetch(`${API_BASE}/admin/withdrawals/${w.id}/approve`, { method: "POST", headers: { Authorization: `Bearer ${backendToken}` } }); if (res.ok) { toast.success("Withdrawal approved"); void fetchWithdrawals(backendToken) } else toast.error("Approve failed") }}>Approve</Button>
                                 <Button size="sm" variant="destructive" className="h-7 text-xs" onClick={() => { setRejectModalWid(w.id); setRejectNote("") }}>Reject</Button>
                               </>
                             )}
@@ -1269,11 +1277,11 @@ export default function AdminPage() {
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="rounded-lg border border-border p-4">
                     <p className="text-sm font-medium text-foreground">Redis</p>
-                    <p className={`text-sm ${health.redis === "ok" ? "text-emerald" : "text-destructive"}`}>{health.redis}</p>
+                    <p className={`text-sm ${health.redis === "ok" ? "text-chart-1" : "text-destructive"}`}>{health.redis}</p>
                   </div>
                   <div className="rounded-lg border border-border p-4">
                     <p className="text-sm font-medium text-foreground">Database</p>
-                    <p className={`text-sm ${health.db === "ok" ? "text-emerald" : "text-destructive"}`}>{health.db}</p>
+                    <p className={`text-sm ${health.db === "ok" ? "text-chart-1" : "text-destructive"}`}>{health.db}</p>
                   </div>
                 </div>
               ) : (

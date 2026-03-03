@@ -1,13 +1,14 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Crown, Users, Zap, Check, Loader2 } from "lucide-react"
+import { Crown, Users, Zap, Check, Loader2, ChevronDown, ChevronUp } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
 import { calculateTotalBudget, calculateUsagePercentage } from "@/lib/calculateTokenUsage"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+const SHOW_DEV_BILLING = process.env.NEXT_PUBLIC_SHOW_DEV_BILLING === "true"
 
 type Plan = "pro" | "ai_ultra" | "whales"
 type Interval = "monthly" | "yearly"
@@ -21,6 +22,8 @@ const WHALES_YEARLY_USDT = 1920
 const PRO_TOKENS = 2000
 const AI_ULTRA_TOKENS = 9000
 const WHALES_TOKENS = 40000
+const PRESET_USD = [10, 25, 50]
+const TOKENS_PER_USD = 100
 
 type TokenBalanceState = {
   tokens_remaining: number
@@ -31,15 +34,18 @@ type TokenBalanceState = {
 export function Subscription() {
   const t = useT()
   const userId = useCurrentUserId()
-  const [loading, setLoading] = useState<string | null>(null) // plan key e.g. "pro" or "pro_yearly"
+  const [loading, setLoading] = useState<string | null>(null)
   const [planTier, setPlanTier] = useState<string>("trial")
   const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
   const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
   const [tokenBalanceError, setTokenBalanceError] = useState<string | null>(null)
+  const [interval, setInterval] = useState<Interval>("monthly")
   const [addTokensUsd, setAddTokensUsd] = useState<string>("")
   const [loadingTokens, setLoadingTokens] = useState(false)
   const [depositMessage, setDepositMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [bypassPayment, setBypassPayment] = useState(false)
+  const [howItWorksOpen, setHowItWorksOpen] = useState(false)
+  const [faqOpen, setFaqOpen] = useState<string | null>(null)
 
   useEffect(() => {
     if (userId == null) return
@@ -104,21 +110,21 @@ export function Subscription() {
     return () => { cancelled = true }
   }, [userId])
 
-  const handleSubscribe = async (plan: Plan, interval: Interval) => {
+  const handleSubscribe = async (plan: Plan, planInterval: Interval) => {
     const { getBackendToken } = await import("@/lib/auth")
     const token = typeof window !== "undefined" ? await getBackendToken() : null
     if (!token) {
       window.location.href = "/login"
       return
     }
-    const loadingKey = interval === "yearly" ? `${plan}_yearly` : plan
+    const loadingKey = planInterval === "yearly" ? `${plan}_yearly` : plan
     setLoading(loadingKey)
     try {
       const res = await fetch(`${API_BASE}/api/create-checkout-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         credentials: "include",
-        body: JSON.stringify({ plan, interval }),
+        body: JSON.stringify({ plan, interval: planInterval }),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.url) {
@@ -133,21 +139,19 @@ export function Subscription() {
     }
   }
 
-  const isSubscribed = planTier !== "trial" && planTier !== "free"
-
   const handlePurchaseTokens = async () => {
     const raw = addTokensUsd.trim()
     if (raw === "" || !/^-?\d*\.?\d+$/.test(raw)) {
-      setDepositMessage({ type: "error", text: "Please enter a valid USD amount" })
+      setDepositMessage({ type: "error", text: t("subscription.validUsd") })
       return
     }
     const amount = parseFloat(raw)
     if (!Number.isFinite(amount)) {
-      setDepositMessage({ type: "error", text: "Please enter a valid USD amount" })
+      setDepositMessage({ type: "error", text: t("subscription.validUsd") })
       return
     }
     if (amount < 1) {
-      setDepositMessage({ type: "error", text: "Minimum deposit is $1" })
+      setDepositMessage({ type: "error", text: t("subscription.minDeposit") })
       return
     }
     const { getBackendToken } = await import("@/lib/auth")
@@ -173,10 +177,10 @@ export function Subscription() {
         })
         setAddTokensUsd("")
         if (bypassPayment && userId != null) {
-          const [statusRes, balanceRes] = await Promise.all([
-            fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers: { Authorization: `Bearer ${token}` } }),
-            fetch(`${API_BASE}/api/v1/users/me/token-balance`, { credentials: "include", headers: { Authorization: `Bearer ${token}` } }),
-          ])
+          const balanceRes = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, {
+            credentials: "include",
+            headers: { Authorization: `Bearer ${token}` },
+          })
           if (balanceRes.ok) {
             const bal = await balanceRes.json()
             setTokenBalance({
@@ -193,14 +197,16 @@ export function Subscription() {
           text: (data.message as string) || "Validation failed",
         })
       }
-      // TODO: Add Stripe checkout flow here (redirect to data.url when implemented)
-      // if (res.ok && data.url) { window.location.href = data.url; return }
     } catch (e) {
       setDepositMessage({ type: "error", text: "Network error. Please try again." })
     } finally {
       setLoadingTokens(false)
     }
   }
+
+  const addTokenAmount = (value: number) => setAddTokensUsd(String(value))
+  const parsedUsd = addTokensUsd.trim() === "" ? 0 : parseFloat(addTokensUsd)
+  const previewTokens = Number.isFinite(parsedUsd) && parsedUsd >= 1 ? Math.floor(parsedUsd * TOKENS_PER_USD) : 0
 
   return (
     <div className="flex flex-col gap-8">
@@ -209,16 +215,17 @@ export function Subscription() {
         <p className="mt-1 text-sm text-muted-foreground">{t("subscription.subtitle")}</p>
       </div>
 
-      {/* Token usage: same data and logic as Settings (total_tokens_added, total_tokens_deducted, tokens_remaining) — show for all users */}
+      {/* Balance hero */}
       {tokenBalanceLoading && tokenBalance == null && !tokenBalanceError && (
-        <div className="rounded-xl border border-border bg-card px-4 py-4">
-          <div className="h-2 w-full rounded-full bg-muted animate-pulse" />
+        <div className="rounded-xl border border-border bg-card px-5 py-6">
+          <div className="h-3 w-24 rounded bg-muted animate-pulse" />
+          <div className="mt-3 h-2 w-full rounded-full bg-muted animate-pulse" />
           <p className="mt-2 text-xs text-muted-foreground">…</p>
         </div>
       )}
       {tokenBalanceError && (
-        <div className="rounded-xl border border-border bg-card px-4 py-4">
-          <p className="text-xs text-destructive">{tokenBalanceError}</p>
+        <div className="rounded-xl border border-border bg-card px-5 py-4">
+          <p className="text-sm text-destructive">{tokenBalanceError}</p>
         </div>
       )}
       {tokenBalance != null && (() => {
@@ -228,177 +235,288 @@ export function Subscription() {
         const remaining = tokenBalance.tokens_remaining
         const runningLow = totalBudget > 0 && (remaining < totalBudget * 0.2 || remaining < 50)
         return (
-          <>
-            <div className="rounded-xl border border-border bg-card px-4 py-4">
-              <div className="flex items-center justify-between text-sm">
-                <span className="font-medium text-foreground">{t("subscription.usageBar")}</span>
-                <span className="text-muted-foreground">
-                  {totalBudget > 0 ? `${Math.round(used)} / ${Math.round(totalBudget)} (${Math.round(pct)}%)` : `${Math.round(remaining)} tokens`}
-                </span>
-              </div>
-              <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-muted">
-                <div className="h-full rounded-full bg-emerald transition-all" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
-              </div>
-              <p className="mt-2 text-xs text-muted-foreground">
-                {t("subscription.tokensRemaining", { n: Math.round(remaining) })}
-              </p>
-              {runningLow && (
-                <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
-                  {t("subscription.runningLow")}
-                </p>
-              )}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {t("subscription.tokenUsageRule")}
+          <div className="rounded-xl border border-border bg-card px-5 py-6 shadow-sm">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("subscription.balanceRemaining")}</p>
+            <p className="mt-1 text-3xl font-bold tabular-nums text-foreground">{Math.round(remaining)}</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t("subscription.usedOfTotal", { used: Math.round(used), total: Math.round(totalBudget) })}
             </p>
-          </>
+            <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-all"
+                style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+              />
+            </div>
+            {runningLow && (
+              <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">
+                {t("subscription.runningLow")}
+              </p>
+            )}
+          </div>
         )
       })()}
 
-      {/* Plan cards: Pro, AI Ultra, Whales */}
-      <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
-        {/* Pro — 20 USDT */}
-        <div className="relative rounded-2xl border-2 border-emerald bg-card p-6 shadow-lg">
-          <div className="absolute -top-px left-0 right-0 flex justify-center">
-            <span className="flex items-center gap-1 rounded-b-md bg-emerald px-3 py-1 text-xs font-semibold text-primary-foreground">
-              <Crown className="h-3 w-3" />
-              {t("subscription.mostPopular")}
-            </span>
+      {/* How tokens work */}
+      <div className="rounded-xl border border-border bg-muted/20 px-4 py-3">
+        <button
+          type="button"
+          onClick={() => setHowItWorksOpen(!howItWorksOpen)}
+          className="flex w-full items-center justify-between text-left text-sm font-semibold text-foreground"
+        >
+          {t("subscription.howItWorks")}
+          {howItWorksOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+        </button>
+        {howItWorksOpen && (
+          <div className="mt-3 space-y-2 text-xs text-muted-foreground">
+            <p>{t("subscription.howItWorksIntro")}</p>
+            <ul className="list-inside list-disc space-y-0.5">
+              <li>{t("subscription.howAdded")}</li>
+              <li>{t("subscription.howDeducted")}</li>
+            </ul>
           </div>
-          <div className="mt-4">
-            <h2 className="text-lg font-bold text-foreground">{t("subscription.proPlan")}</h2>
-            <p className="text-xs text-muted-foreground">{t("subscription.proAudience")}</p>
+        )}
+      </div>
+
+      {/* Plans */}
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">{t("subscription.plansSection")}</h2>
+        <div className="mt-2 flex gap-2 rounded-lg bg-muted/30 p-1">
+          <button
+            type="button"
+            onClick={() => setInterval("monthly")}
+            className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              interval === "monthly" ? "bg-background text-foreground shadow" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {t("subscription.monthly")}
+          </button>
+          <button
+            type="button"
+            onClick={() => setInterval("yearly")}
+            className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              interval === "yearly" ? "bg-background text-foreground shadow" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {t("subscription.yearly")} ({t("subscription.save10")})
+          </button>
+        </div>
+        <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-3">
+          {/* Pro */}
+          <div className="relative rounded-2xl border-2 border-primary bg-card p-6 shadow-lg">
+            <div className="absolute -top-px left-0 right-0 flex justify-center">
+              <span className="flex items-center gap-1 rounded-b-md bg-primary px-3 py-1 text-xs font-semibold text-primary-foreground">
+                <Crown className="h-3 w-3" />
+                {t("subscription.mostPopular")}
+              </span>
+            </div>
+            <div className="mt-4">
+              <h3 className="text-lg font-bold text-foreground">{t("subscription.proPlan")}</h3>
+              <p className="text-xs text-muted-foreground">{t("subscription.proAudience")}</p>
+            </div>
+            <div className="mt-4 flex items-baseline gap-1">
+              <span className="text-3xl font-bold text-foreground">
+                ${interval === "monthly" ? PRO_USDT : PRO_YEARLY_USDT}
+              </span>
+              <span className="text-sm text-muted-foreground">
+                {interval === "monthly" ? t("subscription.perMonth") : t("subscription.perYear")}
+              </span>
+            </div>
+            <ul className="mt-5 space-y-3">
+              {[
+                t("subscription.featureTokens", { n: PRO_TOKENS }),
+                t("subscription.featureRebalance30"),
+                t("subscription.featureAnalytics"),
+                t("subscription.featureEmailNotif"),
+                t("subscription.featurePrioritySupport"),
+              ].map((text, i) => (
+                <li key={i} className="flex items-center gap-2 text-sm text-foreground">
+                  <Check className="h-4 w-4 shrink-0 text-primary" />
+                  {text}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-6">
+              <button
+                onClick={() => handleSubscribe("pro", interval)}
+                disabled={!!loading}
+                className="w-full rounded-xl bg-primary py-3 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {loading === (interval === "yearly" ? "pro_yearly" : "pro") ? (
+                  <Loader2 className="mx-auto h-5 w-5 animate-spin" />
+                ) : (
+                  t("subscription.subscribePro")
+                )}
+              </button>
+            </div>
           </div>
-          <div className="mt-4 flex items-baseline gap-1">
-            <span className="text-3xl font-bold text-foreground">${PRO_USDT}</span>
-            <span className="text-sm text-muted-foreground">{t("subscription.perMonth")}</span>
+
+          {/* AI Ultra */}
+          <div className="rounded-2xl border border-border bg-card p-6 shadow-md">
+            <div className="flex items-center gap-2">
+              <Zap className="h-5 w-5 text-muted-foreground" />
+              <h3 className="text-lg font-bold text-foreground">{t("subscription.aiUltraPlan")}</h3>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{t("subscription.aiUltraAudience")}</p>
+            <div className="mt-4 flex items-baseline gap-1">
+              <span className="text-3xl font-bold text-foreground">
+                ${interval === "monthly" ? AI_ULTRA_USDT : AI_ULTRA_YEARLY_USDT}
+              </span>
+              <span className="text-sm text-muted-foreground">
+                {interval === "monthly" ? t("subscription.perMonth") : t("subscription.perYear")}
+              </span>
+            </div>
+            <ul className="mt-5 space-y-3">
+              {[
+                t("subscription.featureTokens", { n: AI_ULTRA_TOKENS }),
+                t("subscription.featureRebalance3"),
+                t("subscription.featureAnalytics"),
+                t("subscription.featureEmailNotif"),
+                t("subscription.featureGemini"),
+                t("subscription.featurePrioritySupport"),
+              ].map((text, i) => (
+                <li key={i} className="flex items-center gap-2 text-sm text-foreground">
+                  <Check className="h-4 w-4 shrink-0 text-primary" />
+                  {text}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-6">
+              <button
+                onClick={() => handleSubscribe("ai_ultra", interval)}
+                disabled={!!loading}
+                className="w-full rounded-xl border-2 border-primary bg-transparent py-3 text-sm font-semibold text-primary hover:bg-primary/10 disabled:opacity-50"
+              >
+                {loading === (interval === "yearly" ? "ai_ultra_yearly" : "ai_ultra") ? (
+                  <Loader2 className="mx-auto h-5 w-5 animate-spin" />
+                ) : (
+                  t("subscription.subscribeAiUltra")
+                )}
+              </button>
+            </div>
           </div>
-          <ul className="mt-5 space-y-3">
-            {[
-              t("subscription.featureTokens", { n: PRO_TOKENS }),
-              t("subscription.featureRebalance30"),
-              t("subscription.featureAnalytics"),
-              t("subscription.featureEmailNotif"),
-              t("subscription.featurePrioritySupport"),
-            ].map((text, i) => (
-              <li key={i} className="flex items-center gap-2 text-sm text-foreground">
-                <Check className="h-4 w-4 shrink-0 text-emerald" />
-                {text}
-              </li>
-            ))}
-          </ul>
-          <div className="mt-6 flex flex-col gap-2">
-            <button
-              onClick={() => handleSubscribe("pro", "monthly")}
-              disabled={!!loading}
-              className="w-full rounded-xl bg-emerald py-3 text-sm font-semibold text-primary-foreground hover:bg-emerald/90 disabled:opacity-50"
-            >
-              {loading === "pro" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribePro") + " (" + t("subscription.monthly") + ")"}
-            </button>
-            <button
-              onClick={() => handleSubscribe("pro", "yearly")}
-              disabled={!!loading}
-              className="w-full rounded-xl border-2 border-emerald bg-transparent py-2.5 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
-            >
-              {loading === "pro_yearly" ? <Loader2 className="mx-auto h-4 w-4 animate-spin" /> : `$${PRO_YEARLY_USDT}/year ${t("subscription.save10")}`}
-            </button>
+
+          {/* Whales */}
+          <div className="rounded-2xl border border-border bg-card p-6 shadow-md">
+            <div className="flex items-center gap-2">
+              <Users className="h-5 w-5 text-muted-foreground" />
+              <h3 className="text-lg font-bold text-foreground">{t("subscription.whalesPlan")}</h3>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{t("subscription.whalesAudience")}</p>
+            <div className="mt-4 flex items-baseline gap-1">
+              <span className="text-3xl font-bold text-foreground">
+                ${interval === "monthly" ? WHALES_USDT : WHALES_YEARLY_USDT}
+              </span>
+              <span className="text-sm text-muted-foreground">
+                {interval === "monthly" ? t("subscription.perMonth") : t("subscription.perYear")}
+              </span>
+            </div>
+            <ul className="mt-5 space-y-3">
+              {[
+                t("subscription.featureTokens", { n: WHALES_TOKENS }),
+                t("subscription.featureRebalance1"),
+                t("subscription.featureAnalytics"),
+                t("subscription.featureEmailNotif"),
+                t("subscription.featureGemini"),
+                t("subscription.featureTerminal"),
+                t("subscription.featurePrioritySupport"),
+              ].map((text, i) => (
+                <li key={i} className="flex items-center gap-2 text-sm text-foreground">
+                  <Check className="h-4 w-4 shrink-0 text-primary" />
+                  {text}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-6">
+              <button
+                onClick={() => handleSubscribe("whales", interval)}
+                disabled={!!loading}
+                className="w-full rounded-xl border-2 border-primary bg-transparent py-3 text-sm font-semibold text-primary hover:bg-primary/10 disabled:opacity-50"
+              >
+                {loading === (interval === "yearly" ? "whales_yearly" : "whales") ? (
+                  <Loader2 className="mx-auto h-5 w-5 animate-spin" />
+                ) : (
+                  t("subscription.subscribeWhales")
+                )}
+              </button>
+            </div>
           </div>
         </div>
 
-        {/* AI Ultra — 60 USDT */}
-        <div className="rounded-2xl border border-border bg-card p-6 shadow-md">
-          <div className="flex items-center gap-2">
-            <Zap className="h-5 w-5 text-muted-foreground" />
-            <h2 className="text-lg font-bold text-foreground">{t("subscription.aiUltraPlan")}</h2>
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">{t("subscription.aiUltraAudience")}</p>
-          <div className="mt-4 flex items-baseline gap-1">
-            <span className="text-3xl font-bold text-foreground">${AI_ULTRA_USDT}</span>
-            <span className="text-sm text-muted-foreground">{t("subscription.perMonth")}</span>
-          </div>
-          <ul className="mt-5 space-y-3">
-            {[
-              t("subscription.featureTokens", { n: AI_ULTRA_TOKENS }),
-              t("subscription.featureRebalance3"),
-              t("subscription.featureAnalytics"),
-              t("subscription.featureEmailNotif"),
-              t("subscription.featureGemini"),
-              t("subscription.featurePrioritySupport"),
-            ].map((text, i) => (
-              <li key={i} className="flex items-center gap-2 text-sm text-foreground">
-                <Check className="h-4 w-4 shrink-0 text-emerald" />
-                {text}
-              </li>
-            ))}
-          </ul>
-          <div className="mt-6 flex flex-col gap-2">
-            <button
-              onClick={() => handleSubscribe("ai_ultra", "monthly")}
-              disabled={!!loading}
-              className="w-full rounded-xl border-2 border-emerald bg-transparent py-3 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
-            >
-              {loading === "ai_ultra" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribeAiUltra") + " (" + t("subscription.monthly") + ")"}
-            </button>
-            <button
-              onClick={() => handleSubscribe("ai_ultra", "yearly")}
-              disabled={!!loading}
-              className="w-full rounded-xl border border-border py-2.5 text-sm font-semibold text-muted-foreground hover:bg-muted/50 disabled:opacity-50"
-            >
-              {loading === "ai_ultra_yearly" ? <Loader2 className="mx-auto h-4 w-4 animate-spin" /> : `$${AI_ULTRA_YEARLY_USDT}/year ${t("subscription.save10")}`}
-            </button>
-          </div>
-        </div>
-
-        {/* Whales AI — 200 USDT */}
-        <div className="rounded-2xl border border-border bg-card p-6 shadow-md">
-          <div className="flex items-center gap-2">
-            <Users className="h-5 w-5 text-muted-foreground" />
-            <h2 className="text-lg font-bold text-foreground">{t("subscription.whalesPlan")}</h2>
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">{t("subscription.whalesAudience")}</p>
-          <div className="mt-4 flex items-baseline gap-1">
-            <span className="text-3xl font-bold text-foreground">${WHALES_USDT}</span>
-            <span className="text-sm text-muted-foreground">{t("subscription.perMonth")}</span>
-          </div>
-          <ul className="mt-5 space-y-3">
-            {[
-              t("subscription.featureTokens", { n: WHALES_TOKENS }),
-              t("subscription.featureRebalance1"),
-              t("subscription.featureAnalytics"),
-              t("subscription.featureEmailNotif"),
-              t("subscription.featureGemini"),
-              t("subscription.featureTerminal"),
-              t("subscription.featurePrioritySupport"),
-            ].map((text, i) => (
-              <li key={i} className="flex items-center gap-2 text-sm text-foreground">
-                <Check className="h-4 w-4 shrink-0 text-emerald" />
-                {text}
-              </li>
-            ))}
-          </ul>
-          <div className="mt-6 flex flex-col gap-2">
-            <button
-              onClick={() => handleSubscribe("whales", "monthly")}
-              disabled={!!loading}
-              className="w-full rounded-xl border-2 border-emerald bg-transparent py-3 text-sm font-semibold text-emerald hover:bg-emerald/10 disabled:opacity-50"
-            >
-              {loading === "whales" ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : t("subscription.subscribeWhales") + " (" + t("subscription.monthly") + ")"}
-            </button>
-            <button
-              onClick={() => handleSubscribe("whales", "yearly")}
-              disabled={!!loading}
-              className="w-full rounded-xl border border-border py-2.5 text-sm font-semibold text-muted-foreground hover:bg-muted/50 disabled:opacity-50"
-            >
-              {loading === "whales_yearly" ? <Loader2 className="mx-auto h-4 w-4 animate-spin" /> : `$${WHALES_YEARLY_USDT}/year ${t("subscription.save10")}`}
-            </button>
+        {/* Feature comparison table */}
+        <div className="mt-8 overflow-hidden rounded-xl border border-border">
+          <p className="border-b border-border bg-muted/30 px-4 py-2 text-xs font-semibold text-foreground">
+            {t("subscription.comparePlans")}
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[320px] text-left text-sm">
+              <thead>
+                <tr className="border-b border-border bg-muted/20">
+                  <th className="px-4 py-2.5 font-medium text-foreground">{t("subscription.featureColumn")}</th>
+                  <th className="px-4 py-2.5 font-medium text-foreground">{t("subscription.proPlan")}</th>
+                  <th className="px-4 py-2.5 font-medium text-foreground">{t("subscription.aiUltraPlan")}</th>
+                  <th className="px-4 py-2.5 font-medium text-foreground">{t("subscription.whalesPlan")}</th>
+                </tr>
+              </thead>
+              <tbody className="text-muted-foreground">
+                <tr className="border-b border-border/50">
+                  <td className="px-4 py-2.5">{t("subscription.featureRebalance")}</td>
+                  <td className="px-4 py-2.5">30 min</td>
+                  <td className="px-4 py-2.5">3 min</td>
+                  <td className="px-4 py-2.5">1 min</td>
+                </tr>
+                <tr className="border-b border-border/50">
+                  <td className="px-4 py-2.5">{t("subscription.featureTokenCredit")}</td>
+                  <td className="px-4 py-2.5">{PRO_TOKENS.toLocaleString()}</td>
+                  <td className="px-4 py-2.5">{AI_ULTRA_TOKENS.toLocaleString()}</td>
+                  <td className="px-4 py-2.5">{WHALES_TOKENS.toLocaleString()}</td>
+                </tr>
+                <tr className="border-b border-border/50">
+                  <td className="px-4 py-2.5">{t("subscription.featureGemini")}</td>
+                  <td className="px-4 py-2.5">—</td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                </tr>
+                <tr className="border-b border-border/50">
+                  <td className="px-4 py-2.5">{t("subscription.featureTerminal")}</td>
+                  <td className="px-4 py-2.5">—</td>
+                  <td className="px-4 py-2.5">—</td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                </tr>
+                <tr>
+                  <td className="px-4 py-2.5">{t("subscription.featurePrioritySupport")}</td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                  <td className="px-4 py-2.5"><Check className="inline h-4 w-4 text-primary" /></td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
 
-      {/* Add tokens: 1 USD = 100 tokens, min $1 */}
+      {/* Pay As You Go */}
       <div className="rounded-xl border border-border bg-card p-5">
-        <h3 className="text-sm font-semibold text-foreground">{t("subscription.addTokens")}</h3>
-        <p className="mt-1 text-xs text-muted-foreground">{t("subscription.addTokensDesc")}</p>
+        <h3 className="text-base font-semibold text-foreground">{t("subscription.addTokens")}</h3>
+        <p className="mt-1 text-sm text-muted-foreground">{t("subscription.addTokensDesc")}</p>
+        <div className="mt-4 flex flex-wrap gap-2">
+          {PRESET_USD.map((amount) => (
+            <button
+              key={amount}
+              type="button"
+              onClick={() => {
+                addTokenAmount(amount)
+                setDepositMessage(null)
+              }}
+              className={`rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
+                addTokensUsd === String(amount)
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border bg-background text-foreground hover:bg-muted/50"
+              }`}
+            >
+              ${amount}
+            </button>
+          ))}
+        </div>
         <div className="mt-4 flex flex-wrap items-end gap-3">
           <div className="flex-1 min-w-[120px]">
             <label className="mb-1 block text-xs text-muted-foreground">{t("subscription.amountUsd")}</label>
@@ -415,45 +533,70 @@ export function Subscription() {
               placeholder="10"
             />
           </div>
-          <label className="flex items-center gap-2 text-xs text-muted-foreground">
-            <input type="checkbox" checked={bypassPayment} onChange={(e) => setBypassPayment(e.target.checked)} />
-            Bypass payment (dev)
-          </label>
+          {SHOW_DEV_BILLING && (
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input type="checkbox" checked={bypassPayment} onChange={(e) => setBypassPayment(e.target.checked)} />
+              {t("subscription.bypassPaymentDev")}
+            </label>
+          )}
           <button
             onClick={handlePurchaseTokens}
             disabled={loadingTokens}
-            className="rounded-lg bg-emerald px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-emerald/90 disabled:opacity-50"
+            className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {loadingTokens ? (
               <>
                 <Loader2 className="mr-1.5 inline h-4 w-4 animate-spin" />
-                Calculating tokens...
+                {t("subscription.calculatingTokens")}
               </>
             ) : (
               t("subscription.purchaseTokens")
             )}
           </button>
         </div>
-        {addTokensUsd && Number(addTokensUsd) >= 1 && !loadingTokens && (
-          <p className="mt-2 text-xs text-muted-foreground">
-            You get {Math.floor(Number(addTokensUsd) * 100)} tokens (1 USD = 100 tokens)
+        {previewTokens > 0 && (
+          <p className="mt-2 text-sm text-muted-foreground">
+            {t("subscription.addTokensPreview", { n: previewTokens })}
           </p>
         )}
         {depositMessage && (
           <p
-            className={`mt-2 text-sm ${depositMessage.type === "success" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}`}
+            className={`mt-2 text-sm ${depositMessage.type === "success" ? "text-primary" : "text-destructive"}`}
           >
             {depositMessage.text}
           </p>
         )}
       </div>
 
-      <div className="rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground">
-        <p>{t("subscription.terms")}</p>
-        <ul className="mt-2 list-inside list-disc space-y-0.5">
+      {/* Trust footer */}
+      <div className="rounded-xl border border-border bg-muted/30 px-4 py-4">
+        <p className="text-xs text-muted-foreground">{t("subscription.terms")}</p>
+        <ul className="mt-2 list-inside list-disc space-y-0.5 text-xs text-muted-foreground">
           <li>{t("subscription.cancelAnytime")}</li>
           <li>{t("subscription.securePayment")}</li>
         </ul>
+
+        {/* FAQ accordion */}
+        <div className="mt-4 border-t border-border pt-4">
+          <p className="mb-2 text-xs font-semibold text-foreground">{t("subscription.faqTitle")}</p>
+          {[
+            { id: "deduct", q: t("subscription.faqDeduct"), a: t("subscription.faqDeductA") },
+            { id: "refresh", q: t("subscription.faqRefresh"), a: t("subscription.faqRefreshA") },
+            { id: "refund", q: t("subscription.faqRefund"), a: t("subscription.faqRefundA") },
+          ].map((faq) => (
+            <div key={faq.id} className="border-b border-border/50 last:border-b-0">
+              <button
+                type="button"
+                onClick={() => setFaqOpen(faqOpen === faq.id ? null : faq.id)}
+                className="flex w-full items-center justify-between py-2 text-left text-xs font-medium text-foreground"
+              >
+                {faq.q}
+                {faqOpen === faq.id ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              </button>
+              {faqOpen === faq.id && <p className="pb-2 text-xs text-muted-foreground">{faq.a}</p>}
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )

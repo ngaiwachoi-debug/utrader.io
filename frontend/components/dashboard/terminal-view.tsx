@@ -1,12 +1,14 @@
 "use client"
 
-import { useEffect, useState, useRef } from "react"
+import { useEffect, useState, useRef, useCallback } from "react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useBotStatus } from "@/lib/bot-status-context"
 import { getBackendToken } from "@/lib/auth"
-import { Terminal, ChevronDown, ChevronRight } from "lucide-react"
+import { Terminal, ChevronDown, ChevronRight, Copy, ArrowDown } from "lucide-react"
 import { BotStatusBar } from "@/components/dashboard/bot-status-bar"
+
+const SCROLL_THRESHOLD_PX = 50
 
 type TerminalSummary = {
   strategy?: string
@@ -48,7 +50,11 @@ export function TerminalView() {
   const [planTier, setPlanTier] = useState<string>("trial")
   const [pollIntervalMs, setPollIntervalMs] = useState(FIRST_5_MIN_POLL_MS)
   const [checksOpen, setChecksOpen] = useState(false)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+  const [copyFeedback, setCopyFeedback] = useState(false)
   const botStartedAt = useRef<number>(0)
+  const logContainerRef = useRef<HTMLPreElement | null>(null)
+  const userHasScrolledUp = useRef(false)
 
   // Fetch user-status for plan_tier when tab mounts
   useEffect(() => {
@@ -101,6 +107,49 @@ export function TerminalView() {
     return () => clearInterval(interval)
   }, [userId, pollIntervalMs])
 
+  const handleLogScroll = useCallback(() => {
+    const el = logContainerRef.current
+    if (!el) return
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_THRESHOLD_PX
+    if (atBottom) {
+      userHasScrolledUp.current = false
+      setShowScrollToBottom(false)
+    } else {
+      userHasScrolledUp.current = true
+      setShowScrollToBottom(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!userHasScrolledUp.current && logContainerRef.current) {
+      const el = logContainerRef.current
+      const run = () => {
+        el.scrollTop = el.scrollHeight
+      }
+      requestAnimationFrame(run)
+    }
+  }, [logLines])
+
+  const scrollToBottom = useCallback(() => {
+    const el = logContainerRef.current
+    if (el) {
+      el.scrollTop = el.scrollHeight
+      userHasScrolledUp.current = false
+      setShowScrollToBottom(false)
+    }
+  }, [])
+
+  const handleCopyLog = useCallback(async () => {
+    const text = logLines.length > 0 ? logLines.join("\n") : t("dashboard.terminalPlaceholder")
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopyFeedback(true)
+      setTimeout(() => setCopyFeedback(false), 2000)
+    } catch {
+      setCopyFeedback(false)
+    }
+  }, [logLines, t])
+
   if (userId == null) {
     return (
       <div className="flex flex-col gap-6">
@@ -134,7 +183,7 @@ export function TerminalView() {
     : []
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col flex-1 min-h-0 gap-6 min-h-[calc(100vh-12rem)]">
       <BotStatusBar title={t("sidebar.terminal")} />
       <p className="text-sm text-muted-foreground -mt-2">{t("dashboard.terminalDesc")}</p>
 
@@ -192,13 +241,43 @@ export function TerminalView() {
         </div>
       )}
 
-      {/* Recent activity (log lines) */}
-      <div className="rounded-xl border border-border bg-card font-mono text-sm">
-        <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2">
-          <Terminal className="h-4 w-4 text-muted-foreground" />
-          <span className="text-muted-foreground">Recent activity (cached, refresh every {pollIntervalMs >= 60000 ? `${pollIntervalMs / 60000}m` : `${pollIntervalMs / 1000}s`})</span>
+      {/* Recent activity (log lines) – fills remaining space */}
+      <div className="rounded-xl border border-border bg-card font-mono text-sm flex flex-col flex-1 min-h-0">
+        <div className="flex items-center justify-between gap-2 border-b border-border bg-muted/50 px-4 py-2 flex-shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <Terminal className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+            <span className="text-muted-foreground text-xs truncate">
+              Recent activity (cached, refresh every {pollIntervalMs >= 60000 ? `${pollIntervalMs / 60000}m` : `${pollIntervalMs / 1000}s`})
+            </span>
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button
+              type="button"
+              onClick={handleCopyLog}
+              className="rounded-md border border-border bg-background px-2 py-1.5 text-xs font-medium text-foreground hover:bg-muted transition-colors inline-flex items-center gap-1.5"
+            >
+              <Copy className="h-3.5 w-3.5" />
+              {copyFeedback ? t("dashboard.terminalCopied") : t("dashboard.terminalCopy")}
+            </button>
+            {showScrollToBottom && (
+              <button
+                type="button"
+                onClick={scrollToBottom}
+                className="rounded-md border border-border bg-background px-2 py-1.5 text-xs font-medium text-foreground hover:bg-muted transition-colors inline-flex items-center gap-1.5"
+              >
+                <ArrowDown className="h-3.5 w-3.5" />
+                {t("dashboard.terminalScrollToBottom")}
+              </button>
+            )}
+          </div>
         </div>
-        <pre className="overflow-auto p-4 min-h-[200px] max-h-[400px] text-muted-foreground whitespace-pre-wrap">
+        <pre
+          ref={logContainerRef}
+          onScroll={handleLogScroll}
+          role="log"
+          aria-label="Trading terminal output"
+          className="flex-1 min-h-[200px] overflow-auto p-4 text-muted-foreground whitespace-pre-wrap leading-relaxed"
+        >
           {terminalContent}
         </pre>
       </div>

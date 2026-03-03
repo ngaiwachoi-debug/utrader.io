@@ -43,7 +43,7 @@ BOTSTAT=$(curl -s -H "Authorization: Bearer $TOKEN" "$API_BASE/bot-stats/$USER_I
 echo "$BOTSTAT" | grep -q '"active":false' && pass "Bot not started after invalid keys" || fail "Invalid keys" "bot should not be active"
 
 echo "6. Manual start"
-START=$(curl -s -X POST "$API_BASE/start-bot/$USER_ID" -H "Content-Type: application/json")
+START=$(curl -s -X POST "$API_BASE/start-bot/$USER_ID" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN")
 echo "$START" | grep -qE "queued|running|success" && pass "Start accepted" || fail "Start" "$START"
 
 echo "7. Poll until active"
@@ -60,14 +60,14 @@ LOGS=$(curl -s -H "Authorization: Bearer $TOKEN" "$API_BASE/terminal-logs/$USER_
 echo "$LOGS" | grep -q '"lines"' && pass "terminal-logs OK" || fail "Terminal logs" "no lines"
 
 echo "9. Stop bot"
-STOP=$(curl -s -X POST "$API_BASE/stop-bot/$USER_ID" -H "Content-Type: application/json")
+STOP=$(curl -s -X POST "$API_BASE/stop-bot/$USER_ID" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN")
 echo "$STOP" | grep -qE "success|Shutdown" && pass "Stop accepted" || fail "Stop" "$STOP"
 sleep 3
 BOTSTAT=$(curl -s -H "Authorization: Bearer $TOKEN" "$API_BASE/bot-stats/$USER_ID")
 echo "$BOTSTAT" | grep -q '"active":false' && pass "Bot stopped" || fail "Stopped" "still active"
 
 echo "10. Start again"
-curl -s -X POST "$API_BASE/start-bot/$USER_ID" -H "Content-Type: application/json" | grep -qE "queued|running|success" && pass "Start again" || fail "Start again" "response"
+curl -s -X POST "$API_BASE/start-bot/$USER_ID" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" | grep -qE "queued|running|success" && pass "Start again" || fail "Start again" "response"
 ACTIVE="false"
 for _ in $(seq 1 $((WAIT_START/POLL))); do
   sleep $POLL

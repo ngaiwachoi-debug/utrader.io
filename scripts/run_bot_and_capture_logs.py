@@ -1,11 +1,14 @@
 """
 Start the bot for user 2 via API, wait for worker to run, then read terminal_logs from Redis
 to see the actual reason the worker reports. Requires: backend running, worker running, REDIS_URL in .env.
+
+Start by user_id requires auth. Set ADMIN_TOKEN (admin JWT) or NEXTAUTH_SECRET in env.
 Usage: python scripts/run_bot_and_capture_logs.py [user_id]
 """
 import asyncio
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,13 +21,50 @@ except ImportError:
 
 USER_ID = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "").strip()
 WAIT_SEC = 12
+
+
+def _start_bot_headers():
+    """Return (url, headers) for starting bot for USER_ID."""
+    if ADMIN_TOKEN:
+        return f"{API_BASE}/admin/bot/start/{USER_ID}", {"Authorization": f"Bearer {ADMIN_TOKEN}", "Content-Type": "application/json"}
+    if NEXTAUTH_SECRET:
+        try:
+            import jwt as pyjwt
+            from database import SessionLocal
+            import models
+            db = SessionLocal()
+            try:
+                user = db.query(models.User).filter(models.User.id == USER_ID).first()
+                if not user:
+                    return None, None
+                now = int(time.time())
+                token = pyjwt.encode(
+                    {"email": user.email or "", "sub": str(user.id), "iat": now, "exp": now + 3600},
+                    NEXTAUTH_SECRET,
+                    algorithm="HS256",
+                )
+                if hasattr(token, "decode"):
+                    token = token.decode("utf-8")
+                return f"{API_BASE}/start-bot/{USER_ID}", {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            finally:
+                db.close()
+        except Exception:
+            return None, None
+    return None, None
 
 
 async def main_async():
     import requests
     from arq import create_pool
     from arq.connections import RedisSettings
+
+    url, headers = _start_bot_headers()
+    if not url or not headers:
+        print("Set ADMIN_TOKEN or NEXTAUTH_SECRET to start bot by user_id.")
+        return 1
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
     if not redis_url:
@@ -45,9 +85,9 @@ async def main_async():
     except Exception as e:
         print(f"   (Could not clear: {e})")
 
-    print(f"\n1. POST {API_BASE}/start-bot/{USER_ID} ...")
+    print(f"\n1. POST {url} ...")
     try:
-        r = requests.post(f"{API_BASE}/start-bot/{USER_ID}", timeout=15)
+        r = requests.post(url, headers=headers, timeout=15)
     except Exception as e:
         print(f"   Request failed: {e}")
         print("   Is the backend running? (uvicorn main:app --port 8000)")
@@ -62,6 +102,11 @@ async def main_async():
         try: await pool.aclose()
         except Exception: pass
         return 0
+    if r.status_code == 401:
+        print("   -> Auth required. Set ADMIN_TOKEN or NEXTAUTH_SECRET.")
+        try: await pool.aclose()
+        except Exception: pass
+        return 1
     if r.status_code == 404:
         print("   -> User or API keys not found.")
         try: await pool.aclose()

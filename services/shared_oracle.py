@@ -18,6 +18,9 @@ TICKERS_URL = "https://api.bitfinex.com/v2/tickers"
 ORACLE_SNAPSHOT_KEY = "oracle:snapshot"
 ORACLE_SNAPSHOT_TTL_SEC = 120
 ORACLE_LOOP_INTERVAL_SEC = 60
+# Strategy B: 24h rolling median of FRR (1 sample/min → 1440 samples)
+ORACLE_FRR_HISTORY_LEN = 1440
+ORACLE_FRR_MEDIAN_MIN_SAMPLES = 60
 # Default baseline when data/iqm_baselines.json is missing (e.g. before bootstrap).
 DEFAULT_BTC_VOL_BASELINE = 3500.0
 IQM_BASELINES_PATH = Path(__file__).resolve().parent.parent / "data" / "iqm_baselines.json"
@@ -64,6 +67,15 @@ def _regime_from_v_sigma(v_sigma: float) -> str:
     return "NEUTRAL"
 
 
+def _median(values: list[float]) -> float | None:
+    """Return median of non-empty list; None if empty."""
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    return (s[n // 2] + s[(n - 1) // 2]) / 2.0
+
+
 class GlobalMarketOracle:
     """
     Runs once for the entire server. Fetches public data to save API limits.
@@ -73,6 +85,7 @@ class GlobalMarketOracle:
         self.redis = redis_pool
         self.btc_v_sigma = 1.0
         self.frr_rates: dict[str, float] = {}
+        self.frr_24h_median: dict[str, float] = {}
         self.regime = "NEUTRAL"
         self.BTC_VOL_BASELINE = DEFAULT_BTC_VOL_BASELINE
         if IQM_BASELINES_PATH.exists():
@@ -105,6 +118,7 @@ class GlobalMarketOracle:
             "btc_v_sigma": self.btc_v_sigma,
             "regime": self.regime,
             "frr": self.frr_rates,
+            "frr_24h_median": self.frr_24h_median,
             "ts": ts_ms,
         }
         try:
@@ -113,12 +127,35 @@ class GlobalMarketOracle:
         except Exception as e:
             logger.warning("Oracle Redis set failed: %s", e)
 
+    async def _update_frr_24h_median(self) -> None:
+        """Append current FRR to Redis history per symbol; compute 24h rolling median."""
+        self.frr_24h_median = {}
+        for sym, rate in self.frr_rates.items():
+            key = f"oracle:frr_history:{sym}"
+            try:
+                await self.redis.rpush(key, str(rate))
+                await self.redis.ltrim(key, -ORACLE_FRR_HISTORY_LEN, -1)
+                raw_list = await self.redis.lrange(key, 0, -1)
+                vals = []
+                for s in raw_list or []:
+                    try:
+                        vals.append(float(s))
+                    except (TypeError, ValueError):
+                        continue
+                if len(vals) >= ORACLE_FRR_MEDIAN_MIN_SAMPLES:
+                    med = _median(vals)
+                    if med is not None:
+                        self.frr_24h_median[sym] = med
+            except Exception as e:
+                logger.warning("Oracle FRR history/median failed for %s: %s", sym, e)
+
     async def run_forever(self) -> None:
         while True:
             try:
                 frr_rates, btc_volume = await self._fetch_tickers()
                 if frr_rates:
                     self.frr_rates = frr_rates
+                    await self._update_frr_24h_median()
                 self.btc_v_sigma = _compute_v_sigma(btc_volume, self.BTC_VOL_BASELINE)
                 self.regime = _regime_from_v_sigma(self.btc_v_sigma)
                 await self._write_snapshot()

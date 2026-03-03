@@ -11,7 +11,9 @@ try:
     load_dotenv(os.path.join(_root_dir, ".env"))
 except ImportError:
     pass
+import random
 import re
+import string
 import secrets
 import threading
 from typing import Any, Dict, List, Optional
@@ -39,7 +41,7 @@ import security
 from utils.logging import generate_trace_id, get_trace_id, set_trace_id
 from services.bitfinex_service import BitfinexManager, hash_bitfinex_id
 from services import bitfinex_cache
-from services.daily_token_deduction import run_daily_token_deduction
+from services.daily_token_deduction import run_daily_token_deduction, run_deduction_for_user_for_date
 from services import ledger_cache as ledger_cache_svc
 from services import token_ledger_service as token_ledger_svc
 from services.referral_rewards import apply_referral_rewards_on_purchase
@@ -248,7 +250,10 @@ async def _run_09_00_ledger_cache_scheduler() -> None:
                 try:
                     keys = vault.get_keys()
                     mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
-                    entries, _, fetch_err = await _fetch_all_margin_funding_entries(mgr)
+                    ledger_currencies = await _get_ledger_currencies_for_user(mgr)
+                    if not ledger_currencies:
+                        ledger_currencies = list(LEDGER_FUNDING_CURRENCIES)
+                    entries, _, fetch_err = await _fetch_all_margin_funding_entries(mgr, currencies=ledger_currencies)
                     if fetch_err and not entries:
                         logger.warning("09:00 UTC: Invalid API key for %s – alert sent", email)
                         await _alert_admins_deduction_failure(
@@ -378,11 +383,103 @@ async def _run_daily_gross_profit_scheduler() -> None:
                     )
                 finally:
                     db.close()
+        # Refresh ranking and referral gain snapshots once per day (after 10:00 profit calculation)
+        db_rank = database.SessionLocal()
+        try:
+            _refresh_ranking_snapshot(db_rank)
+            _refresh_referral_gain_snapshot(db_rank)
+        finally:
+            db_rank.close()
 
 
 def _get_next_1030_utc_wait_sec() -> float:
     """Seconds until next 10:30 UTC (deduction uses stored snapshot only, no API call)."""
     return _get_next_utc_wait_sec(DAILY_DEDUCTION_UTC_HOUR, DAILY_DEDUCTION_UTC_MINUTE)
+
+
+def _random_gmail_display(rng: random.Random) -> str:
+    """Name-based Gmail style: e.g. alanfhs103@gmail.com (all lowercase, ends with @gmail.com)."""
+    name_len = rng.randint(4, 9)
+    name_part = "".join(rng.choices(string.ascii_lowercase, k=name_len))
+    suffix_len = rng.randint(3, 6)
+    suffix = "".join(rng.choices(string.ascii_lowercase + string.digits, k=suffix_len))
+    return f"{name_part}{suffix}@gmail.com"
+
+
+def _refresh_ranking_snapshot(db: Session) -> None:
+    """
+    Generate top 100 fake ranking (yield 15–32%), replace ranking_snapshot.
+    user_display = name-based Gmail (e.g. alanfhs103@gmail.com). All @gmail.com.
+    Called once per day after 10:00 UTC profit calculation; also on startup if table empty.
+    """
+    try:
+        today = date.today()
+        seed = today.year * 10000 + today.month * 100 + today.day
+        rng = random.Random(seed)
+        seen_emails: set[str] = set()
+        rows = []
+        for i in range(100):
+            while True:
+                user_display = _random_gmail_display(rng)
+                if user_display not in seen_emails:
+                    seen_emails.add(user_display)
+                    break
+            rows.append({
+                "user_display": user_display,
+                "yield_pct": round(15 + rng.uniform(0, 17), 2),
+                "lent_usd": round(1000 + rng.uniform(0, 99000), 2),
+            })
+        rows.sort(key=lambda x: x["yield_pct"], reverse=True)
+        db.query(models.RankingSnapshot).delete()
+        for r, row in enumerate(rows, start=1):
+            db.add(models.RankingSnapshot(
+                rank=r,
+                user_display=row["user_display"],
+                yield_pct=row["yield_pct"],
+                lent_usd=row["lent_usd"],
+            ))
+        db.commit()
+        logger.info("ranking_snapshot refreshed: 100 rows (seed=%s)", seed)
+    except Exception as e:
+        db.rollback()
+        logger.warning("_refresh_ranking_snapshot failed: %s", e)
+
+
+def _refresh_referral_gain_snapshot(db: Session) -> None:
+    """
+    Generate top 100 fake referral gain (usdt_gain_daily 500–10000), replace referral_gain_snapshot.
+    user_display = same Gmail-style as ranking. Called once per day after 10:00 UTC profit calculation;
+    also on startup if table empty.
+    """
+    try:
+        today = date.today()
+        seed = today.year * 10000 + today.month * 100 + today.day
+        rng = random.Random(seed)
+        seen_emails: set[str] = set()
+        rows = []
+        for i in range(100):
+            while True:
+                user_display = _random_gmail_display(rng)
+                if user_display not in seen_emails:
+                    seen_emails.add(user_display)
+                    break
+            rows.append({
+                "user_display": user_display,
+                "usdt_gain_daily": round(500 + rng.uniform(0, 9500), 2),
+            })
+        rows.sort(key=lambda x: x["usdt_gain_daily"], reverse=True)
+        db.query(models.ReferralGainSnapshot).delete()
+        for r, row in enumerate(rows, start=1):
+            db.add(models.ReferralGainSnapshot(
+                rank=r,
+                user_display=row["user_display"],
+                usdt_gain_daily=row["usdt_gain_daily"],
+            ))
+        db.commit()
+        logger.info("referral_gain_snapshot refreshed: 100 rows (seed=%s)", seed)
+    except Exception as e:
+        db.rollback()
+        logger.warning("_refresh_referral_gain_snapshot failed: %s", e)
 
 
 def _is_deduction_processed(db: Session, user_id: int, date_utc: date) -> bool:
@@ -516,8 +613,10 @@ async def _apply_09_00_cache_before_deduction(db: Session, redis: Any) -> None:
         if not entries:
             continue
         start_ms = start_ms or 0
-        gross, fees = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms)
-        daily_gross, _ = _gross_and_fees_from_ledger_entries(entries, start_ms=start_today_ms, end_ms=end_today_ms)
+        currencies_in_entries = {str(e[1]).strip() for e in entries if isinstance(e, (list, tuple)) and len(e) > 1 and e[1]}
+        usd_prices = _fetch_ticker_prices(currencies_in_entries) if currencies_in_entries else {}
+        gross, fees = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms, usd_prices=usd_prices)
+        daily_gross, _ = _gross_and_fees_from_ledger_entries(entries, start_ms=start_today_ms, end_ms=end_today_ms, usd_prices=usd_prices)
         snap.gross_profit_usd = round(gross, 2)
         snap.net_profit_usd = round(gross - fees, 2)
         snap.bitfinex_fee_usd = round(fees, 2)
@@ -538,7 +637,10 @@ async def _apply_09_00_cache_before_deduction(db: Session, redis: Any) -> None:
 
 
 async def _run_daily_token_deduction_scheduler() -> None:
-    """At 10:30 UTC daily, deduct tokens by daily_gross_profit_usd from stored snapshot only (no Bitfinex API call)."""
+    """
+    At 10:30 UTC daily: final fetch for users still without daily_gross (Bitfinex data can be late until 10:30),
+    then 09:00 cache fill, then deduction. Deduction uses stored snapshot only after this.
+    """
     while True:
         wait_sec = _get_next_1030_utc_wait_sec()
         set_trace_id(generate_trace_id())
@@ -548,11 +650,48 @@ async def _run_daily_token_deduction_scheduler() -> None:
         for attempt in range(DEDUCTION_MAX_RETRIES):
             db = database.SessionLocal()
             try:
+                # Final fetch for users still with daily_gross 0/None (Bitfinex can release data late until 10:30).
+                try:
+                    user_ids_with_vault = [
+                        row[0]
+                        for row in db.query(models.User.id)
+                        .join(models.APIVault, models.User.id == models.APIVault.user_id)
+                        .distinct()
+                        .all()
+                    ]
+                    test_uid = _get_scheduler_test_user_id()
+                    if test_uid is not None:
+                        user_ids_with_vault = [u for u in user_ids_with_vault if u == test_uid]
+                    need_fetch: List[int] = []
+                    for uid in user_ids_with_vault:
+                        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                        if snap is None:
+                            need_fetch.append(uid)
+                        else:
+                            dg = getattr(snap, "daily_gross_profit_usd", None)
+                            if dg is None or (isinstance(dg, (int, float)) and float(dg) == 0):
+                                need_fetch.append(uid)
+                    if need_fetch:
+                        logger.info("trace_id=%s | 10:30 UTC final fetch for %s user(s) without daily_gross", get_trace_id(), len(need_fetch))
+                        for i, uid in enumerate(need_fetch):
+                            if i > 0:
+                                await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
+                            db_u = database.SessionLocal()
+                            try:
+                                success, _, _ = await _daily_10_00_fetch_and_save(uid, db_u, accept_fresh_data=True)
+                                if success:
+                                    logger.info("trace_id=%s | 10:30 final fetch user_id=%s success", get_trace_id(), uid)
+                            finally:
+                                db_u.close()
+                except Exception as e:
+                    logger.warning("10:30 pre-deduction final fetch: %s", e)
                 try:
                     redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
                     await _apply_09_00_cache_before_deduction(db, redis)
                 except Exception as e:
                     logger.warning("09:00 cache fallback before deduction: %s", e)
+                # Expire so we see snapshot after final fetch (db_u commits); same safety as manual trigger.
+                db.expire_all()
                 log_entries, err = run_daily_token_deduction(db)
                 if err:
                     last_error = err
@@ -883,6 +1022,20 @@ async def lifespan(app: FastAPI):
             db.close()
     except Exception as e:
         logger.warning("Startup check user_profit_snapshot failed: %s", e)
+    # Seed ranking_snapshot and referral_gain_snapshot if empty (so leaderboard has data before first 10:00 UTC run)
+    try:
+        db = database.SessionLocal()
+        try:
+            n = db.query(models.RankingSnapshot).count()
+            if n == 0:
+                _refresh_ranking_snapshot(db)
+            n_ref = db.query(models.ReferralGainSnapshot).count()
+            if n_ref == 0:
+                _refresh_referral_gain_snapshot(db)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("Startup ranking/referral_gain snapshot seed failed: %s", e)
     # 09:00 UTC ledger cache; 10:00 API fetch; 10:30 deduction; 11:15 catch-up; 12:00 late fee; 23:00 reconciliation
     ledger_cache_task = asyncio.create_task(_run_09_00_ledger_cache_scheduler())
     scheduler_task = asyncio.create_task(_run_daily_gross_profit_scheduler())
@@ -1294,6 +1447,77 @@ async def _token_balance_rate_limit(user_id: int) -> None:
         times.append(now)
 
 
+# Rate limit for start-bot / stop-bot: 10 actions per minute per user (prevents spam/abuse)
+_bot_action_rl: Dict[int, List[float]] = {}
+_bot_action_rl_lock = asyncio.Lock()
+BOT_ACTION_RL_MAX = 10
+BOT_ACTION_RL_WINDOW_SEC = 60.0
+
+# Per-action cooldown: min time between start or stop (reduces accidental/abuse toggling)
+_bot_last_start_ts: Dict[int, float] = {}
+_bot_last_stop_ts: Dict[int, float] = {}
+BOT_START_COOLDOWN_SEC = 30.0
+BOT_STOP_COOLDOWN_SEC = 15.0
+
+
+async def _bot_action_rate_limit(user_id: int) -> None:
+    """Raise 429 if user exceeds 10 start/stop bot requests per minute."""
+    import time as _time
+    now = _time.monotonic()
+    async with _bot_action_rl_lock:
+        if user_id not in _bot_action_rl:
+            _bot_action_rl[user_id] = []
+        times = _bot_action_rl[user_id]
+        cutoff = now - BOT_ACTION_RL_WINDOW_SEC
+        times[:] = [t for t in times if t > cutoff]
+        if len(times) >= BOT_ACTION_RL_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many start/stop requests. Please wait a minute.",
+            )
+        times.append(now)
+
+
+async def _check_start_cooldown(user_id: int) -> None:
+    """Raise 429 if user started the bot too recently."""
+    import time as _time
+    now = _time.monotonic()
+    async with _bot_action_rl_lock:
+        last = _bot_last_start_ts.get(user_id, 0.0)
+        if last > 0 and (now - last) < BOT_START_COOLDOWN_SEC:
+            wait = int(BOT_START_COOLDOWN_SEC - (now - last))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait} seconds before starting the bot again.",
+            )
+
+
+async def _check_stop_cooldown(user_id: int) -> None:
+    """Raise 429 if user stopped the bot too recently."""
+    import time as _time
+    now = _time.monotonic()
+    async with _bot_action_rl_lock:
+        last = _bot_last_stop_ts.get(user_id, 0.0)
+        if last > 0 and (now - last) < BOT_STOP_COOLDOWN_SEC:
+            wait = int(BOT_STOP_COOLDOWN_SEC - (now - last))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait} seconds before stopping the bot again.",
+            )
+
+
+async def _record_start_success(user_id: int) -> None:
+    import time as _time
+    async with _bot_action_rl_lock:
+        _bot_last_start_ts[user_id] = _time.monotonic()
+
+
+async def _record_stop_success(user_id: int) -> None:
+    import time as _time
+    async with _bot_action_rl_lock:
+        _bot_last_stop_ts[user_id] = _time.monotonic()
+
+
 class AdminUserOut(BaseModel):
     id: int
     email: str
@@ -1395,6 +1619,40 @@ class WithdrawalRow(BaseModel):
     processed_at: Optional[str] = None
     processed_by: Optional[str] = None
     rejection_note: Optional[str] = None
+
+
+class RankingRow(BaseModel):
+    rank: int
+    user_display: str
+    yield_pct: float
+    lent_usd: Optional[float] = None
+
+
+class RankingSummary(BaseModel):
+    total_paid_out_usd: float
+    total_payouts: int
+    active_traders: int
+
+
+class RankingResponse(BaseModel):
+    items: List[RankingRow]
+    total: int
+    page: int
+    per_page: int
+    summary: Optional[RankingSummary] = None
+
+
+class ReferralGainRow(BaseModel):
+    rank: int
+    user_display: str
+    usdt_gain_daily: float
+
+
+class ReferralGainResponse(BaseModel):
+    items: List[ReferralGainRow]
+    total: int
+    page: int
+    per_page: int
 
 
 class ReferralRow(BaseModel):
@@ -1627,6 +1885,90 @@ async def connect_exchange(
 async def api_version():
     """No-auth endpoint to verify which backend is running (gross-profit DB fallback support)."""
     return {"version": "gross-profit-db-fallback", "source_db_supported": True}
+
+
+@app.get("/api/ranking", response_model=RankingResponse)
+def get_ranking(
+    page: int = Query(1, ge=1, le=10, description="Page 1–10"),
+    per_page: int = Query(10, ge=1, le=10, description="Items per page"),
+    db: Session = Depends(database.get_db),
+):
+    """Top 100 leaderboard (fake data). Refreshed daily after 10:00 UTC profit run. Paginated: 10 pages × 10 per page."""
+    total = db.query(models.RankingSnapshot).count()
+    offset = (page - 1) * per_page
+    rows = (
+        db.query(models.RankingSnapshot)
+        .order_by(models.RankingSnapshot.rank)
+        .offset(offset)
+        .limit(per_page)
+        .all()
+    )
+    summary = None
+    if total > 0:
+        total_paid_row = db.execute(
+            text("SELECT COALESCE(SUM(COALESCE(lent_usd,0) * yield_pct / 100.0), 0) FROM ranking_snapshot")
+        ).scalar()
+        total_paid_out_usd = float(total_paid_row) if total_paid_row is not None else 0.0
+        summary = RankingSummary(
+            total_paid_out_usd=round(total_paid_out_usd, 2),
+            total_payouts=total,
+            active_traders=total,
+        )
+    return RankingResponse(
+        items=[
+            RankingRow(rank=r.rank, user_display=r.user_display, yield_pct=r.yield_pct, lent_usd=r.lent_usd)
+            for r in rows
+        ],
+        total=total,
+        page=page,
+        per_page=per_page,
+        summary=summary,
+    )
+
+
+@app.post("/api/ranking/refresh")
+def refresh_ranking_api(db: Session = Depends(database.get_db)):
+    """Dev-only: regenerate top 100 fake ranking (same as daily run after 10:00 UTC profit). Set ALLOW_DEV_CONNECT=1."""
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    _refresh_ranking_snapshot(db)
+    return {"status": "ok", "message": "ranking_snapshot refreshed (100 fake rows)."}
+
+
+@app.get("/api/referral-gain", response_model=ReferralGainResponse)
+def get_referral_gain(
+    page: int = Query(1, ge=1, le=10, description="Page 1–10"),
+    per_page: int = Query(10, ge=1, le=10, description="Items per page"),
+    db: Session = Depends(database.get_db),
+):
+    """Top 100 referral gain (fake data). Refreshed daily after 10:00 UTC profit run. Paginated: 10 pages × 10 per page."""
+    total = db.query(models.ReferralGainSnapshot).count()
+    offset = (page - 1) * per_page
+    rows = (
+        db.query(models.ReferralGainSnapshot)
+        .order_by(models.ReferralGainSnapshot.rank)
+        .offset(offset)
+        .limit(per_page)
+        .all()
+    )
+    return ReferralGainResponse(
+        items=[
+            ReferralGainRow(rank=r.rank, user_display=r.user_display, usdt_gain_daily=r.usdt_gain_daily)
+            for r in rows
+        ],
+        total=total,
+        page=page,
+        per_page=per_page,
+    )
+
+
+@app.post("/api/referral-gain/refresh")
+def refresh_referral_gain_api(db: Session = Depends(database.get_db)):
+    """Dev-only: regenerate top 100 fake referral gain (same as daily run after 10:00 UTC profit). Set ALLOW_DEV_CONNECT=1."""
+    if os.getenv("ALLOW_DEV_CONNECT") != "1":
+        raise HTTPException(status_code=404, detail="Not available.")
+    _refresh_referral_gain_snapshot(db)
+    return {"status": "ok", "message": "referral_gain_snapshot refreshed (100 fake rows)."}
 
 
 @app.get("/api/me")
@@ -2316,6 +2658,9 @@ async def start_bot(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
+    await _bot_action_rate_limit(current_user.id)
+    await _check_start_cooldown(current_user.id)
+    await _record_start_success(current_user.id)  # record so next start is cooldown-limited
     # Plan C: set desired state first
     if hasattr(current_user, "bot_desired_state"):
         current_user.bot_desired_state = "running"
@@ -2364,6 +2709,9 @@ async def stop_bot(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
+    await _bot_action_rate_limit(current_user.id)
+    await _check_stop_cooldown(current_user.id)
+    await _record_stop_success(current_user.id)  # record so next stop is cooldown-limited
     from arq.jobs import Job
     status_before = getattr(current_user, "bot_status", None) or "stopped"
     # Plan C: DB first so UI never stuck on "starting" if job aborted before start
@@ -2405,8 +2753,16 @@ async def stop_bot(
 
 
 # Legacy-style control endpoints that address bots by numeric user_id directly.
+# Secured: require auth and current_user.id == user_id (prevents abuse / one user controlling another's bot).
 @app.post("/start-bot/{user_id}")
-async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
+async def start_bot_for_user(
+    user_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to start bot for another user.")
+    await _bot_action_rate_limit(current_user.id)
     try:
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user or not user.vault:
@@ -2449,7 +2805,14 @@ async def start_bot_for_user(user_id: int, db: Session = Depends(database.get_db
 
 
 @app.post("/stop-bot/{user_id}")
-async def stop_bot_for_user(user_id: int, db: Session = Depends(database.get_db)):
+async def stop_bot_for_user(
+    user_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to stop bot for another user.")
+    await _bot_action_rate_limit(current_user.id)
     from arq.jobs import Job
     user = db.query(models.User).filter(models.User.id == user_id).first()
     status_before = getattr(user, "bot_status", None) if user else None
@@ -2795,17 +3158,63 @@ def _max_mts_from_trades(trades: list) -> Optional[int]:
 # --- Ledgers-based gross profit (Margin Funding Payment): from user registration to latest ---
 MARGIN_FUNDING_PAYMENT_DESC = "Margin Funding Payment"
 
+# All lending market profit: fetch ledgers for these currencies when Option B (credits+wallets) is not used.
+# Stablecoins first; then common funding currencies so we never miss a market (Option A fallback).
+LEDGER_FUNDING_CURRENCIES = (
+    "USD", "USDT", "USDt", "UST",
+    "BTC", "ETH", "XRP", "LTC", "EOS", "XLM",
+    "SOL", "AVAX", "DOT", "MATIC", "LINK", "UNI", "AAVE", "ATOM", "DOGE", "ADA",
+)
+# Always include these in ledger fetch so stablecoin profit is never missed (Option B minimum).
+_LEDGER_STABLECOINS_ALWAYS = frozenset(("USD", "USDT", "USDt", "UST"))
+
+
+async def _get_ledger_currencies_for_user(mgr: BitfinexManager) -> Optional[List[str]]:
+    """
+    Option B: Get currencies the user has funding activity in (credits + wallets), so we fetch
+    ledgers only for those and minimize API calls. Returns sorted list or None on error.
+    Always includes USD, USDT, USDt, UST so stablecoin profit is never missed.
+    """
+    try:
+        credits, err_c = await mgr.funding_credits(symbol=None)
+        wallets, err_w = await mgr.wallets()
+        currencies: set = set(_LEDGER_STABLECOINS_ALWAYS)
+        if isinstance(credits, list):
+            for row in credits:
+                try:
+                    if isinstance(row, (list, tuple)) and len(row) > 1:
+                        sym = (row[1] or "").strip().upper()
+                        if sym.startswith("F"):
+                            sym = sym[1:]
+                        if sym:
+                            currencies.add(sym)
+                except (TypeError, IndexError):
+                    pass
+        if isinstance(wallets, list):
+            for w in wallets:
+                try:
+                    if isinstance(w, (list, tuple)) and len(w) > 2 and (w[0] or "").strip().lower() == "funding":
+                        c = (w[1] or "").strip().upper()
+                        if c:
+                            currencies.add(c)
+                except (TypeError, IndexError):
+                    pass
+        return sorted(currencies) if currencies else list(_LEDGER_STABLECOINS_ALWAYS)
+    except Exception:
+        return None
+
 
 def _gross_and_fees_from_ledger_entries(
     entries: list,
     start_ms: Optional[int] = None,
     end_ms: Optional[int] = None,
+    usd_prices: Optional[Dict[str, float]] = None,
 ) -> tuple[float, float]:
     """
-    Parse Bitfinex ledger entries (same logic as user script).
-    Entry format: entry[3]=MTS, entry[4] or entry[5]=amount, entry[8]=description.
+    Parse Bitfinex ledger entries. Entry format: [0]=ID, [1]=CURRENCY, [2]=WALLET, [3]=MTS, [4]=None, [5]=AMOUNT, [6]=BALANCE, [7]=None, [8]=DESCRIPTION.
     Margin Funding Payment: positive = gross earned, negative = fees paid.
     If start_ms/end_ms are set, only count entries where start_ms <= entry[3] <= end_ms.
+    If usd_prices is provided (dict keyed by tCCYUSD e.g. tBTCUSD), convert each entry to USD using entry[1] and _usd_price_for_currency; else sum raw amounts (1:1 for stablecoins only).
     Returns (gross_usd, fees_usd).
     """
     gross = 0.0
@@ -2814,7 +3223,6 @@ def _gross_and_fees_from_ledger_entries(
         try:
             if not isinstance(entry, (list, tuple)) or len(entry) < 9:
                 continue
-            # User script: raw_ts = entry[3]; amount = entry[5] if entry[4] is None else entry[4]; desc = entry[8]
             raw_ts = entry[3]
             ts_ms = int(raw_ts) if raw_ts is not None else None
             if start_ms is not None and (ts_ms is None or ts_ms < start_ms):
@@ -2826,12 +3234,14 @@ def _gross_and_fees_from_ledger_entries(
             desc = str(entry[8]) if len(entry) > 8 and entry[8] is not None else ""
             if MARGIN_FUNDING_PAYMENT_DESC not in desc:
                 if "fee" in desc.lower() and amount < 0:
-                    fees += abs(amount)
+                    rate_fee = 1.0 if usd_prices is None else _usd_price_for_currency(str(entry[1]) if len(entry) > 1 else "USD", usd_prices)
+                    fees += abs(amount) * rate_fee
                 continue
+            rate = 1.0 if usd_prices is None else _usd_price_for_currency(str(entry[1]) if len(entry) > 1 else "USD", usd_prices)
             if amount > 0:
-                gross += amount
+                gross += amount * rate
             else:
-                fees += abs(amount)
+                fees += abs(amount) * rate
         except (TypeError, ValueError, IndexError):
             continue
     return gross, fees
@@ -2861,15 +3271,18 @@ def _is_ledger_data_complete(latest_entry_mts: Optional[int]) -> bool:
 
 async def _fetch_all_margin_funding_entries(
     mgr: BitfinexManager,
+    currencies: Optional[List[str]] = None,
 ) -> tuple[list, Optional[int], Optional[str]]:
     """
-    Fetch full Margin Funding Payment ledger for USD, USDT, USDt. Returns (merged_entries, latest_mts, err).
-    Used by 10:00 UTC daily job only. latest_mts = max(entry[3]) for validation (incomplete if < 20 mins old).
+    Fetch Margin Funding ledger for the given currencies (or LEDGER_FUNDING_CURRENCIES if None).
+    Returns (merged_entries, latest_mts, err). Each entry has entry[1]=CURRENCY, entry[3]=MTS, entry[5]=AMOUNT.
+    All amounts must be converted to USD by caller via _gross_and_fees_from_ledger_entries(..., usd_prices=...).
     """
+    to_fetch = list(currencies) if currencies else list(LEDGER_FUNDING_CURRENCIES)
     all_entries: list = []
     latest_mts: Optional[int] = None
     last_err: Optional[str] = None
-    for i, currency in enumerate(("USD", "USDT", "USDt")):
+    for i, currency in enumerate(to_fetch):
         if i > 0:
             await asyncio.sleep(0.2)
         entries, err = await _fetch_ledgers_script_style(mgr, currency, limit=100)
@@ -2891,11 +3304,13 @@ async def _fetch_all_margin_funding_entries(
 async def _daily_10_00_fetch_and_save(
     user_id: int,
     db: Session,
+    accept_fresh_data: bool = False,
 ) -> tuple[bool, bool, Optional[str]]:
     """
     Single 10:00-style API call: fetch Margin Funding ledger, validate completeness, then save.
     Returns (success, data_incomplete, error_message).
-    If data_incomplete (latest entry < 20 mins old): do not save; return (False, True, None). Caller may retry at 10:10.
+    If data_incomplete (latest entry < 20 mins old) and not accept_fresh_data: do not save; return (False, True, None). Caller may retry at 10:10 or 10:30.
+    When accept_fresh_data=True (e.g. 10:30 final fetch): skip completeness check so late-released Bitfinex data is saved.
     If complete: compute gross_profit_usd and daily_gross_profit_usd, save to user_profit_snapshot, return (True, False, None).
     If API error: return (False, False, err).
     """
@@ -2910,16 +3325,22 @@ async def _daily_10_00_fetch_and_save(
     if start_ms is None:
         return False, False, "No vault created_at"
     end_ms = int(datetime.utcnow().timestamp() * 1000)
-    entries, latest_mts, fetch_err = await _fetch_all_margin_funding_entries(mgr)
+    # Option B: fetch ledgers only for currencies user has activity in (credits + wallets); fallback to full list.
+    ledger_currencies = await _get_ledger_currencies_for_user(mgr)
+    if not ledger_currencies:
+        ledger_currencies = list(LEDGER_FUNDING_CURRENCIES)
+    entries, latest_mts, fetch_err = await _fetch_all_margin_funding_entries(mgr, currencies=ledger_currencies)
     if fetch_err and not entries:
         return False, False, fetch_err
-    if not _is_ledger_data_complete(latest_mts):
+    if not accept_fresh_data and not _is_ledger_data_complete(latest_mts):
         return False, True, None
-    gross, fees = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms)
+    currencies_in_entries = {str(e[1]).strip() for e in entries if isinstance(e, (list, tuple)) and len(e) > 1 and e[1]}
+    usd_prices = _fetch_ticker_prices(currencies_in_entries) if currencies_in_entries else {}
+    gross, fees = _gross_and_fees_from_ledger_entries(entries, start_ms=start_ms, end_ms=end_ms, usd_prices=usd_prices)
     today = datetime.utcnow().date()
     start_today_ms = int(datetime(today.year, today.month, today.day).timestamp() * 1000)
     end_today_ms = start_today_ms + 86400 * 1000 - 1
-    daily_gross, _ = _gross_and_fees_from_ledger_entries(entries, start_ms=start_today_ms, end_ms=end_today_ms)
+    daily_gross, _ = _gross_and_fees_from_ledger_entries(entries, start_ms=start_today_ms, end_ms=end_today_ms, usd_prices=usd_prices)
     snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
     net = gross - fees
     if snap:
@@ -2982,26 +3403,17 @@ async def _gross_profit_from_ledgers(
     start_ms: Optional[int] = None,
 ) -> tuple[float, float, Optional[str]]:
     """
-    Sum gross profit and fees from ledgers (Margin Funding Payment), same API and logic as user script.
-    Fetches USD, USDT, USDt (limit=100 each). Skips a currency on error.
-    Matches user script: sum ALL Margin Funding Payment entries in the response (no start_ms/end_ms filter),
-    so the total matches Bitfinex /auth/r/ledgers/USD/hist when run manually (e.g. $86.54 for 6 entries).
+    Sum gross profit and fees from ledgers (Margin Funding Payment) for all lending currencies.
+    Uses Option B: fetch only currencies user has activity in (credits + wallets); fallback to full list.
+    Converts every currency to USD via ticker prices (stablecoins 1:1). No start_ms/end_ms filter (cumulative).
     """
-    total_gross = 0.0
-    total_fees = 0.0
-    last_err: Optional[str] = None
-    # Bitfinex ~10 req/s per IP: space ledger calls to stay under limit
-    for i, currency in enumerate(("USD", "USDT", "USDt")):
-        if i > 0:
-            await asyncio.sleep(0.2)
-        entries, err = await _fetch_ledgers_script_style(mgr, currency, limit=100)
-        if err:
-            last_err = err
-            continue
-        # No time filter: match user script which sums all positive Margin Funding Payment amounts in response
-        g, f = _gross_and_fees_from_ledger_entries(entries, start_ms=None, end_ms=None)
-        total_gross += g
-        total_fees += f
+    ledger_currencies = await _get_ledger_currencies_for_user(mgr)
+    if not ledger_currencies:
+        ledger_currencies = list(LEDGER_FUNDING_CURRENCIES)
+    all_entries, _, last_err = await _fetch_all_margin_funding_entries(mgr, currencies=ledger_currencies)
+    currencies_in_entries = {str(e[1]).strip() for e in all_entries if isinstance(e, (list, tuple)) and len(e) > 1 and e[1]}
+    usd_prices = _fetch_ticker_prices(currencies_in_entries) if currencies_in_entries else {}
+    total_gross, total_fees = _gross_and_fees_from_ledger_entries(all_entries, start_ms=None, end_ms=None, usd_prices=usd_prices)
     return round(total_gross, 6), round(total_fees, 6), last_err if (last_err is not None and total_gross == 0 and total_fees == 0) else None
 
 
@@ -4040,11 +4452,112 @@ def admin_deduction_logs(
 
 
 @app.post("/admin/deduction/trigger")
-def admin_deduction_trigger(
+async def admin_deduction_trigger(
+    refresh_first: bool = Query(True, description="Refresh snapshots from Bitfinex (and 09:00 cache) before deducting. Use true when 10:00 failed or server was down (soft pad)."),
     admin_user: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
-    """Admin: run daily token deduction manually."""
+    """
+    Admin: run daily token deduction manually.
+    When refresh_first=True (default): refresh snapshots from Bitfinex for all users with vault,
+    then apply 09:00 cache for any still missing daily_gross, then run deduction. Use this when
+    server was down or 10:00 API run failed so deduction uses up-to-date profit (100% accuracy).
+    When refresh_first=False: only run deduction from existing snapshot (no API calls).
+    When refresh_first=True, backfill any missed snapshot day (last_deduction_processed_date < last_daily_snapshot_date)
+    before refreshing so users who were not deducted (e.g. server down) get that day deducted.
+    """
+    refreshed = 0
+    backfill_entries: List[Dict[str, Any]] = []
+    if refresh_first:
+        # Backfill: deduct any user whose snapshot day was never processed (e.g. 10:00 ran but 10:30 didn't).
+        # Only backfill PAST dates (snapshot_date < today); today is always deducted once in run_daily_token_deduction below.
+        today_utc = datetime.utcnow().date()
+        try:
+            rows = (
+                db.query(models.UserTokenBalance, models.UserProfitSnapshot, models.User)
+                .join(
+                    models.UserProfitSnapshot,
+                    models.UserTokenBalance.user_id == models.UserProfitSnapshot.user_id,
+                )
+                .join(models.User, models.User.id == models.UserTokenBalance.user_id)
+                .all()
+            )
+            for token_row, snap, user in rows:
+                last_ded = getattr(snap, "last_deduction_processed_date", None)
+                snapshot_date = getattr(snap, "last_daily_snapshot_date", None)
+                if snapshot_date is None:
+                    continue
+                if snapshot_date >= today_utc:
+                    continue  # never backfill "today"; run_daily_token_deduction handles today once after refresh
+                if last_ded is not None and last_ded >= snapshot_date:
+                    continue
+                daily_gross = getattr(snap, "daily_gross_profit_usd", None)
+                if daily_gross is None or float(daily_gross) <= 0:
+                    continue
+                uid = token_row.user_id
+                log_entry, _ = run_deduction_for_user_for_date(
+                    db, uid, snapshot_date, float(daily_gross)
+                )
+                if log_entry:
+                    backfill_entries.append(log_entry)
+                    logger.info(
+                        "trace_id=%s | Manual trigger backfill: user_id=%s for_date=%s deducted %.2f",
+                        get_trace_id(), uid, snapshot_date, float(daily_gross),
+                    )
+            if backfill_entries:
+                db.commit()
+                with _deduction_logs_lock:
+                    for e in backfill_entries:
+                        _deduction_logs.append(e)
+                        while len(_deduction_logs) > DEDUCTION_LOGS_MAX:
+                            _deduction_logs.pop(0)
+        except Exception as e:
+            logger.warning("Manual trigger backfill: %s", e)
+            db.rollback()
+        db_refresh = database.SessionLocal()
+        try:
+            user_ids = [
+                row[0]
+                for row in db_refresh.query(models.User.id)
+                .join(models.APIVault, models.User.id == models.APIVault.user_id)
+                .distinct()
+                .all()
+            ]
+        finally:
+            db_refresh.close()
+        test_uid = _get_scheduler_test_user_id()
+        if test_uid is not None:
+            user_ids = [u for u in user_ids if u == test_uid]
+        for i, uid in enumerate(user_ids):
+            if i > 0:
+                await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
+            db_u = database.SessionLocal()
+            try:
+                success, _, _ = await _daily_10_00_fetch_and_save(uid, db_u)
+                if success:
+                    refreshed += 1
+                    snap = db_u.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                    if snap:
+                        await bitfinex_cache.set_cached(
+                            uid,
+                            bitfinex_cache.KEY_LENDING,
+                            {
+                                "gross_profit": float(snap.gross_profit_usd or 0),
+                                "bitfinex_fee": float(snap.bitfinex_fee_usd or 0),
+                                "net_profit": float(snap.net_profit_usd or 0),
+                            },
+                        )
+            except Exception as e:
+                logger.warning("Manual trigger: refresh failed for user_id=%s: %s", uid, e)
+            finally:
+                db_u.close()
+        try:
+            redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
+            await _apply_09_00_cache_before_deduction(db, redis)
+        except Exception as e:
+            logger.warning("Manual trigger: 09:00 cache fallback skipped: %s", e)
+    if refresh_first:
+        db.expire_all()  # see post-refresh snapshot so we deduct today's amount, not stale yesterday's
     log_entries, err = run_daily_token_deduction(db)
     if err:
         raise HTTPException(status_code=500, detail=err)
@@ -4053,8 +4566,13 @@ def admin_deduction_trigger(
             _deduction_logs.append(e)
             while len(_deduction_logs) > DEDUCTION_LOGS_MAX:
                 _deduction_logs.pop(0)
-    _admin_audit(admin_user.email or "", "deduction_trigger", {"count": len(log_entries)})
-    return {"status": "success", "count": len(log_entries), "entries": log_entries}
+    _admin_audit(admin_user.email or "", "deduction_trigger", {"count": len(log_entries), "refreshed": refreshed})
+    return {
+        "status": "success",
+        "count": len(log_entries),
+        "entries": log_entries,
+        "refreshed": refreshed,
+    }
 
 
 @app.post("/admin/deduction/rollback/{user_id}/{date}")
@@ -4089,6 +4607,10 @@ def admin_deduction_rollback(
         raise HTTPException(status_code=404, detail=f"No deduction entries for user_id={user_id} and date={date}")
     total_add_back = sum(e.get("tokens_deducted", 0) for e in entries)
     new_remaining = token_ledger_svc.add_tokens(db, user_id, total_add_back, "deduction_rollback")
+    # Clear last_deduction_processed_date so the next deduction run will process this user again for this date
+    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).first()
+    if snap and hasattr(snap, "last_deduction_processed_date"):
+        snap.last_deduction_processed_date = None
     db.commit()
     _admin_audit(admin_user.email or "", "deduction_rollback", {"user_id": user_id, "date": date, "tokens_added_back": total_add_back})
     return {"status": "success", "user_id": user_id, "date": date, "tokens_added_back": total_add_back, "new_tokens_remaining": new_remaining}
@@ -4508,22 +5030,66 @@ def admin_reject_withdrawal(
 
 
 # --- User: Referral & USDT Credit (spec endpoints) ---
+def _mask_email(email: str | None) -> str:
+    """Mask email for display (e.g. a***@b.com)."""
+    if not email or "@" not in email:
+        return "—"
+    local, domain = email.rsplit("@", 1)
+    if len(local) <= 2:
+        return f"{local[0]}***@{domain}"
+    return f"{local[0]}***{local[-1]}@{domain}"
+
+
 @app.get("/api/v1/user/referral-info")
 def user_referral_info(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
-    """Referral code, upline info, total USDT Credit earned from referrals, saved USDT address."""
+    """Referral code, upline info, total USDT Credit earned, referred users count, saved USDT address."""
     uc = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == current_user.id).first()
     total_earned = float(uc.total_earned or 0) if uc else 0.0
     level1 = db.query(models.User).filter(models.User.id == current_user.referred_by).first() if current_user.referred_by else None
+    referred_count = db.query(models.User).filter(models.User.referred_by == current_user.id).count()
     return {
         "referral_code": current_user.referral_code or "",
         "referrer_id": current_user.referred_by,
         "referrer_email": level1.email if level1 else None,
         "total_usdt_credit_earned": total_earned,
+        "referred_users_count": referred_count,
         "usdt_withdraw_address": (current_user.usdt_withdraw_address or "").strip() or None,
     }
+
+
+@app.get("/api/v1/user/referral-downline")
+def user_referral_downline(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """List users who signed up with current user's referral code, with masked email and USDT earned from each (L1 only)."""
+    from sqlalchemy import func
+    referred = (
+        db.query(models.User.id, models.User.email, models.User.created_at)
+        .filter(models.User.referred_by == current_user.id)
+        .order_by(models.User.created_at.desc())
+        .all()
+    )
+    out = []
+    for user_id, email, created_at in referred:
+        total_from_them = (
+            db.query(func.coalesce(func.sum(models.ReferralReward.reward_l1), 0))
+            .filter(
+                models.ReferralReward.level_1_id == current_user.id,
+                models.ReferralReward.burning_user_id == user_id,
+            )
+            .scalar()
+        )
+        out.append({
+            "user_id": user_id,
+            "email_masked": _mask_email(email),
+            "created_at": created_at.isoformat() + "Z" if created_at else None,
+            "total_usdt_earned_from_them": float(total_from_them or 0),
+        })
+    return out
 
 
 @app.get("/api/v1/user/referral-reward-history")
@@ -5201,8 +5767,7 @@ TICKER_CACHE_TTL_SEC = 60
 def _fetch_ticker_prices(currencies: set) -> Dict[str, float]:
     """Fetch tCCYUSD prices for all non-stablecoins. Returns dict keyed by tCCYUSD. Cached 60s to reduce API calls."""
     from services.bitfinex_service import _get_tickers_sync
-    stablecoins = {"USD", "USDt", "USDT", "UST"}
-    need = sorted([c for c in currencies if c and c not in stablecoins])
+    need = sorted([c for c in currencies if c and c not in _STABLECOINS_1TO1])
     if not need:
         return {}
     symbols = [f"t{c}USD" for c in need]

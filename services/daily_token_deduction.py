@@ -10,14 +10,23 @@ Example: choiwangai@gmail.com gross_profit_usd = 72.20 → used_tokens = 722.
 Referral: only purchased tokens (not free 150) trigger L1/L2/L3 USDT Credit rewards.
 We consume free tokens first; purchased_burned = max(0, daily_gross - free_remaining).
 """
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def _utc_today() -> date:
+    """Today's date in UTC (for deduction date comparison; avoids server TZ issues)."""
+    return datetime.now(timezone.utc).date()
+
 from sqlalchemy.orm import Session
+
+import logging
 
 import models
 from services.referral_rewards import apply_referral_rewards
 from services import token_ledger_service as token_ledger_svc
+
+_log = logging.getLogger(__name__)
 
 TOKENS_PER_USDT_GROSS = 10  # used_tokens = gross_profit_usd × TOKENS_PER_USDT_GROSS (documented for consistency)
 
@@ -25,13 +34,90 @@ TOKENS_PER_USDT_GROSS = 10  # used_tokens = gross_profit_usd × TOKENS_PER_USDT_
 def apply_deduction_rule(tokens_remaining: float, daily_gross_profit: float) -> Tuple[float, bool]:
     """
     Pure deduction rule for one user.
-    Returns (new_tokens_remaining, should_deduct).
+    Returns (new_tokens_remaining, should_deduct), rounded to 2 decimals.
     If daily_gross_profit <= 0, should_deduct is False and tokens unchanged.
     """
     if daily_gross_profit <= 0:
-        return tokens_remaining, False
+        return round(float(tokens_remaining), 2), False
     new_raw = tokens_remaining - daily_gross_profit
-    return max(0.0, new_raw), True
+    return round(max(0.0, new_raw), 2), True
+
+
+def run_deduction_for_user_for_date(
+    db: Session,
+    user_id: int,
+    date_d: date,
+    daily_gross: float,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Deduct tokens for one user for a specific date (manual-trigger backfill of missed days).
+    If already deducted for date_d or daily_gross <= 0, returns (None, None). Does not commit.
+    """
+    q = (
+        db.query(models.UserTokenBalance, models.UserProfitSnapshot, models.User)
+        .join(
+            models.UserProfitSnapshot,
+            models.UserTokenBalance.user_id == models.UserProfitSnapshot.user_id,
+        )
+        .join(models.User, models.User.id == models.UserTokenBalance.user_id)
+        .filter(models.UserTokenBalance.user_id == user_id)
+    )
+    row = q.first()
+    if not row:
+        return None, None
+    token_row, snap, user = row
+    if getattr(snap, "last_deduction_processed_date", None) == date_d:
+        return None, None
+    if daily_gross <= 0:
+        return None, None
+    email = getattr(user, "email", None) or ""
+    tokens_before = round(float(token_row.tokens_remaining or 0), 2)
+    new_tokens, should_deduct = apply_deduction_rule(tokens_before, daily_gross)
+    if not should_deduct:
+        return None, None
+    tokens_deducted = round(float(daily_gross), 2)
+    now_utc = datetime.utcnow()
+    purchased_added = token_ledger_svc.purchased_tokens_for_referral(db, user_id)
+    free_remaining = max(0.0, tokens_before - purchased_added)
+    purchased_burned = max(0.0, daily_gross - free_remaining)
+    if purchased_burned > 0:
+        apply_referral_rewards(db, user_id, purchased_burned)
+    new_tokens = token_ledger_svc.deduct_tokens(db, user_id, tokens_deducted)
+    token_row.last_gross_usd_used = daily_gross
+    token_row.updated_at = now_utc
+    gross_profit_usd = float(getattr(snap, "gross_profit_usd", None) or 0)
+    total_used_tokens = int(gross_profit_usd * TOKENS_PER_USDT_GROSS) if gross_profit_usd else 0
+    account_switch_note = getattr(snap, "account_switch_note", None)
+    log_entry = {
+        "user_id": user_id,
+        "email": email,
+        "gross_profit": round(daily_gross, 2),
+        "tokens_deducted": tokens_deducted,
+        "tokens_remaining_before": tokens_before,
+        "tokens_remaining_after": round(new_tokens, 2),
+        "timestamp": now_utc.isoformat() + "Z",
+        "total_used_tokens": total_used_tokens,
+        "account_switch_note": account_switch_note,
+        "for_date": date_d.isoformat(),
+    }
+    if hasattr(models, "DeductionLog"):
+        db.add(models.DeductionLog(
+            user_id=user_id,
+            email=email or None,
+            timestamp_utc=now_utc,
+            daily_gross_profit_usd=daily_gross,
+            tokens_deducted=tokens_deducted,
+            total_used_tokens=float(total_used_tokens),
+            tokens_remaining_after=round(new_tokens, 2),
+            account_switch_note=account_switch_note,
+        ))
+    if getattr(snap, "account_switch_note", None) is not None:
+        snap.account_switch_note = None
+    if hasattr(snap, "deduction_processed"):
+        snap.deduction_processed = True
+    if hasattr(snap, "last_deduction_processed_date"):
+        snap.last_deduction_processed_date = date_d
+    return log_entry, None
 
 
 def run_daily_token_deduction(
@@ -59,19 +145,21 @@ def run_daily_token_deduction(
         if user_ids is not None:
             q = q.filter(models.UserTokenBalance.user_id.in_(user_ids))
         rows = q.all()
-        now_utc = datetime.utcnow()
-        date_utc = now_utc.date() if hasattr(now_utc, "date") else date(now_utc.year, now_utc.month, now_utc.day)
+        now_utc = datetime.now(timezone.utc)
+        date_utc = _utc_today()
+        skipped_already_processed = 0
         for token_row, snap, user in rows:
             user_id = token_row.user_id
             if getattr(snap, "last_deduction_processed_date", None) == date_utc:
+                skipped_already_processed += 1
                 continue  # already processed (prevent double-charge)
             email = getattr(user, "email", None) or ""
             daily_gross = getattr(snap, "daily_gross_profit_usd", None)
             if daily_gross is None:
                 daily_gross = 0.0
-            daily_gross = float(daily_gross)
+            daily_gross = round(float(daily_gross), 2)
 
-            tokens_before = float(token_row.tokens_remaining or 0)
+            tokens_before = round(float(token_row.tokens_remaining or 0), 2)
             new_tokens, should_deduct = apply_deduction_rule(tokens_before, daily_gross)
             if not should_deduct:
                 continue
@@ -98,7 +186,7 @@ def run_daily_token_deduction(
                 "gross_profit": daily_gross,
                 "tokens_deducted": tokens_deducted,
                 "tokens_remaining_before": tokens_before,
-                "tokens_remaining_after": new_tokens,
+                "tokens_remaining_after": round(new_tokens, 2),
                 "timestamp": now_utc.isoformat() + "Z",
                 "total_used_tokens": total_used_tokens,
                 "account_switch_note": account_switch_note,
@@ -112,7 +200,7 @@ def run_daily_token_deduction(
                     daily_gross_profit_usd=daily_gross,
                     tokens_deducted=tokens_deducted,
                     total_used_tokens=float(total_used_tokens),
-                    tokens_remaining_after=new_tokens,
+                    tokens_remaining_after=round(new_tokens, 2),
                     account_switch_note=account_switch_note,
                 ))
             if getattr(snap, "account_switch_note", None) is not None:
@@ -123,6 +211,11 @@ def run_daily_token_deduction(
                 snap.last_deduction_processed_date = date_utc
 
         db.commit()
+        if skipped_already_processed or log_entries:
+            _log.info(
+                "run_daily_token_deduction date_utc=%s skipped_already_processed=%d deducted=%d",
+                date_utc, skipped_already_processed, len(log_entries),
+            )
         return log_entries, None
     except Exception as e:
         db.rollback()
