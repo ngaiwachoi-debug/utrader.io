@@ -46,6 +46,14 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
         const data = await res.json()
         const id = data.id != null ? Number(data.id) : null
         setUserId(id)
+        if (id != null && id > 0) {
+          setTimeout(() => {
+            fetch(`${API_BACKEND}/api/dashboard-fold`, {
+              credentials: "include",
+              headers: { Authorization: `Bearer ${token}` },
+            }).catch(() => {})
+          }, 150)
+        }
       } else {
         // Fallback: when /api/me fails (e.g. backend auth/DB issue) but we have a token, use 2 so dashboard can load
         setUserId(2)

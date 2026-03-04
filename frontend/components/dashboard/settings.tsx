@@ -26,7 +26,7 @@ import {
   CheckCircle,
 } from "lucide-react"
 import { useCurrentUserId } from "@/lib/current-user-context"
-import { useReferralData } from "@/lib/dashboard-data-context"
+import { useReferralData, useDeductionMultiplier } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
 import {
   calculateTotalBudget,
@@ -46,7 +46,7 @@ type TokenBalanceState = {
   updated_at: string | null
 }
 
-type TokenAddHistoryEntry = { amount: number; reason: string; created_at: string }
+type TokenAddHistoryEntry = { amount: number; reason: string; created_at: string; detail?: string | null }
 
 function tokenAddReasonLabel(reason: string): string {
   const map: Record<string, string> = {
@@ -73,6 +73,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const userId = useCurrentUserId()
   const id = userId ?? 0
   const { data: referralCacheData } = useReferralData(id)
+  const deductionMultiplier = useDeductionMultiplier()
   const { data: session, status } = useSession()
   const signedIn = status === "authenticated" && !!session?.user
   const [activeTab, setActiveTab] = useState<SettingsTab>("general")
@@ -365,7 +366,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
         </div>
 
         <p className="text-xs text-muted-foreground mb-4 max-w-xl">
-          {t("settings.tokenUsageExplanation")}
+          {t("settings.tokenUsageExplanation", { multiplier: deductionMultiplier })}
         </p>
 
         {/* Token Usage section (replaces Lending Usage) – progress bar from /api/v1/users/me/token-balance */}
@@ -437,7 +438,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
                           })() : "—"}
                       </td>
                       <td className="py-1.5 px-2">{e.amount}</td>
-                      <td className="py-1.5 px-2">{tokenAddReasonLabel(e.reason)}</td>
+                      <td className="py-1.5 px-2">{e.detail ?? tokenAddReasonLabel(e.reason)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1189,6 +1190,7 @@ function ApiKeysTab({
 type DeductionHistoryEntry = {
   gross_profit: number
   tokens_deducted: number
+  tokens_remaining_before: number | null
   tokens_remaining_after: number | null
   total_used_tokens: number | null
   timestamp: string
@@ -1285,7 +1287,7 @@ function TokenActivityTab() {
                   <tr key={i} className="border-b border-border/50 hover:bg-muted/30">
                     <td className="py-2 px-3">{formatDate(e.created_at)}</td>
                     <td className="py-2 px-3 font-medium">+{Number(e.amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
-                    <td className="py-2 px-3">{tokenAddReasonLabel(e.reason)}</td>
+                    <td className="py-2 px-3">{e.detail ?? tokenAddReasonLabel(e.reason)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1310,6 +1312,7 @@ function TokenActivityTab() {
               <thead className="bg-muted/50 sticky top-0">
                 <tr className="border-b border-border">
                   <th className="text-left py-2 px-3 font-medium">Date</th>
+                  <th className="text-left py-2 px-3 font-medium">Balance before</th>
                   <th className="text-left py-2 px-3 font-medium">Gross profit (USD)</th>
                   <th className="text-left py-2 px-3 font-medium">Tokens deducted</th>
                   <th className="text-left py-2 px-3 font-medium">Balance after</th>
@@ -1319,6 +1322,7 @@ function TokenActivityTab() {
                 {deductionLog.map((e, i) => (
                   <tr key={i} className="border-b border-border/50 hover:bg-muted/30">
                     <td className="py-2 px-3">{formatDate(e.timestamp)}</td>
+                    <td className="py-2 px-3">{e.tokens_remaining_before != null && Number.isFinite(Number(e.tokens_remaining_before)) ? Number(e.tokens_remaining_before).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}</td>
                     <td className="py-2 px-3">{Number(e.gross_profit).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
                     <td className="py-2 px-3 font-medium text-destructive">−{Number(e.tokens_deducted).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
                     <td className="py-2 px-3">{e.tokens_remaining_after != null ? Number(e.tokens_remaining_after).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}</td>

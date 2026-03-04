@@ -11,7 +11,7 @@ import { Spinner } from "@/components/ui/spinner"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
-import { useLendingStats, useUserStatus, type LendingStatsTrade } from "@/lib/dashboard-data-context"
+import { useLendingStats, useUserStatus, useDeductionMultiplier, type LendingStatsTrade } from "@/lib/dashboard-data-context"
 import {
   AreaChart,
   Area,
@@ -91,6 +91,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const id = userId ?? 0
   const lendingStats = useLendingStats(id)
   const userStatus = useUserStatus(id)
+  const deductionMultiplier = useDeductionMultiplier()
   const [timeRange, setTimeRange] = useState("30d")
   const [showBreakdown, setShowBreakdown] = useState(false)
   const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
@@ -241,7 +242,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
           <Wallet className="h-5 w-5 text-primary" />
           <h3 className="text-sm font-semibold text-foreground">{t("dashboard.tokenCredit")}</h3>
         </div>
-        <p className="text-xs text-muted-foreground mb-4">{t("dashboard.tokenUsageRule")}</p>
+        <p className="text-xs text-muted-foreground mb-4">{t("dashboard.tokenUsageRule", { multiplier: deductionMultiplier })}</p>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           {tokenBalanceLoading && !tokenBalance ? (
             <span className="text-xl font-bold text-primary">…</span>

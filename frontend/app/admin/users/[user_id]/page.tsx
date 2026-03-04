@@ -21,7 +21,7 @@ type Overview = {
   api_key_status?: Record<string, unknown>
   withdrawals: Record<string, unknown>[]
   deduction_history: Record<string, unknown>[]
-  token_add_history?: { amount: number; reason: string; created_at: string }[]
+  token_add_history?: { amount: number; reason: string; created_at: string; detail?: string | null }[]
   audit_entries: Record<string, unknown>[]
   edits_locked?: boolean
 }
@@ -195,7 +195,7 @@ export default function AdminUserDetailPage() {
                         <tr key={i} className="border-b border-border/50">
                           <td className="py-1.5 px-2">{e.created_at}</td>
                           <td className="py-1.5 px-2">{e.amount}</td>
-                          <td className="py-1.5 px-2">{e.reason}</td>
+                          <td className="py-1.5 px-2">{e.detail ?? e.reason}</td>
                         </tr>
                       ))}
                     </tbody>

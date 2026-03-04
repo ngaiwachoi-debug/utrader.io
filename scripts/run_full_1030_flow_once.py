@@ -19,6 +19,8 @@ load_dotenv(ROOT / ".env")
 
 
 async def main():
+    from datetime import datetime
+
     import database
     import models
     from main import (
@@ -26,6 +28,7 @@ async def main():
         _apply_09_00_cache_before_deduction,
         get_redis,
         _get_scheduler_test_user_id,
+        _get_deduction_multiplier,
         DELAY_BETWEEN_USERS_SEC,
         REDIS_CONNECT_TIMEOUT,
     )
@@ -33,6 +36,7 @@ async def main():
 
     db = database.SessionLocal()
     try:
+        today_utc = datetime.utcnow().date()
         user_ids_with_vault = [
             row[0]
             for row in db.query(models.User.id)
@@ -49,11 +53,11 @@ async def main():
             if snap is None:
                 need_fetch.append(uid)
             else:
-                dg = getattr(snap, "daily_gross_profit_usd", None)
-                if dg is None or (isinstance(dg, (int, float)) and float(dg) == 0):
+                snapshot_date = getattr(snap, "last_daily_snapshot_date", None)
+                if snapshot_date is None or snapshot_date != today_utc:
                     need_fetch.append(uid)
         if need_fetch:
-            print(f"10:30 final fetch for {len(need_fetch)} user(s) without daily_gross")
+            print(f"10:30 final fetch for {len(need_fetch)} user(s) with snapshot not for today")
             for i, uid in enumerate(need_fetch):
                 if i > 0:
                     await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
@@ -71,7 +75,8 @@ async def main():
         except Exception as e:
             print(f"09:00 cache skipped: {e}")
         db.expire_all()
-        log_entries, err = run_daily_token_deduction(db)
+        mult = _get_deduction_multiplier(db)
+        log_entries, err = run_daily_token_deduction(db, deduction_multiplier=mult)
         if err:
             print(f"FAIL: run_daily_token_deduction: {err}")
             return 1

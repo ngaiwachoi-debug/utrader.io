@@ -11,9 +11,9 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 # Bitfinex: up to ~90 req/min per endpoint; use conservative per-user limits
-# Min interval between fresh calls per (user_id, endpoint)
-CACHE_TTL_WALLETS_SEC = 30   # wallets + credits: 30s
-CACHE_TTL_LENDING_SEC = 60  # funding trades + tickers: 60s
+# Min interval between fresh calls per (user_id, endpoint). Increased for dashboard fold + repeat visits.
+CACHE_TTL_WALLETS_SEC = 90   # wallets + credits: 90s
+CACHE_TTL_LENDING_SEC = 120  # funding trades + tickers: 120s
 RATE_LIMIT_COOLDOWN_SEC = 60  # when Bitfinex returns ERR_RATE_LIMIT, don't call again for 60s
 
 _cache: Dict[Tuple[int, str], Dict[str, Any]] = {}

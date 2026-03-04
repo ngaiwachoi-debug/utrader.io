@@ -130,6 +130,8 @@ type CacheState = {
   userStatus: Record<number, UserStatusCacheEntry>
   lendingStats: Record<number, LendingStatsCacheEntry>
   referralData: Record<number, ReferralDataCacheEntry>
+  /** Platform deduction multiplier: tokens_deducted = daily_gross * multiplier (from admin setting). */
+  deductionMultiplier: number | null
   version: number
 }
 
@@ -172,10 +174,12 @@ type DashboardDataContextValue = {
     isRevalidating: boolean
     refetch: () => Promise<void>
   }
+  /** Current deduction multiplier (1 USD gross = multiplier tokens). Default 1 when unknown. */
+  deductionMultiplier: number
   prefetch: (userId: number) => void
 }
 
-const initialState: CacheState = { wallets: {}, botStats: {}, userStatus: {}, lendingStats: {}, referralData: {}, version: 0 }
+const initialState: CacheState = { wallets: {}, botStats: {}, userStatus: {}, lendingStats: {}, referralData: {}, deductionMultiplier: null, version: 0 }
 const DashboardDataContext = createContext<DashboardDataContextValue | null>(null)
 
 function loadFromStorage<T>(key: string): T | null {
@@ -250,6 +254,7 @@ function normalizeLendingStats(raw: Record<string, unknown>): LendingStatsData {
 
 export function DashboardDataProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<CacheState>(initialState)
+  const inFlightFold = useRef<Partial<Record<number, Promise<void>>>>({})
   const inFlightWallets = useRef<Record<number, Promise<void>>>({})
   const inFlightBotStats = useRef<Record<number, Promise<void>>>({})
   const inFlightUserStatus = useRef<Record<number, Promise<void>>>({})
@@ -397,6 +402,43 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     [state.userStatus, updateState]
   )
 
+  /** When lending has gross profit but no trades (e.g. cache hit), fetch funding-trades so charts can show data. */
+  const ensureLendingTrades = useCallback(
+    async (userId: number, data: LendingStatsData): Promise<void> => {
+      if (!(data.gross_profit > 0 && (!data.trades || data.trades.length === 0))) return
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      try {
+        const ftRes = await fetch(`${API_BACKEND}/api/funding-trades`, { credentials: "include", headers })
+        if (!ftRes.ok) return
+        const ftData = await ftRes.json().catch(() => ({}))
+        const trades = Array.isArray(ftData?.trades) ? (ftData.trades as LendingStatsTrade[]) : []
+        if (trades.length === 0) return
+        updateState((prev) => {
+          const entry = prev.lendingStats[userId]
+          if (!entry?.data) return prev
+          return {
+            ...prev,
+            lendingStats: {
+              ...prev.lendingStats,
+              [userId]: {
+                ...entry,
+                data: {
+                  ...entry.data,
+                  trades,
+                  total_trades_count: entry.data.total_trades_count ?? trades.length,
+                },
+              },
+            },
+          }
+        })
+      } catch {
+        // ignore
+      }
+    },
+    [updateState]
+  )
+
   const fetchLendingStats = useCallback(
     async (userId: number, force?: boolean): Promise<void> => {
       const existing = state.lendingStats[userId]
@@ -410,27 +452,8 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
       const source = res.headers.get("X-Data-Source") === "cache" ? "cache" : "live"
       const rateLimited = res.headers.get("X-Rate-Limited") === "true"
       if (res.ok) {
-        let raw: Record<string, unknown> = await res.json().catch(() => ({}))
-        if (typeof raw.gross_profit === "number" && raw.gross_profit === 0) {
-          const dbRes = await fetch(`${API_BACKEND}/stats/${userId}/lending?source=db`, { credentials: "include", headers })
-          if (dbRes.ok) {
-            const dbData = await dbRes.json().catch(() => ({}))
-            if (typeof dbData.gross_profit === "number" && dbData.gross_profit > 0) raw = dbData
-          }
-        }
-        let data = normalizeLendingStats(raw)
-        if (data.trades.length === 0 && data.gross_profit > 0) {
-          try {
-            const ftRes = await fetch(`${API_BACKEND}/api/funding-trades`, { credentials: "include", headers })
-            if (ftRes.ok) {
-              const ftData = await ftRes.json().catch(() => ({}))
-              const trades = Array.isArray(ftData?.trades) ? (ftData.trades as LendingStatsTrade[]) : []
-              data = { ...data, trades, total_trades_count: data.total_trades_count || trades.length }
-            }
-          } catch {
-            // keep trades empty
-          }
-        }
+        const raw: Record<string, unknown> = await res.json().catch(() => ({}))
+        const data = normalizeLendingStats(raw)
         updateState((prev) => ({
           ...prev,
           lendingStats: {
@@ -439,6 +462,7 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
           },
         }))
         saveToStorage(`${STORAGE_PREFIX}:${userId}:lendingStats`, { data, fetchedAt: Date.now(), source })
+        ensureLendingTrades(userId, data).catch(() => {})
       } else {
         updateState((prev) => ({
           ...prev,
@@ -455,7 +479,7 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
         }))
       }
     },
-    [state.lendingStats, updateState]
+    [state.lendingStats, updateState, ensureLendingTrades]
   )
 
   const fetchReferralData = useCallback(
@@ -527,6 +551,61 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
       }
     },
     [state.referralData, updateState]
+  )
+
+  const fetchDashboardFold = useCallback(
+    async (userId: number): Promise<boolean> => {
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      const res = await fetch(`${API_BACKEND}/api/dashboard-fold`, { credentials: "include", headers })
+      if (!res.ok) return false
+      const raw = await res.json().catch(() => ({}))
+      const now = Date.now()
+      const walletsData = normalizeWalletSummary(raw.wallets ?? {})
+      const botStatsRaw = raw.botStats ?? {}
+      const botStatsData = {
+        active: Boolean(botStatsRaw.active),
+        total_loaned: (() => {
+          const v = parseFloat(String(botStatsRaw.total_loaned ?? "0").replace(/,/g, ""))
+          return Number.isFinite(v) ? v : 0
+        })(),
+      }
+      const userStatusRaw = raw.userStatus ?? {}
+      const userStatusData = {
+        tokens_remaining: typeof userStatusRaw.tokens_remaining === "number" ? userStatusRaw.tokens_remaining : null,
+        plan_tier: typeof userStatusRaw.plan_tier === "string" ? userStatusRaw.plan_tier : null,
+      }
+      const lendingData = normalizeLendingStats((raw.lending ?? {}) as Record<string, unknown>)
+      const mult = typeof (raw as Record<string, unknown>).deduction_multiplier === "number"
+        ? (raw as Record<string, unknown>).deduction_multiplier as number
+        : null
+      updateState((prev) => ({
+        ...prev,
+        deductionMultiplier: mult,
+        wallets: {
+          ...prev.wallets,
+          [userId]: { data: walletsData, fetchedAt: now, error: null, source: "live", rateLimited: false, errorMessage: null },
+        },
+        botStats: {
+          ...prev.botStats,
+          [userId]: { data: botStatsData, fetchedAt: now, error: null, source: "live" },
+        },
+        userStatus: {
+          ...prev.userStatus,
+          [userId]: { data: userStatusData, fetchedAt: now, error: null, source: "live" },
+        },
+        lendingStats: {
+          ...prev.lendingStats,
+          [userId]: { data: lendingData, fetchedAt: now, error: null, source: "live", rateLimited: false },
+        },
+      }))
+      saveToStorage(`${STORAGE_PREFIX}:${userId}:wallets`, { data: walletsData, fetchedAt: now, source: "live" })
+      saveToStorage(`${STORAGE_PREFIX}:${userId}:botStats`, { data: botStatsData, fetchedAt: now })
+      saveToStorage(`${STORAGE_PREFIX}:${userId}:lendingStats`, { data: lendingData, fetchedAt: now, source: "live" })
+      ensureLendingTrades(userId, lendingData).catch(() => {})
+      return true
+    },
+    [updateState, ensureLendingTrades]
   )
 
   const getWalletsEntry = useCallback((userId: number): WalletCacheEntry | null => {
@@ -728,17 +807,25 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
 
   const prefetch = useCallback(
     (userId: number) => {
-      if (!inFlightWallets.current[userId]) inFlightWallets.current[userId] = fetchWallets(userId)
-      if (!inFlightBotStats.current[userId]) inFlightBotStats.current[userId] = fetchBotStats(userId)
-      if (!inFlightUserStatus.current[userId]) inFlightUserStatus.current[userId] = fetchUserStatus(userId)
-      if (!inFlightLendingStats.current[userId]) inFlightLendingStats.current[userId] = fetchLendingStats(userId)
+      if (inFlightFold.current[userId]) return
+      const foldPromise = (async () => {
+        const ok = await fetchDashboardFold(userId)
+        delete inFlightFold.current[userId]
+        if (!ok) {
+          if (!inFlightWallets.current[userId]) inFlightWallets.current[userId] = fetchWallets(userId)
+          if (!inFlightBotStats.current[userId]) inFlightBotStats.current[userId] = fetchBotStats(userId)
+          if (!inFlightUserStatus.current[userId]) inFlightUserStatus.current[userId] = fetchUserStatus(userId)
+          if (!inFlightLendingStats.current[userId]) inFlightLendingStats.current[userId] = fetchLendingStats(userId)
+        }
+      })()
+      inFlightFold.current[userId] = foldPromise
       if (!inFlightReferralData.current[userId]) {
         inFlightReferralData.current[userId] = fetchReferralData(userId).finally(() => {
           delete inFlightReferralData.current[userId]
         })
       }
     },
-    [fetchWallets, fetchBotStats, fetchUserStatus, fetchLendingStats, fetchReferralData]
+    [fetchDashboardFold, fetchWallets, fetchBotStats, fetchUserStatus, fetchLendingStats, fetchReferralData]
   )
 
   const value: DashboardDataContextValue = {
@@ -747,6 +834,7 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     getUserStatus,
     getLendingStats,
     getReferralData,
+    deductionMultiplier: state.deductionMultiplier ?? 1,
     prefetch,
   }
 
@@ -794,4 +882,9 @@ export function useReferralData(userId: number) {
     if (userId != null && userId > 0) prefetch(userId)
   }, [userId, prefetch])
   return getReferralData(userId)
+}
+
+export function useDeductionMultiplier(): number {
+  const { deductionMultiplier } = useDashboardData()
+  return deductionMultiplier
 }

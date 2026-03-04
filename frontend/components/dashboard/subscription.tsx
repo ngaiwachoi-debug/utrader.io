@@ -4,6 +4,7 @@ import { useState, useEffect } from "react"
 import { Crown, Users, Zap, Check, Loader2, ChevronDown, ChevronUp, Coins, ArrowDownCircle } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
+import { useDeductionMultiplier } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
 import { calculateTotalBudget, calculateUsagePercentage } from "@/lib/calculateTokenUsage"
 
@@ -34,6 +35,7 @@ type TokenBalanceState = {
 export function Subscription() {
   const t = useT()
   const userId = useCurrentUserId()
+  const deductionMultiplier = useDeductionMultiplier()
   const [loading, setLoading] = useState<string | null>(null)
   const [planTier, setPlanTier] = useState<string>("trial")
   const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
@@ -602,7 +604,7 @@ export function Subscription() {
             </div>
             <div>
               <p className="text-xs font-semibold text-foreground mb-0.5">{t("subscription.howUseTitle")}</p>
-              <p className="text-xs text-muted-foreground">{t("subscription.howUseBody")}</p>
+              <p className="text-xs text-muted-foreground">{t("subscription.howUseBody", { multiplier: deductionMultiplier })}</p>
             </div>
           </div>
         </div>
@@ -623,7 +625,7 @@ export function Subscription() {
         <div className="mt-4 border-t border-border pt-4">
           <p className="mb-2 text-xs font-semibold text-foreground">{t("subscription.faqTitle")}</p>
           {[
-            { id: "deduct", q: t("subscription.faqDeduct"), a: t("subscription.faqDeductA") },
+            { id: "deduct", q: t("subscription.faqDeduct"), a: t("subscription.faqDeductA", { multiplier: deductionMultiplier }) },
             { id: "refresh", q: t("subscription.faqRefresh"), a: t("subscription.faqRefreshA") },
             { id: "refund", q: t("subscription.faqRefund"), a: t("subscription.faqRefundA") },
           ].map((faq) => (

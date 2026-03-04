@@ -48,9 +48,11 @@ def run_deduction_for_user_for_date(
     user_id: int,
     date_d: date,
     daily_gross: float,
+    deduction_multiplier: float = 1.0,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Deduct tokens for one user for a specific date (manual-trigger backfill of missed days).
+    deduction_multiplier: tokens_deducted = daily_gross * multiplier (default 1.0).
     If already deducted for date_d or daily_gross <= 0, returns (None, None). Does not commit.
     """
     q = (
@@ -70,16 +72,19 @@ def run_deduction_for_user_for_date(
         return None, None
     if daily_gross <= 0:
         return None, None
+    amount_to_deduct = round(float(daily_gross) * float(deduction_multiplier), 2)
+    if amount_to_deduct <= 0:
+        return None, None
     email = getattr(user, "email", None) or ""
     tokens_before = round(float(token_row.tokens_remaining or 0), 2)
-    new_tokens, should_deduct = apply_deduction_rule(tokens_before, daily_gross)
+    new_tokens, should_deduct = apply_deduction_rule(tokens_before, amount_to_deduct)
     if not should_deduct:
         return None, None
-    tokens_deducted = round(float(daily_gross), 2)
-    now_utc = datetime.utcnow()
+    tokens_deducted = amount_to_deduct
+    now_utc = datetime.now(timezone.utc)
     purchased_added = token_ledger_svc.purchased_tokens_for_referral(db, user_id)
     free_remaining = max(0.0, tokens_before - purchased_added)
-    purchased_burned = max(0.0, daily_gross - free_remaining)
+    purchased_burned = max(0.0, amount_to_deduct - free_remaining)
     if purchased_burned > 0:
         apply_referral_rewards(db, user_id, purchased_burned)
     new_tokens = token_ledger_svc.deduct_tokens(db, user_id, tokens_deducted)
@@ -123,10 +128,11 @@ def run_deduction_for_user_for_date(
 def run_daily_token_deduction(
     db: Session,
     user_ids: Optional[List[int]] = None,
+    deduction_multiplier: float = 1.0,
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
-    For each user with token balance and profit snapshot, deduct daily gross profit
-    from tokens_remaining (1:1 USD), update last_gross_usd_used and updated_at.
+    For each user with token balance and profit snapshot, deduct daily gross profit × multiplier
+    from tokens_remaining. deduction_multiplier default 1.0 (1 USD gross = 1 token).
     Persists each deduction to deduction_log (with email and account_switch_note).
     If user_ids is provided, only those users are processed (e.g. 11:15 catch-up).
 
@@ -148,27 +154,40 @@ def run_daily_token_deduction(
         now_utc = datetime.now(timezone.utc)
         date_utc = _utc_today()
         skipped_already_processed = 0
+        skipped_snapshot_not_today = 0
         for token_row, snap, user in rows:
             user_id = token_row.user_id
             if getattr(snap, "last_deduction_processed_date", None) == date_utc:
                 skipped_already_processed += 1
                 continue  # already processed (prevent double-charge)
+            # Date-gate: only deduct when snapshot is for today (never charge yesterday's amount for today).
+            snapshot_date = getattr(snap, "last_daily_snapshot_date", None)
+            if snapshot_date is None or snapshot_date != date_utc:
+                skipped_snapshot_not_today += 1
+                _log.debug(
+                    "run_daily_token_deduction user_id=%s skipped snapshot_date=%s date_utc=%s",
+                    user_id, snapshot_date, date_utc,
+                )
+                continue
             email = getattr(user, "email", None) or ""
             daily_gross = getattr(snap, "daily_gross_profit_usd", None)
             if daily_gross is None:
                 daily_gross = 0.0
             daily_gross = round(float(daily_gross), 2)
+            amount_to_deduct = round(daily_gross * float(deduction_multiplier), 2)
+            if amount_to_deduct <= 0:
+                continue
 
             tokens_before = round(float(token_row.tokens_remaining or 0), 2)
-            new_tokens, should_deduct = apply_deduction_rule(tokens_before, daily_gross)
+            new_tokens, should_deduct = apply_deduction_rule(tokens_before, amount_to_deduct)
             if not should_deduct:
                 continue
 
-            tokens_deducted = daily_gross  # 1:1 USD per requirement
+            tokens_deducted = amount_to_deduct
 
             purchased_added = token_ledger_svc.purchased_tokens_for_referral(db, user_id)
             free_remaining = max(0.0, tokens_before - purchased_added)
-            purchased_burned = max(0.0, daily_gross - free_remaining)
+            purchased_burned = max(0.0, amount_to_deduct - free_remaining)
             if purchased_burned > 0:
                 apply_referral_rewards(db, user_id, purchased_burned)
 
@@ -211,10 +230,10 @@ def run_daily_token_deduction(
                 snap.last_deduction_processed_date = date_utc
 
         db.commit()
-        if skipped_already_processed or log_entries:
+        if skipped_already_processed or skipped_snapshot_not_today or log_entries:
             _log.info(
-                "run_daily_token_deduction date_utc=%s skipped_already_processed=%d deducted=%d",
-                date_utc, skipped_already_processed, len(log_entries),
+                "run_daily_token_deduction date_utc=%s skipped_already_processed=%d skipped_snapshot_not_today=%d deducted=%d",
+                date_utc, skipped_already_processed, skipped_snapshot_not_today, len(log_entries),
             )
         return log_entries, None
     except Exception as e:

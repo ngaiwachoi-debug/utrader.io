@@ -48,15 +48,41 @@ def get_tokens_remaining(db: Session, user_id: int) -> float:
     return 0.0
 
 
+def subscription_invoice_already_processed(db: Session, user_id: int, stripe_invoice_id: str) -> bool:
+    """
+    Return True if we have already recorded a subscription token award for this Stripe invoice (idempotency for webhook retries).
+    """
+    if not stripe_invoice_id or not _has_token_ledger:
+        return False
+    if not _token_ledger_table_exists(db):
+        return False
+    try:
+        r = db.execute(
+            text("""
+                SELECT 1 FROM token_ledger
+                WHERE user_id = :uid AND activity_type = 'add'
+                  AND reason IN ('subscription_monthly', 'subscription_yearly')
+                  AND (metadata->>'stripe_invoice_id') = :inv_id
+                LIMIT 1
+            """),
+            {"uid": user_id, "inv_id": stripe_invoice_id},
+        ).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
 def add_tokens(
     db: Session,
     user_id: int,
     amount: float,
     reason: str,
+    extra: dict | None = None,
 ) -> float:
     """
     Add amount to user's balance (rounded to 2 decimals). If reason is in PURCHASED_REASONS, also add to purchased_tokens.
-    Creates row if missing. Returns new tokens_remaining rounded to 2 decimals.
+    Creates row if missing. extra is stored in token_ledger.metadata (e.g. {"stripe_invoice_id": "in_xxx"} for idempotency).
+    Returns new tokens_remaining rounded to 2 decimals.
     """
     amount = round(float(amount), 2)
     if amount <= 0:
@@ -81,7 +107,7 @@ def add_tokens(
                     activity_type="add",
                     amount=amount,
                     reason=reason,
-                    extra=None,
+                    extra=extra,
                 ))
             db.flush()
         return get_tokens_remaining(db, user_id)
@@ -104,7 +130,7 @@ def add_tokens(
                     activity_type="add",
                     amount=amount,
                     reason=reason,
-                    extra=None,
+                    extra=extra,
                 ))
                 db.flush()
         except Exception:

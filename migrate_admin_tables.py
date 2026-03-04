@@ -102,6 +102,7 @@ def main():
             ("registration_bonus_tokens", "150"),
             ("min_withdrawal_usdt", "10"),
             ("daily_deduction_utc_hour", "10"),
+            ("deduction_multiplier", "1"),
             ("bot_auto_start", "true"),
             ("referral_system_enabled", "true"),
             ("withdrawal_enabled", "true"),

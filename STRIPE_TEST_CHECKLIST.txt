@@ -1,0 +1,23 @@
+Stripe Whales plan test (user 2) – checklist
+============================================
+
+1. Start Stripe CLI listener (in a separate terminal):
+   stripe listen --forward-to http://127.0.0.1:8000/webhook/stripe
+
+2. Copy the "whsec_..." signing secret from the listener output.
+
+3. In .env set:
+   STRIPE_WEBHOOK_SECRET="whsec_xxxxxxxx"   (paste the real value)
+
+4. Restart the backend so it loads the new secret.
+
+5. Log in as user 2 in the app → Subscription → choose Whales plan → Subscribe.
+
+6. Complete Stripe Checkout (test card 4242 4242 4242 4242).
+
+7. After payment, check:
+   - Dashboard: token balance should increase by 40,000 (Whales monthly).
+   - Backend console: look for "stripe_webhook" and "subscription_token_award".
+   - File stripe_webhook_debug.log (project root): event type, user_id, tokens_added, new_balance.
+
+If tokens still don’t increase: open stripe_webhook_debug.log. If the file is missing or empty, the webhook is not reaching the backend (run step 1 and fix step 3).

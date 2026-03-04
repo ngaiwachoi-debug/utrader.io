@@ -1,14 +1,11 @@
-import createMiddleware from 'next-intl/middleware';
+import createMiddleware from "next-intl/middleware";
 import { withAuth } from "next-auth/middleware";
 import { NextRequest } from "next/request";
+import { routing } from "./i18n/routing";
 
-const locales = ['en', 'zh', 'ko', 'ru', 'de'];
-const publicPages = ['/', '/login', '/dashboard', '/admin-login']; // Dashboard public for "Dev: Login as"; admin-login for admin Google sign-in
+const publicPages = ["/", "/login", "/dashboard", "/admin-login"]; // Dashboard public for "Dev: Login as"; admin-login for admin Google sign-in
 
-const intlMiddleware = createMiddleware({
-  locales,
-  defaultLocale: 'en'
-});
+const intlMiddleware = createMiddleware(routing);
 
 const authMiddleware = withAuth(
   (req) => intlMiddleware(req),
@@ -24,8 +21,8 @@ const authMiddleware = withAuth(
 
 export default function middleware(req: NextRequest) {
   const publicPathnameRegex = RegExp(
-    `^(/(${locales.join('|')}))?(${publicPages.join('|')})?/?$`,
-    'i'
+    `^(/(${routing.locales.join("|")}))?(${publicPages.join("|")})?/?$`,
+    "i"
   );
   const isPublicPage = publicPathnameRegex.test(req.nextUrl.pathname);
 

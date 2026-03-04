@@ -137,6 +137,7 @@ function AdminSettingsFormInline({ settings, loading, backendToken, onSave }: { 
         const v = local.registration_bonus_tokens; if (v !== undefined && v !== "") body.registration_bonus_tokens = parseInt(String(v), 10)
         const v2 = local.min_withdrawal_usdt; if (v2 !== undefined && v2 !== "") body.min_withdrawal_usdt = parseFloat(String(v2))
         const v3 = local.daily_deduction_utc_hour; if (v3 !== undefined && v3 !== "") body.daily_deduction_utc_hour = parseInt(String(v3), 10)
+        const vMult = local.deduction_multiplier; if (vMult !== undefined && vMult !== "") { const n = parseFloat(String(vMult)); if (Number.isFinite(n)) body.deduction_multiplier = Math.max(0.01, Math.min(100, n)) }
         const v4 = local.bot_auto_start; if (v4 !== undefined && v4 !== "") body.bot_auto_start = v4 === "true"
         const v5 = local.referral_system_enabled; if (v5 !== undefined && v5 !== "") body.referral_system_enabled = v5 === "true"
         const v6 = local.withdrawal_enabled; if (v6 !== undefined && v6 !== "") body.withdrawal_enabled = v6 === "true"
@@ -215,8 +216,9 @@ export default function AdminPage() {
   const [auditFilterEmail, setAuditFilterEmail] = useState("")
   const [deductionStartDate, setDeductionStartDate] = useState("")
   const [deductionEndDate, setDeductionEndDate] = useState("")
-  const [tokenAddLogs, setTokenAddLogs] = useState<{ id?: number; user_id: number; email?: string; amount: number; reason: string; created_at: string }[]>([])
+  const [tokenAddLogs, setTokenAddLogs] = useState<{ id?: number; user_id: number; email?: string; amount: number; reason: string; created_at: string; detail?: string | null }[]>([])
   const [tokenAddLoading, setTokenAddLoading] = useState(false)
+  const [tokenAddError, setTokenAddError] = useState(false)
   const [tokenAddUserId, setTokenAddUserId] = useState("")
   const [tokenAddStartDate, setTokenAddStartDate] = useState("")
   const [tokenAddEndDate, setTokenAddEndDate] = useState("")
@@ -327,6 +329,7 @@ export default function AdminPage() {
   const fetchTokenAddLogs = useCallback(async (token: string) => {
     try {
       setTokenAddLoading(true)
+      setTokenAddError(false)
       const params = new URLSearchParams({ limit: "100" })
       if (tokenAddUserId) params.set("user_id", tokenAddUserId)
       if (tokenAddStartDate) params.set("start_date", tokenAddStartDate)
@@ -335,11 +338,16 @@ export default function AdminPage() {
         headers: { Authorization: `Bearer ${token}` },
       })
       if (res.status === 401) { handleSessionExpired(); return }
-      if (!res.ok) return
+      if (!res.ok) {
+        setTokenAddError(true)
+        setTokenAddLogs([])
+        return
+      }
       const data = await res.json()
       setTokenAddLogs(Array.isArray(data) ? data : [])
     } catch {
-      // ignore
+      setTokenAddError(true)
+      setTokenAddLogs([])
     } finally {
       setTokenAddLoading(false)
     }
@@ -1039,6 +1047,8 @@ export default function AdminPage() {
                         <tr className="border-b border-border">
                           <th className="text-left py-2 px-2">User ID</th>
                           <th className="text-left py-2 px-2">Time</th>
+                          <th className="text-left py-2 px-2">Balance before</th>
+                          <th className="text-left py-2 px-2">Gross profit (USD)</th>
                           <th className="text-left py-2 px-2">Deducted</th>
                           <th className="text-left py-2 px-2">After</th>
                         </tr>
@@ -1048,6 +1058,8 @@ export default function AdminPage() {
                           <tr key={i} className="border-b border-border/50">
                             <td className="py-2 px-2">{e.user_id}</td>
                             <td className="py-2 px-2">{e.timestamp}</td>
+                            <td className="py-2 px-2">{e.tokens_remaining_before != null && Number.isFinite(Number(e.tokens_remaining_before)) ? Number(e.tokens_remaining_before).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}</td>
+                            <td className="py-2 px-2">{e.gross_profit != null && Number.isFinite(Number(e.gross_profit)) ? Number(e.gross_profit).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}</td>
                             <td className="py-2 px-2">{e.tokens_deducted}</td>
                             <td className="py-2 px-2">{e.tokens_remaining_after}</td>
                           </tr>
@@ -1091,6 +1103,7 @@ export default function AdminPage() {
                         <th className="text-left py-2 px-2">Time</th>
                         <th className="text-left py-2 px-2">Amount</th>
                         <th className="text-left py-2 px-2">Reason</th>
+                        <th className="text-left py-2 px-2">Detail</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1101,11 +1114,18 @@ export default function AdminPage() {
                           <td className="py-2 px-2">{e.created_at}</td>
                           <td className="py-2 px-2">{e.amount}</td>
                           <td className="py-2 px-2">{e.reason}</td>
+                          <td className="py-2 px-2 text-muted-foreground">{e.detail ?? e.reason}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                  {tokenAddLogs.length === 0 && !tokenAddLoading && <p className="text-sm text-muted-foreground py-4">No token add logs yet.</p>}
+                  {tokenAddLogs.length === 0 && !tokenAddLoading && (
+                    <p className="text-sm text-muted-foreground py-4">
+                      {tokenAddError
+                        ? "Failed to load token add logs. Check backend and auth."
+                        : "No token add logs yet. Logs come from the token_ledger table. Run migration add_token_ledger_and_balance_columns.sql if needed; new subscription, admin, and registration adds will then appear here."}
+                    </p>
+                  )}
                 </div>
               )}
             </CardContent>

@@ -27,10 +27,13 @@ export const viewport: Viewport = {
   themeColor: "#10b981",
 }
 
-export default function LocaleLayout({
+export default async function LocaleLayout({
   children,
+  params,
 }: Readonly<{
   children: React.ReactNode
+  params: Promise<{ locale: string }>
 }>) {
+  await params
   return <>{children}</>
 }
