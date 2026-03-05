@@ -79,6 +79,7 @@ const translations: Record<string, TranslationEntry> = {
   "settings.noTokensAvailable": { en: "No tokens available", zh: "無可用代幣" },
   "settings.tokenUsageFailed": { en: "Failed to load token usage data", zh: "無法載入代幣使用量資料" },
   "settings.tokensUsedRemaining": { en: "Tokens Used: {used} | Remaining: {remaining}", zh: "已使用：{used} | 剩餘：{remaining}" },
+  "settings.tokensRemainingUsed": { en: "Remaining: {remaining} | Used: {used}", zh: "剩餘：{remaining} | 已使用：{used}" },
   "settings.totalBudget": { en: "Total Budget: {total}", zh: "總預算：{total}" },
   "settings.every30Minutes": { en: "Every 30 minutes", zh: "每 30 分鐘" },
   "settings.noRenewalDate": { en: "No renewal date (Free Plan)", zh: "無續訂日期（免費方案）" },
@@ -92,6 +93,8 @@ const translations: Record<string, TranslationEntry> = {
   "settings.tokenAddLog": { en: "Token add log", zh: "代幣添加記錄" },
   "settings.tokenDeductionLog": { en: "Token deduction log", zh: "代幣扣減記錄" },
   "settings.noTokenAddHistory": { en: "No token add history yet.", zh: "尚無代幣添加記錄。" },
+  "settings.noTokenAddHistoryShort": { en: "No purchases or top-ups yet.", zh: "尚無購買或儲值記錄。" },
+  "settings.tokenActivitySubtitle": { en: "Subscription, pay-as-you-go, and deductions (newest first).", zh: "訂閱、隨用隨付與扣減記錄（由新到舊）。" },
   "settings.noDeductionHistory": { en: "No deduction history yet.", zh: "尚無扣減記錄。" },
 
   // Login / Landing

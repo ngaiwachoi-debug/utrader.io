@@ -8,6 +8,7 @@ Multi-tenant ready: all variables are isolated per instance.
 
 import asyncio
 import aiohttp
+import math
 import os
 import threading
 import websockets
@@ -22,6 +23,7 @@ from google import genai
 
 from services.shared_oracle import get_oracle_snapshot
 from services.ai_injector import AI_ContextInjector
+from services.bitfinex_nonce import get_next_nonce
 
 # Institutional baselines (lag = minutes until lending rate typically spikes after BTC volume surge)
 IQM_BASELINES_PATH = Path(__file__).resolve().parent / "data" / "iqm_baselines.json"
@@ -136,14 +138,42 @@ class WallStreet_Omni_FullEngine:
         self._nonce = max(self._nonce + 1, int(time.time() * 1000000))
         return str(self._nonce)
 
+    def _rebase_nonce_for_10114(self) -> None:
+        """Re-base shared nonce above current time so next request is above what Bitfinex has seen (after 10114)."""
+        if self._shared_nonce_ref is not None:
+            lst, lock = self._shared_nonce_ref
+            with lock:
+                lst[0] = int(time.time() * 1000000) + 1000
+        else:
+            self._nonce = int(time.time() * 1000000) + 1000
+
+    @staticmethod
+    def _is_nonce_error(status: int, body: list | str) -> bool:
+        """True if response indicates Bitfinex 10114 'nonce: small'."""
+        if status != 200:
+            if isinstance(body, str):
+                try:
+                    parsed = json.loads(body)
+                    if isinstance(parsed, list) and len(parsed) >= 2:
+                        if parsed[0] == "error" and (parsed[1] == 10114 or (len(parsed) > 2 and "nonce" in str(parsed[2]).lower())):
+                            return True
+                except Exception:
+                    if "10114" in body or "nonce" in body.lower():
+                        return True
+            return False
+        if isinstance(body, list) and len(body) >= 2 and body[0] == "error":
+            if body[1] == 10114 or (len(body) > 2 and "nonce" in str(body[2]).lower()):
+                return True
+        return False
+
     def _generate_signature(self, path: str, nonce: str, body: dict) -> str:
         payload = json.dumps(body) if body else "{}"
         signature = f"/api/v2{path}{nonce}{payload}"
         return hmac.new(self.api_secret.encode(), signature.encode(), hashlib.sha384).hexdigest()
 
     async def _api_request(self, path: str, body: dict = None) -> dict | list | None:
-        async def _do_request():
-            nonce = self.get_nonce()
+        async def _do_request() -> tuple[dict | list | None, bool]:
+            nonce = await get_next_nonce(self.redis_pool, self.api_key) if self.redis_pool else self.get_nonce()
             headers = {
                 "bfx-nonce": nonce,
                 "bfx-apikey": self.api_key,
@@ -156,21 +186,34 @@ class WallStreet_Omni_FullEngine:
                         if resp.status != 200:
                             body_text = await resp.text()
                             self._log(f"[User {self.user_id}] API {path} → HTTP {resp.status} | {body_text[:200]}")
-                            return None
+                            is_nonce = self._is_nonce_error(resp.status, body_text)
+                            return (None, is_nonce)
                         out = await resp.json()
-                        # Bitfinex can return ["error", "message"] with 200
+                        # Bitfinex can return ["error", code, "message"] with 200
                         if isinstance(out, list) and len(out) > 0 and out[0] == "error":
                             self._log(f"[User {self.user_id}] API {path} → error response: {out}")
-                            return None
-                        return out
+                            is_nonce = self._is_nonce_error(200, out)
+                            return (None, is_nonce)
+                        return (out, False)
             except Exception as e:
                 self._log(f"[User {self.user_id}] API Error ({path}): {e}")
-                return None
+                return (None, False)
+
+        async def _run():
+            result, is_10114 = await _do_request()
+            if result is not None:
+                return result
+            if is_10114:
+                self._rebase_nonce_for_10114()
+                await asyncio.sleep(1.5)
+                result, _ = await _do_request()
+                return result
+            return None
 
         if self._bfx_request_lock is not None:
             async with self._bfx_request_lock:
-                return await _do_request()
-        return await _do_request()
+                return await _run()
+        return await _run()
 
     # --- 🟢 Dashboard Heartbeat ---
     async def broadcast_status(self):
@@ -310,7 +353,8 @@ class WallStreet_Omni_FullEngine:
             insight = await self.get_ai_insight(wapr, util, loaned)
             self._log(f"\n[{self._now()}] [User {self.user_id}] 📈 Strategy: {insight}")
             await self._api_request("/auth/w/funding/offer/cancel/all", {"currency": self.wallet_currency})
-            await asyncio.sleep(2) 
+            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)  # Let Bitfinex update w[4] before we fetch (reduces 10001 on stale available)
 
         # Same as check script: /auth/r/wallets → w[0]=TYPE, w[1]=CURRENCY, w[2]=BALANCE, w[4]=AVAILABLE_BALANCE
         wallets = await self._api_request("/auth/r/wallets", {})
@@ -329,25 +373,15 @@ class WallStreet_Omni_FullEngine:
                 except (TypeError, ValueError):
                     raw_available = None
             break
-        in_offers = 0.0
-        if raw_available is not None and raw_available >= self.MIN_ORDER_AMT:
-            available = raw_available
-            self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Available = w[4] = {available:,.4f} (same as check script)")
-        else:
-            offers = await self._api_request(f"/auth/r/funding/offers/{self.symbol}", {})
-            if offers and isinstance(offers, list) and offers[0] != "error":
-                for o in offers:
-                    try:
-                        if len(o) > 4 and o[4] is not None:
-                            in_offers += float(o[4])
-                    except (TypeError, ValueError, IndexError):
-                        pass
-            available = max(0.0, balance - in_offers)
-            if available >= self.MIN_ORDER_AMT:
-                self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] API available=0/null; using balance - offers = {available:,.4f} (w[2]={balance:,.4f} in_offers={in_offers:,.4f})")
-        if available < self.MIN_ORDER_AMT:
-            self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Idle/skip: w[2]={balance:,.4f} w[4]={raw_available!r} in_offers={in_offers:,.4f} available={available:,.4f} MIN={self.MIN_ORDER_AMT:,.4f} (compare with scripts/check_wallet_available_user2.py)")
+        # Only deploy when w[4] (deposit available) is valid; do not use balance - in_offers (overestimates and causes "not enough balance in deposit wallet")
+        if raw_available is None or raw_available < self.MIN_ORDER_AMT:
+            self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Skip deploy: w[4] missing or < MIN; need deposit available from API (w[2]={balance:,.4f} w[4]={raw_available!r} MIN={self.MIN_ORDER_AMT:,.4f})")
             return
+        # Safety margin (99%) to avoid Bitfinex 10001 "not enough balance in deposit wallet"
+        available = min(raw_available, math.floor(raw_available * 0.99 * 1e4) / 1e4)
+        if available < self.MIN_ORDER_AMT:
+            return
+        self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Available = {available:,.4f} (w[4]={raw_available:,.4f}, 99% margin)")
 
         # Strategy B: only place when current rate >= 24h rolling median (gate off if STRATEGY_B_GATE_ENABLED=0)
         if _strategy_b_gate_enabled() and self.redis_pool:
@@ -366,6 +400,10 @@ class WallStreet_Omni_FullEngine:
         self._log(f"[{self._now()}] [User {self.user_id}] 🌊 [{self.wallet_currency}] Grid Available: {available:,.4f}")
         ops, running_balance = [], available
 
+        def _round_down_4(x: float) -> float:
+            """Round down to 4 decimals so sum of orders never exceeds available."""
+            return math.floor(x * 1e4) / 1e4
+
         # Tranche Calculation
         if full_rebuild and available < self.SWEEP_AMT:
             amt_s, amt_m, amt_t = available, 0.0, 0.0
@@ -379,25 +417,37 @@ class WallStreet_Omni_FullEngine:
             grid_s = min(max(int(amt_s / (2000 / self.spot_price)), 3), 15)
             single_amt = max(amt_s / grid_s, self.MIN_ORDER_AMT)
             for r in np.linspace(safe_frr, safe_frr * 1.05, grid_s):
-                if running_balance < self.MIN_ORDER_AMT: break
+                if running_balance < self.MIN_ORDER_AMT:
+                    break
                 order_amt = single_amt if running_balance - single_amt >= self.MIN_ORDER_AMT else running_balance
-                ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": str(round(order_amt, 4)), "rate": str(round(r, 8)), "period": 2, "label": "SENIOR"})
+                order_amt = _round_down_4(min(order_amt, running_balance))
+                if order_amt < self.MIN_ORDER_AMT:
+                    break
+                ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": f"{order_amt:.4f}", "rate": str(round(r, 8)), "period": 2, "label": "SENIOR"})
                 running_balance -= order_amt
 
         # 2. Mezzanine (30-Day)
         if full_rebuild and running_balance >= self.MIN_ORDER_AMT and amt_m > 0:
             for r in np.linspace(self.current_frr * 1.5, self.current_frr * 2.8, 4):
-                if running_balance < self.MIN_ORDER_AMT: break
+                if running_balance < self.MIN_ORDER_AMT:
+                    break
                 order_amt = max(amt_m / 4, self.MIN_ORDER_AMT)
-                ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": str(round(order_amt, 4)), "rate": str(round(r, 8)), "period": 30, "flags": 64, "label": "MEZZANINE"})
+                order_amt = _round_down_4(min(order_amt, running_balance))
+                if order_amt < self.MIN_ORDER_AMT:
+                    break
+                ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": f"{order_amt:.4f}", "rate": str(round(r, 8)), "period": 30, "flags": 64, "label": "MEZZANINE"})
                 running_balance -= order_amt
 
         # 3. Tail Trap (60-Day)
         if full_rebuild and running_balance >= self.MIN_ORDER_AMT and amt_t > 0:
             for r in np.geomspace(self.current_frr * 3.0, self.current_frr * 6.0, 3):
-                if running_balance < self.MIN_ORDER_AMT: break
+                if running_balance < self.MIN_ORDER_AMT:
+                    break
                 order_amt = self.MIN_ORDER_AMT if running_balance > (self.MIN_ORDER_AMT * 2) else running_balance
-                ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": str(round(order_amt, 4)), "rate": str(round(r, 8)), "period": 60, "flags": 64, "label": "TAIL TRAP"})
+                order_amt = _round_down_4(min(order_amt, running_balance))
+                if order_amt < self.MIN_ORDER_AMT:
+                    break
+                ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": f"{order_amt:.4f}", "rate": str(round(r, 8)), "period": 60, "flags": 64, "label": "TAIL TRAP"})
                 running_balance -= order_amt
 
         for op in ops:
@@ -445,9 +495,14 @@ class PortfolioManager:
         self._bfx_request_lock = asyncio.Lock()
 
     async def _api_request(self, path: str, body: dict = None):
-        self._nonce = max(self._nonce + 1, int(time.time() * 1000000))
-        headers = {"bfx-nonce": str(self._nonce), "bfx-apikey": self.api_key, "Content-Type": "application/json",
-                   "bfx-signature": hmac.new(self.api_secret.encode(), f"/api/v2{path}{self._nonce}{json.dumps(body or {}) if body else '{}'}".encode(), hashlib.sha384).hexdigest()}
+        if self.redis_pool:
+            nonce = await get_next_nonce(self.redis_pool, self.api_key)
+        else:
+            self._nonce = max(self._nonce + 1, int(time.time() * 1000000))
+            nonce = str(self._nonce)
+        body_str = json.dumps(body or {}) if body else "{}"
+        headers = {"bfx-nonce": nonce, "bfx-apikey": self.api_key, "Content-Type": "application/json",
+                   "bfx-signature": hmac.new(self.api_secret.encode(), f"/api/v2{path}{nonce}{body_str}".encode(), hashlib.sha384).hexdigest()}
         async with aiohttp.ClientSession() as s:
             async with s.post(f"https://api.bitfinex.com/v2{path}", headers=headers, json=body) as r:
                 return await r.json() if r.status == 200 else None
@@ -459,8 +514,9 @@ class PortfolioManager:
             self.log_lines.append(msg)
         async with self._bfx_request_lock:
             wallets = await self._api_request("/auth/r/wallets", {})
-        # Sync shared_nonce so engines continue from the same counter (avoid duplicate nonce)
-        self._shared_nonce[0] = self._nonce
+        # Sync shared_nonce so engines (when not using Redis) continue from same counter
+        if not self.redis_pool:
+            self._shared_nonce[0] = self._nonce
         if not wallets or (isinstance(wallets, list) and len(wallets) > 0 and wallets[0] == "error"):
             err = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] [SCANNER] Failure: Could not fetch wallets (API error or empty)."
             print(err)

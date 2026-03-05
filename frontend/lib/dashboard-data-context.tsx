@@ -36,6 +36,12 @@ export type WalletSummary = {
 export type BotStatsData = { active: boolean; total_loaned: number }
 export type UserStatusData = { tokens_remaining: number | null; plan_tier: string | null }
 
+export type TokenBalanceData = {
+  tokens_remaining: number
+  total_tokens_added: number
+  total_tokens_deducted: number
+}
+
 export type LendingStatsTrade = {
   id: number
   currency: string
@@ -102,12 +108,22 @@ export type ReferralRewardHistoryRow = {
   level?: number
 }
 
+export type UsdtHistoryRow = {
+  id: number
+  user_id: number
+  amount: number
+  reason: string
+  created_at: string | null
+  admin_email: string | null
+}
+
 export type ReferralUsdtData = {
   referralInfo: ReferralInfo | null
   usdtCredit: ReferralUsdtCredit | null
   withdrawals: ReferralWithdrawalRow[]
   rewardHistory: ReferralRewardHistoryRow[]
   downline: ReferralDownlineRow[]
+  usdtHistory: UsdtHistoryRow[]
 }
 
 type CacheEntry<T> = {
@@ -124,12 +140,16 @@ type UserStatusCacheEntry = CacheEntry<UserStatusData>
 type LendingStatsCacheEntry = CacheEntry<LendingStatsData>
 type ReferralDataCacheEntry = CacheEntry<ReferralUsdtData>
 
+type TokenBalanceCacheEntry = { data: TokenBalanceData | null; fetchedAt: number }
+
 type CacheState = {
   wallets: Record<number, WalletCacheEntry>
   botStats: Record<number, BotStatsCacheEntry>
   userStatus: Record<number, UserStatusCacheEntry>
   lendingStats: Record<number, LendingStatsCacheEntry>
   referralData: Record<number, ReferralDataCacheEntry>
+  /** From dashboard-fold or GET /api/v1/users/me/token-balance; avoids extra request on load. */
+  tokenBalance: Record<number, TokenBalanceCacheEntry>
   /** Platform deduction multiplier: tokens_deducted = daily_gross * multiplier (from admin setting). */
   deductionMultiplier: number | null
   version: number
@@ -174,12 +194,16 @@ type DashboardDataContextValue = {
     isRevalidating: boolean
     refetch: () => Promise<void>
   }
+  /** Token balance (from fold or refetch). Use instead of separate /token-balance call on load. */
+  getTokenBalance: (userId: number) => { data: TokenBalanceData | null; refetch: () => Promise<void> }
   /** Current deduction multiplier (1 USD gross = multiplier tokens). Default 1 when unknown. */
   deductionMultiplier: number
   prefetch: (userId: number) => void
+  /** Fetch referral data when user opens Referral or Settings (deferred from initial load). */
+  ensureReferralData: (userId: number) => void
 }
 
-const initialState: CacheState = { wallets: {}, botStats: {}, userStatus: {}, lendingStats: {}, referralData: {}, deductionMultiplier: null, version: 0 }
+const initialState: CacheState = { wallets: {}, botStats: {}, userStatus: {}, lendingStats: {}, referralData: {}, tokenBalance: {}, deductionMultiplier: null, version: 0 }
 const DashboardDataContext = createContext<DashboardDataContextValue | null>(null)
 
 function loadFromStorage<T>(key: string): T | null {
@@ -260,6 +284,7 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
   const inFlightUserStatus = useRef<Record<number, Promise<void>>>({})
   const inFlightLendingStats = useRef<Record<number, Promise<void>>>({})
   const inFlightReferralData = useRef<Record<number, Promise<void>>>({})
+  const inFlightTokenBalance = useRef<Record<number, Promise<void>>>({})
 
   const updateState = useCallback((updater: (prev: CacheState) => CacheState) => {
     setState((prev) => ({ ...updater(prev), version: prev.version + 1 }))
@@ -336,10 +361,7 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
             },
           },
         }))
-        saveToStorage(`${STORAGE_PREFIX}:${userId}:botStats`, {
-          data: { active, total_loaned: Number.isFinite(total_loaned) ? total_loaned : 0 },
-          fetchedAt: Date.now(),
-        })
+        // Do not persist botStats to sessionStorage so tab reopen always fetches current status.
       } else {
         updateState((prev) => ({
           ...prev,
@@ -402,7 +424,7 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     [state.userStatus, updateState]
   )
 
-  /** When lending has gross profit but no trades (e.g. cache hit), fetch funding-trades so charts can show data. */
+  /** When lending has gross profit but no trades, fetch funding-trades so charts can show data. No-op if fold already populated trades. */
   const ensureLendingTrades = useCallback(
     async (userId: number, data: LendingStatsData): Promise<void> => {
       if (!(data.gross_profit > 0 && (!data.trades || data.trades.length === 0))) return
@@ -507,24 +529,16 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
       }
       const headers: HeadersInit = { Authorization: `Bearer ${token}` }
       try {
-        const [refRes, creditRes, histRes, rewardRes, downlineRes] = await Promise.all([
-          fetch(`${API_BACKEND}/api/v1/user/referral-info`, { credentials: "include", headers }),
-          fetch(`${API_BACKEND}/api/v1/user/usdt-credit`, { credentials: "include", headers }),
-          fetch(`${API_BACKEND}/api/v1/user/usdt-withdraw-history`, { credentials: "include", headers }),
-          fetch(`${API_BACKEND}/api/v1/user/referral-reward-history?limit=50`, { credentials: "include", headers }),
-          fetch(`${API_BACKEND}/api/v1/user/referral-downline`, { credentials: "include", headers }),
-        ])
-        const referralInfo: ReferralInfo | null = refRes.ok ? await refRes.json().catch(() => null) : null
-        const usdtCredit: ReferralUsdtCredit | null = creditRes.ok ? await creditRes.json().catch(() => null) : null
-        const withdrawals: ReferralWithdrawalRow[] = histRes.ok ? await histRes.json().catch(() => []) : []
-        const rewardHistory: ReferralRewardHistoryRow[] = rewardRes.ok ? await rewardRes.json().catch(() => []) : []
-        const downline: ReferralDownlineRow[] = downlineRes.ok ? await downlineRes.json().catch(() => []) : []
+        const res = await fetch(`${API_BACKEND}/api/v1/user/referral-bundle?limit=50`, { credentials: "include", headers })
+        if (!res.ok) throw new Error("Referral bundle failed")
+        const raw = await res.json().catch(() => ({}))
         const data: ReferralUsdtData = {
-          referralInfo,
-          usdtCredit,
-          withdrawals: Array.isArray(withdrawals) ? withdrawals : [],
-          rewardHistory: Array.isArray(rewardHistory) ? rewardHistory : [],
-          downline: Array.isArray(downline) ? downline : [],
+          referralInfo: raw.referralInfo ?? null,
+          usdtCredit: raw.usdtCredit ?? null,
+          withdrawals: Array.isArray(raw.withdrawals) ? raw.withdrawals : [],
+          rewardHistory: Array.isArray(raw.rewardHistory) ? raw.rewardHistory : [],
+          downline: Array.isArray(raw.downline) ? raw.downline : [],
+          usdtHistory: Array.isArray(raw.usdtHistory) ? raw.usdtHistory : [],
         }
         updateState((prev) => ({
           ...prev,
@@ -553,6 +567,34 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     [state.referralData, updateState]
   )
 
+  const fetchTokenBalance = useCallback(
+    async (userId: number): Promise<void> => {
+      const token = await getBackendToken()
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
+      try {
+        const res = await fetch(`${API_BACKEND}/api/v1/users/me/token-balance`, { credentials: "include", headers })
+        if (!res.ok) return
+        const data = await res.json().catch(() => null)
+        if (!data || typeof data.tokens_remaining !== "number") return
+        const payload: TokenBalanceData = {
+          tokens_remaining: Number(data.tokens_remaining),
+          total_tokens_added: Number(data.total_tokens_added ?? 0),
+          total_tokens_deducted: Number(data.total_tokens_deducted ?? 0),
+        }
+        updateState((prev) => ({
+          ...prev,
+          tokenBalance: {
+            ...prev.tokenBalance,
+            [userId]: { data: payload, fetchedAt: Date.now() },
+          },
+        }))
+      } catch {
+        // ignore
+      }
+    },
+    [updateState]
+  )
+
   const fetchDashboardFold = useCallback(
     async (userId: number): Promise<boolean> => {
       const token = await getBackendToken()
@@ -579,6 +621,14 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
       const mult = typeof (raw as Record<string, unknown>).deduction_multiplier === "number"
         ? (raw as Record<string, unknown>).deduction_multiplier as number
         : null
+      const tb = (raw as Record<string, unknown>).token_balance as Record<string, unknown> | undefined
+      const tokenBalanceData: TokenBalanceData | null = tb && typeof tb.tokens_remaining === "number"
+        ? {
+            tokens_remaining: Number(tb.tokens_remaining),
+            total_tokens_added: Number(tb.total_tokens_added ?? 0),
+            total_tokens_deducted: Number(tb.total_tokens_deducted ?? 0),
+          }
+        : null
       updateState((prev) => ({
         ...prev,
         deductionMultiplier: mult,
@@ -598,9 +648,13 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
           ...prev.lendingStats,
           [userId]: { data: lendingData, fetchedAt: now, error: null, source: "live", rateLimited: false },
         },
+        tokenBalance: {
+          ...prev.tokenBalance,
+          [userId]: { data: tokenBalanceData, fetchedAt: now },
+        },
       }))
       saveToStorage(`${STORAGE_PREFIX}:${userId}:wallets`, { data: walletsData, fetchedAt: now, source: "live" })
-      saveToStorage(`${STORAGE_PREFIX}:${userId}:botStats`, { data: botStatsData, fetchedAt: now })
+      // botStats not persisted to sessionStorage so status is always fresh on load
       saveToStorage(`${STORAGE_PREFIX}:${userId}:lendingStats`, { data: lendingData, fetchedAt: now, source: "live" })
       ensureLendingTrades(userId, lendingData).catch(() => {})
       return true
@@ -629,17 +683,8 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
   const getBotStatsEntry = useCallback((userId: number): BotStatsCacheEntry | null => {
     const entry = state.botStats[userId]
     if (entry) return entry
-    if (typeof window === "undefined") return null
-    const stored = loadFromStorage<{ data: BotStatsData; fetchedAt: number }>(
-      `${STORAGE_PREFIX}:${userId}:botStats`
-    )
-    if (!stored?.data) return null
-    return {
-      data: stored.data,
-      fetchedAt: stored.fetchedAt,
-      error: null,
-      source: "live",
-    }
+    // Do not load botStats from sessionStorage; always fetch so status is current on load.
+    return null
   }, [state.botStats])
 
   const getLendingStatsEntry = useCallback((userId: number): LendingStatsCacheEntry | null => {
@@ -819,13 +864,38 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
         }
       })()
       inFlightFold.current[userId] = foldPromise
-      if (!inFlightReferralData.current[userId]) {
-        inFlightReferralData.current[userId] = fetchReferralData(userId).finally(() => {
-          delete inFlightReferralData.current[userId]
+      // Referral data is fetched on demand via ensureReferralData when user opens Referral or Settings tab.
+    },
+    [fetchDashboardFold, fetchWallets, fetchBotStats, fetchUserStatus, fetchLendingStats]
+  )
+
+  const ensureReferralData = useCallback(
+    (userId: number) => {
+      if (inFlightReferralData.current[userId]) return
+      inFlightReferralData.current[userId] = fetchReferralData(userId).finally(() => {
+        delete inFlightReferralData.current[userId]
+      })
+    },
+    [fetchReferralData]
+  )
+
+  const getTokenBalance = useCallback(
+    (userId: number) => {
+      const entry = state.tokenBalance[userId]
+      const refetch = () => {
+        if (inFlightTokenBalance.current[userId]) return inFlightTokenBalance.current[userId]
+        const p = fetchTokenBalance(userId).finally(() => {
+          delete inFlightTokenBalance.current[userId]
         })
+        inFlightTokenBalance.current[userId] = p
+        return p
+      }
+      return {
+        data: entry?.data ?? null,
+        refetch: () => refetch(),
       }
     },
-    [fetchDashboardFold, fetchWallets, fetchBotStats, fetchUserStatus, fetchLendingStats, fetchReferralData]
+    [state.tokenBalance, state.version, fetchTokenBalance]
   )
 
   const value: DashboardDataContextValue = {
@@ -834,8 +904,10 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     getUserStatus,
     getLendingStats,
     getReferralData,
+    getTokenBalance,
     deductionMultiplier: state.deductionMultiplier ?? 1,
     prefetch,
+    ensureReferralData,
   }
 
   return <DashboardDataContext.Provider value={value}>{children}</DashboardDataContext.Provider>
@@ -877,14 +949,22 @@ export function useLendingStats(userId: number) {
 }
 
 export function useReferralData(userId: number) {
-  const { getReferralData, prefetch } = useDashboardData()
+  const { getReferralData, ensureReferralData } = useDashboardData()
   useEffect(() => {
-    if (userId != null && userId > 0) prefetch(userId)
-  }, [userId, prefetch])
+    if (userId != null && userId > 0) ensureReferralData(userId)
+  }, [userId, ensureReferralData])
   return getReferralData(userId)
 }
 
 export function useDeductionMultiplier(): number {
   const { deductionMultiplier } = useDashboardData()
   return deductionMultiplier
+}
+
+export function useTokenBalance(userId: number) {
+  const { getTokenBalance, prefetch } = useDashboardData()
+  useEffect(() => {
+    if (userId != null && userId > 0) prefetch(userId)
+  }, [userId, prefetch])
+  return getTokenBalance(userId)
 }

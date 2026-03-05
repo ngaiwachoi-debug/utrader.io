@@ -3,7 +3,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react"
 import { getBackendToken } from "@/lib/auth"
 import { useCurrentUserId } from "@/lib/current-user-context"
-import { useBotStats } from "@/lib/dashboard-data-context"
+import { useBotStats, useDashboardData } from "@/lib/dashboard-data-context"
 
 const API_BACKEND = "/api-backend"
 const BOT_STATUS_POLL_MS = 90000
@@ -41,6 +41,7 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
   const userId = useCurrentUserId()
   const id = userId ?? 0
   const botStats = useBotStats(id)
+  const { getWallets, getLendingStats } = useDashboardData()
   const botActive = botStats.data?.active ?? null
   const [insufficientTokens, setInsufficientTokens] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
@@ -54,10 +55,30 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
 
   const refreshBotStatus = useCallback(() => botStats.refetch(), [botStats.refetch])
 
+  // Poll only when tab is visible (Page Visibility API) to reduce server load from background tabs
   useEffect(() => {
     if (userId == null) return
-    const t = setInterval(refreshBotStatus, BOT_STATUS_POLL_MS)
-    return () => clearInterval(t)
+    let intervalId: ReturnType<typeof setInterval> | null = null
+    const startPolling = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return
+      intervalId = setInterval(refreshBotStatus, BOT_STATUS_POLL_MS)
+    }
+    const stopPolling = () => {
+      if (intervalId) {
+        clearInterval(intervalId)
+        intervalId = null
+      }
+    }
+    startPolling()
+    const onVisibility = () => {
+      stopPolling()
+      if (document.visibilityState === "visible") startPolling()
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility)
+      stopPolling()
+    }
   }, [userId, refreshBotStatus])
 
   // Tick down action cooldown every second
@@ -99,8 +120,12 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
         }
       } else if (data && (data.bot_status === "running" || data.bot_status === "starting")) {
         await refreshBotStatus()
+        getWallets(id).refetch()
+        getLendingStats(id).refetch()
       } else {
         await refreshBotStatus()
+        getWallets(id).refetch()
+        getLendingStats(id).refetch()
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -109,7 +134,7 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
       startInProgressRef.current = false
       setIsStarting(false)
     }
-  }, [userId, refreshBotStatus, actionCooldownSec])
+  }, [userId, refreshBotStatus, actionCooldownSec, getWallets, getLendingStats, id])
 
   const handleStop = useCallback(async () => {
     if (userId == null || actionCooldownSec > 0) return
@@ -151,6 +176,8 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
           log("stop-bot success body", { raw: text?.slice(0, 200) })
         }
         await refreshBotStatus()
+        getWallets(id).refetch()
+        getLendingStats(id).refetch()
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -160,7 +187,7 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
       stopInProgressRef.current = false
       setIsStopping(false)
     }
-  }, [userId, refreshBotStatus, actionCooldownSec])
+  }, [userId, refreshBotStatus, actionCooldownSec, getWallets, getLendingStats, id])
 
   const value: BotStatusContextValue = {
     botActive,

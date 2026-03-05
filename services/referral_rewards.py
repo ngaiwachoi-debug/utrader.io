@@ -15,10 +15,10 @@ REWARD_L1 = 0.0015
 REWARD_L2 = 0.0005
 REWARD_L3 = 0.0001
 
-# Purchase-based rewards: share of USD value added (deposit, subscription, admin add)
-REWARD_PURCHASE_L1 = 0.10   # 10%
-REWARD_PURCHASE_L2 = 0.05   # 5%
-REWARD_PURCHASE_L3 = 0.02   # 2%
+# Purchase-based rewards: default share of USD value (used when not passed in; admin can override via settings)
+DEFAULT_REWARD_PURCHASE_L1 = 0.10   # 10%
+DEFAULT_REWARD_PURCHASE_L2 = 0.05   # 5%
+DEFAULT_REWARD_PURCHASE_L3 = 0.02   # 2%
 
 
 def apply_referral_rewards(
@@ -85,16 +85,22 @@ def apply_referral_rewards_on_purchase(
     db: Session,
     referred_user_id: int,
     usd_amount: float,
+    reward_purchase_l1: Optional[float] = None,
+    reward_purchase_l2: Optional[float] = None,
+    reward_purchase_l3: Optional[float] = None,
 ) -> None:
     """
     Credit L1/L2/L3 uplines with USDT when a referred user adds purchased tokens
-    (deposit, subscription, admin add). L1=10%, L2=5%, L3=2% of usd_amount.
+    (deposit, subscription, admin add). Percentages are from admin settings or defaults (10%, 5%, 2%).
     """
     if usd_amount <= 0:
         return
     referred = db.query(models.User).filter(models.User.id == referred_user_id).first()
     if not referred or not referred.referred_by:
         return
+    l1 = reward_purchase_l1 if reward_purchase_l1 is not None else DEFAULT_REWARD_PURCHASE_L1
+    l2 = reward_purchase_l2 if reward_purchase_l2 is not None else DEFAULT_REWARD_PURCHASE_L2
+    l3 = reward_purchase_l3 if reward_purchase_l3 is not None else DEFAULT_REWARD_PURCHASE_L3
     level_1_id: Optional[int] = referred.referred_by
     level_2_id: Optional[int] = None
     level_3_id: Optional[int] = None
@@ -107,11 +113,24 @@ def apply_referral_rewards_on_purchase(
         if u2:
             level_3_id = u2.referred_by
 
-    reward_l1 = round(usd_amount * REWARD_PURCHASE_L1, 6)
-    reward_l2 = round(usd_amount * REWARD_PURCHASE_L2, 6)
-    reward_l3 = round(usd_amount * REWARD_PURCHASE_L3, 6)
+    reward_l1 = round(usd_amount * l1, 6)
+    reward_l2 = round(usd_amount * l2, 6)
+    reward_l3 = round(usd_amount * l3, 6)
 
     now = datetime.utcnow()
+
+    # Record in ReferralReward so downline "USDT earned from them" sums correctly (L1 only per referred user).
+    db.add(models.ReferralReward(
+        burning_user_id=referred_user_id,
+        level_1_id=level_1_id,
+        level_2_id=level_2_id,
+        level_3_id=level_3_id,
+        tokens_burned=0.0,  # purchase-based, not token burn
+        reward_l1=reward_l1,
+        reward_l2=reward_l2,
+        reward_l3=reward_l3,
+        created_at=now,
+    ))
 
     def credit_user(uid: Optional[int], amount: float) -> None:
         if uid is None or amount <= 0:

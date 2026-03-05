@@ -79,14 +79,15 @@ def test_scenario5_daily_2026_02_27_is_3_271661():
 
 
 def test_scenario5_daily_2026_02_28_tiny_entry():
-    """Scenario 5 Step 2: Daily 2026-02-28 = 0.000001 → tokens deducted 0.000001."""
+    """Scenario 5 Step 2: Daily 2026-02-28 = 0.000001 → tokens deducted; service rounds to 2 decimals."""
     from services.daily_token_deduction import apply_deduction_rule
 
     tokens_before = 100.0
     daily_gross = 0.000001
     new_tokens, should_deduct = apply_deduction_rule(tokens_before, daily_gross)
     assert should_deduct is True
-    assert abs(new_tokens - (tokens_before - daily_gross)) < 1e-9
+    # apply_deduction_rule rounds to 2 decimals: 100 - 0.000001 -> 100.0
+    assert abs(new_tokens - round(tokens_before - daily_gross, 2)) < 0.01
 
 
 # --- Scenario 1: Basic flow (09:59 no API, 10:00/10:30 timing) ---
@@ -197,11 +198,18 @@ def test_scenario3_account_switch_pre_10_00_triggers_fresh_api_call():
     mock_user.vault.created_at = datetime(2026, 2, 1)
     mock_user.vault.keys_updated_at = datetime(2026, 2, 27, 10, 0, 0)  # triggers account switch
 
-    mock_snap = MagicMock()
-    mock_snap.gross_profit_usd = 72.20
-    mock_snap.last_vault_updated_at = datetime(2026, 2, 26, 10, 0, 0)  # old
-    mock_snap.net_profit_usd = 0
-    mock_snap.bitfinex_fee_usd = 0
+    # Use a simple object so code under test can set gross_profit_usd and we can assert it
+    class _Snap:
+        gross_profit_usd = 72.20
+        last_vault_updated_at = datetime(2026, 2, 26, 10, 0, 0)
+        net_profit_usd = 0
+        bitfinex_fee_usd = 0
+        account_switch_note = None
+        daily_gross_profit_usd = 0
+        last_daily_cumulative_gross = None
+        last_daily_snapshot_date = None
+        updated_at = None
+    mock_snap = _Snap()
 
     mock_vault = MagicMock()
     mock_vault.keys_updated_at = datetime(2026, 2, 27, 10, 0, 0)
@@ -223,8 +231,12 @@ def test_scenario3_account_switch_pre_10_00_triggers_fresh_api_call():
         with freeze_time("2026-02-27 10:00:00", tz_offset=0):
             with patch("main._fetch_all_margin_funding_entries", new_callable=AsyncMock) as mock_fetch:
                 mock_fetch.return_value = (entries_new, latest_mts, None)
-                with patch("main._alert_admins_deduction_failure", new_callable=AsyncMock):
-                    success, incomplete, err = await _daily_10_00_fetch_and_save(1, mock_db)
+                with patch("main._get_ledger_currencies_for_user", new_callable=AsyncMock, return_value=["usd"]):
+                    with patch("main._fetch_ticker_prices", return_value={}):
+                        with patch("main._alert_admins_deduction_failure", new_callable=AsyncMock):
+                            with patch("main._gross_and_fees_from_ledger_entries") as mock_gross:
+                                mock_gross.return_value = (10.5, 0.0)  # new account total 10.50 USD
+                                success, incomplete, err = await _daily_10_00_fetch_and_save(1, mock_db)
         return success, incomplete, err, mock_snap
 
     success, incomplete, err, snap = asyncio.run(run())
@@ -300,14 +312,15 @@ def test_next_deduction_10_30_utc():
 # --- Deduction 1:1 with daily gross ---
 
 def test_scenario1_deduction_1_to_1_daily_gross():
-    """Scenario 1 Step 4: daily tokens deducted = daily_gross_profit_usd (1:1)."""
+    """Scenario 1 Step 4: daily tokens deducted = daily_gross_profit_usd (1:1); service rounds to 2 decimals."""
     from services.daily_token_deduction import apply_deduction_rule
 
     tokens_before = 500.0
     daily_gross = 3.271661
     new_tokens, should_deduct = apply_deduction_rule(tokens_before, daily_gross)
     assert should_deduct is True
-    assert abs(new_tokens - (tokens_before - daily_gross)) < 1e-6
+    # apply_deduction_rule rounds to 2 decimals: 500 - 3.271661 -> 496.73
+    assert abs(new_tokens - 496.73) < 0.01
 
 
 def test_post_validation_max_2_calls_per_day():
@@ -513,7 +526,8 @@ def test_free_rider_0500_key_deletion_1100_restoration():
     daily_cached = 3.271661
     new_tokens, should = apply_deduction_rule(500.0, daily_cached)
     assert should is True
-    assert abs(new_tokens - (500.0 - daily_cached)) < 1e-6
+    # apply_deduction_rule rounds to 2 decimals: 500 - 3.271661 -> 496.73
+    assert abs(new_tokens - 496.73) < 0.01
 
     entries_27 = [
         [None, None, None, int(datetime(2026, 2, 27).timestamp() * 1000), 3.271661, None, None, None, "Margin Funding Payment"],

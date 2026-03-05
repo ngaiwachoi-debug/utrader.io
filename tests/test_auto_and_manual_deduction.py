@@ -155,7 +155,10 @@ def test_auto_deduction_extreme_tokens_less_than_daily_gross_clamps_to_zero():
     db = database.SessionLocal()
     user_id = None
     try:
-        user_id = _make_user_with_balance_and_snapshot(db, "auto-clamp", 100.0, 100.0)
+        user_id = _make_user_with_balance_and_snapshot(
+            db, "auto-clamp", 100.0, 100.0,
+            last_daily_snapshot_date=_utc_today(),
+        )
         log_entries, err = run_daily_token_deduction(db, user_ids=[user_id])
         assert err is None, err
         assert len(log_entries) == 1

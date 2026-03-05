@@ -17,7 +17,7 @@ def test_authenticated_user_returns_correct_balance():
     import database
     import models
     from fastapi.testclient import TestClient
-    from main import app, get_current_user
+    from main import app, _get_current_user_for_token_balance
 
     db = database.SessionLocal()
     user_id = None
@@ -42,10 +42,10 @@ def test_authenticated_user_returns_correct_balance():
         ))
         db.commit()
 
-        def override_get_current_user():
+        def override_token_balance_user():
             return db.query(models.User).filter(models.User.id == user_id).first()
 
-        app.dependency_overrides[get_current_user] = override_get_current_user
+        app.dependency_overrides[_get_current_user_for_token_balance] = override_token_balance_user
         client = TestClient(app)
         try:
             r = client.get("/api/v1/users/me/token-balance")
@@ -57,7 +57,7 @@ def test_authenticated_user_returns_correct_balance():
             assert data["last_gross_usd_used"] == 500.0
             assert data.get("updated_at") is None or isinstance(data["updated_at"], str)
         finally:
-            app.dependency_overrides.pop(get_current_user, None)
+            app.dependency_overrides.pop(_get_current_user_for_token_balance, None)
     finally:
         if user_id is not None:
             db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()
@@ -81,7 +81,8 @@ def test_rate_limit_exceeded_returns_429():
     """Test 3: More than 10 requests in 1 minute → 429."""
     import database
     import models
-    from main import app, get_current_user, TOKEN_BALANCE_RL_MAX
+    from fastapi.testclient import TestClient
+    from main import app, _get_current_user_for_token_balance, TOKEN_BALANCE_RL_MAX
 
     db = database.SessionLocal()
     user_id = None
@@ -104,10 +105,10 @@ def test_rate_limit_exceeded_returns_429():
         ))
         db.commit()
 
-        def override_get_current_user():
+        def override_token_balance_user():
             return db.query(models.User).filter(models.User.id == user_id).first()
 
-        app.dependency_overrides[get_current_user] = override_get_current_user
+        app.dependency_overrides[_get_current_user_for_token_balance] = override_token_balance_user
         client = TestClient(app)
         try:
             for _ in range(TOKEN_BALANCE_RL_MAX + 1):
@@ -115,9 +116,10 @@ def test_rate_limit_exceeded_returns_429():
             assert r.status_code == 429
             assert "Rate limit exceeded" in r.json().get("detail", "")
         finally:
-            app.dependency_overrides.pop(get_current_user, None)
+            app.dependency_overrides.pop(_get_current_user_for_token_balance, None)
     finally:
         if user_id is not None:
+            db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()
             db.query(models.User).filter(models.User.id == user_id).delete()
             db.commit()
         db.close()
@@ -128,7 +130,7 @@ def test_no_user_token_balance_row_returns_404():
     import database
     import models
     from fastapi.testclient import TestClient
-    from main import app, get_current_user
+    from main import app, _get_current_user_for_token_balance
 
     db = database.SessionLocal()
     user_id = None
@@ -145,16 +147,16 @@ def test_no_user_token_balance_row_returns_404():
         db.refresh(user)
         user_id = user.id
 
-        def override_get_current_user():
+        def override_token_balance_user():
             return db.query(models.User).filter(models.User.id == user_id).first()
 
-        app.dependency_overrides[get_current_user] = override_get_current_user
+        app.dependency_overrides[_get_current_user_for_token_balance] = override_token_balance_user
         client = TestClient(app)
         try:
             r = client.get("/api/v1/users/me/token-balance")
             assert r.status_code == 404
         finally:
-            app.dependency_overrides.pop(get_current_user, None)
+            app.dependency_overrides.pop(_get_current_user_for_token_balance, None)
     finally:
         if user_id is not None:
             db.query(models.User).filter(models.User.id == user_id).delete()
@@ -164,10 +166,12 @@ def test_no_user_token_balance_row_returns_404():
 
 def test_after_deduction_balance_updates():
     """Test 5: After run_daily_token_deduction, balance reflects deduction."""
+    from datetime import datetime, timezone
+
     import database
     import models
     from fastapi.testclient import TestClient
-    from main import app, get_current_user
+    from main import app, _get_current_user_for_token_balance
     from services.daily_token_deduction import run_daily_token_deduction
 
     db = database.SessionLocal()
@@ -191,21 +195,24 @@ def test_after_deduction_balance_updates():
             purchased_tokens=2000.0,
             last_gross_usd_used=0.0,
         ))
-        db.add(models.UserProfitSnapshot(
+        snap = models.UserProfitSnapshot(
             user_id=user_id,
             gross_profit_usd=100.0,
             net_profit_usd=85.0,
             bitfinex_fee_usd=15.0,
             daily_gross_profit_usd=500.0,
-        ))
+        )
+        if hasattr(snap, "last_daily_snapshot_date"):
+            snap.last_daily_snapshot_date = datetime.now(timezone.utc).date()
+        db.add(snap)
         db.commit()
 
         run_daily_token_deduction(db)
 
-        def override_get_current_user():
+        def override_token_balance_user():
             return db.query(models.User).filter(models.User.id == user_id).first()
 
-        app.dependency_overrides[get_current_user] = override_get_current_user
+        app.dependency_overrides[_get_current_user_for_token_balance] = override_token_balance_user
         client = TestClient(app)
         try:
             r = client.get("/api/v1/users/me/token-balance")
@@ -216,10 +223,14 @@ def test_after_deduction_balance_updates():
             assert data["total_tokens_deducted"] == 500.0
             assert data["last_gross_usd_used"] == 500.0
         finally:
-            app.dependency_overrides.pop(get_current_user, None)
+            app.dependency_overrides.pop(_get_current_user_for_token_balance, None)
     finally:
         if user_id is not None:
-            db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).delete()
+            if hasattr(models, "TokenLedger"):
+                db.query(models.TokenLedger).filter(models.TokenLedger.user_id == user_id).delete(synchronize_session=False)
+            if hasattr(models, "DeductionLog"):
+                db.query(models.DeductionLog).filter(models.DeductionLog.user_id == user_id).delete(synchronize_session=False)
+            db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).delete(synchronize_session=False)
             db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()
             db.query(models.User).filter(models.User.id == user_id).delete()
             db.commit()

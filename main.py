@@ -40,7 +40,7 @@ import models
 import security
 from utils.logging import generate_trace_id, get_trace_id, set_trace_id
 from services.bitfinex_service import BitfinexManager, hash_bitfinex_id
-from services import bitfinex_cache
+from services import bitfinex_cache  # Short TTL (90s/120s); call invalidate() after mutations so next request is live.
 from services.daily_token_deduction import run_daily_token_deduction, run_deduction_for_user_for_date
 from services import ledger_cache as ledger_cache_svc
 from services import token_ledger_service as token_ledger_svc
@@ -663,6 +663,7 @@ async def _run_daily_token_deduction_scheduler() -> None:
         set_trace_id(generate_trace_id())
         logger.info("trace_id=%s | Next daily token deduction at 10:30 UTC in %.0fs", get_trace_id(), wait_sec)
         await asyncio.sleep(wait_sec)
+        logger.info("Daily token deduction: scheduler woke at ~10:30 UTC; starting deduction run.")
         last_error: Optional[str] = None
         for attempt in range(DEDUCTION_MAX_RETRIES):
             db = database.SessionLocal()
@@ -1056,7 +1057,39 @@ async def lifespan(app: FastAPI):
             db.close()
     except Exception as e:
         logger.warning("Startup ranking/referral_gain snapshot seed failed: %s", e)
+    # Ensure token_ledger table exists (so admin and user token-add logs work)
+    try:
+        db = database.SessionLocal()
+        try:
+            r = db.execute(
+                text("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'token_ledger'")
+            ).fetchone()
+            if not r:
+                db.execute(text("""
+                    CREATE TABLE token_ledger (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        activity_type VARCHAR(16) NOT NULL,
+                        amount DOUBLE PRECISION NOT NULL,
+                        reason VARCHAR(64) NOT NULL,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        metadata JSONB
+                    )
+                """))
+                db.execute(text("CREATE INDEX idx_token_ledger_user_id_created_at ON token_ledger(user_id, created_at)"))
+                db.commit()
+                logger.info("Startup: created token_ledger table")
+            else:
+                logger.info("Startup: token_ledger table exists")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("Startup token_ledger ensure failed: %s", e)
     # 09:00 UTC ledger cache; 10:00 API fetch; 10:30 deduction; 11:15 catch-up; 12:00 late fee; 23:00 reconciliation
+    logger.info(
+        "Auto token deduction runs only at 10:30 UTC when the backend is running. "
+        "If the server is off at 10:30 UTC, deduction will not run; use Admin Panel → Deduction → Manual trigger or POST /admin/deduction/trigger to run it."
+    )
     ledger_cache_task = asyncio.create_task(_run_09_00_ledger_cache_scheduler())
     scheduler_task = asyncio.create_task(_run_daily_gross_profit_scheduler())
     deduction_task = asyncio.create_task(_run_daily_token_deduction_scheduler())
@@ -1202,21 +1235,38 @@ class GoogleAuthPayload(BaseModel):
     referral_code: Optional[str] = None
 
 
-def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], db: Session) -> models.User:
-    email: str = idinfo.get("email", "")
-    hd = email.split("@")[-1] if "@" in email else ""
+class BootstrapUserPayload(BaseModel):
+    referral_code: Optional[str] = None
+
+
+def _apply_referral_first_touch(user: models.User, referral_code: Optional[str], db: Session) -> bool:
+    """
+    First-touch referral policy:
+    - only set referrer when user has no referred_by yet
+    - ignore invalid/missing code
+    - prevent self-referral
+    Returns True when referred_by is updated.
+    """
+    code = (referral_code or "").strip()
+    if not code or user.referred_by is not None:
+        return False
+    referrer = db.query(models.User).filter(models.User.referral_code == code).first()
+    if not referrer or referrer.id == user.id:
+        return False
+    user.referred_by = referrer.id
+    db.commit()
+    db.refresh(user)
+    return True
+
+
+def _create_user_by_email(email: str, referral_code: Optional[str], db: Session) -> models.User:
+    """Create a new Gmail user with optional first-touch referral."""
     if not email or not email.endswith("@gmail.com"):
         raise HTTPException(status_code=400, detail="Only @gmail.com accounts are allowed.")
-
-    user = db.query(models.User).filter(models.User.email == email).first()
-    if user:
-        return user
-
-    # New user – optional referral association
     referrer: Optional[models.User] = None
-    if referral_code:
-        referrer = db.query(models.User).filter(models.User.referral_code == referral_code).first()
-
+    code = (referral_code or "").strip()
+    if code:
+        referrer = db.query(models.User).filter(models.User.referral_code == code).first()
     new_user = models.User(
         email=email,
         plan_tier="trial",
@@ -1224,12 +1274,30 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
         referred_by=referrer.id if referrer else None,
     )
     new_user.referral_code = _generate_referral_code(db)
-
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     _award_registration_tokens(new_user.id, db)
     return new_user
+
+
+def _get_or_create_user_by_email_for_session(email: str, referral_code: Optional[str], db: Session) -> models.User:
+    """
+    Ensure user exists for an authenticated session.
+    Applies referral only with first-touch policy.
+    """
+    if not email or not email.endswith("@gmail.com"):
+        raise HTTPException(status_code=400, detail="Only @gmail.com accounts are allowed.")
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user:
+        _apply_referral_first_touch(user, referral_code, db)
+        return user
+    return _create_user_by_email(email, referral_code, db)
+
+
+def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], db: Session) -> models.User:
+    email: str = (idinfo.get("email") or "").strip()
+    return _get_or_create_user_by_email_for_session(email, referral_code, db)
 
 
 def _get_user_by_email(email: str, db: Session) -> models.User:
@@ -1256,6 +1324,14 @@ async def get_current_user(
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
+    email = _extract_email_from_bearer_token(authorization)
+    return _get_user_by_email(email, db)
+
+
+def _extract_email_from_bearer_token(authorization: Optional[str]) -> str:
+    """Extract authenticated email from NextAuth JWT or Google ID token."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
     token = authorization.split(" ", 1)[1].strip()
     if not token:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
@@ -1271,13 +1347,13 @@ async def get_current_user(
             )
             email = (payload.get("email") or "").strip()
             if email:
-                return _get_user_by_email(email, db)
+                return email
         except jwt.PyJWTError:
             pass
         except HTTPException:
             raise
         except Exception as e:
-            logger.exception("get_current_user JWT lookup failed: %s", e)
+            logger.exception("token email extraction JWT failed: %s", e)
             raise HTTPException(status_code=500, detail="Authentication service error. Please try again.")
 
     # 2) Fallback: Google ID token (legacy)
@@ -1285,13 +1361,11 @@ async def get_current_user(
         idinfo = id_token.verify_oauth2_token(
             token, google_requests.Request(), GOOGLE_CLIENT_ID
         )
-        email = idinfo.get("email")
-        return _get_user_by_email(email or "", db)
-    except HTTPException:
-        raise
+        email = (idinfo.get("email") or "").strip()
+        if email:
+            return email
     except Exception:
         pass
-
     raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
 
@@ -1630,6 +1704,8 @@ class TokenAddHistoryEntry(BaseModel):
     reason: str
     created_at: str
     detail: Optional[str] = None
+    balance_before: Optional[float] = None
+    balance_after: Optional[float] = None
 
 
 class MyDeductionLogEntry(BaseModel):
@@ -1778,6 +1854,9 @@ class AdminSettingsUpdateBody(BaseModel):
     min_withdrawal_usdt: Optional[float] = None
     daily_deduction_utc_hour: Optional[int] = None
     deduction_multiplier: Optional[float] = None
+    referral_purchase_l1_pct: Optional[float] = None
+    referral_purchase_l2_pct: Optional[float] = None
+    referral_purchase_l3_pct: Optional[float] = None
     bot_auto_start: Optional[bool] = None
     referral_system_enabled: Optional[bool] = None
     withdrawal_enabled: Optional[bool] = None
@@ -1810,6 +1889,26 @@ def google_login(payload: GoogleAuthPayload, db: Session = Depends(database.get_
 
     user = _get_or_create_user_from_google(idinfo, payload.referral_code, db)
     return {"user_id": user.id, "email": user.email, "plan_tier": user.plan_tier}
+
+
+@app.post("/api/bootstrap-user")
+async def bootstrap_user(
+    payload: BootstrapUserPayload,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Ensure backend user exists right after auth (before API key save).
+    Applies first-touch referral linking once.
+    """
+    email = _extract_email_from_bearer_token(authorization)
+    user = _get_or_create_user_by_email_for_session(email, payload.referral_code, db)
+    return {
+        "id": user.id,
+        "email": user.email,
+        "referral_code": user.referral_code,
+        "referred_by": user.referred_by,
+    }
 
 
 # --- Live Bot Stats Route (existing dashboard); user end: auth required, own data only ---
@@ -1971,8 +2070,9 @@ async def connect_exchange(
 
 
 @app.get("/api/version")
-async def api_version():
+async def api_version(response: Response):
     """No-auth endpoint to verify which backend is running (gross-profit DB fallback support)."""
+    response.headers["Cache-Control"] = "public, max-age=60"
     return {"version": "gross-profit-db-fallback", "source_db_supported": True}
 
 
@@ -2197,28 +2297,94 @@ async def get_my_token_add_history(
     current_user: models.User = Depends(_get_current_user_for_token_balance),
     db: Session = Depends(database.get_db),
 ):
-    """Token add history for the current user (newest first)."""
-    if not hasattr(models, "TokenLedger"):
-        return []
-    rows = (
-        db.query(models.TokenLedger)
-        .filter(
-            models.TokenLedger.user_id == current_user.id,
-            models.TokenLedger.activity_type == "add",
-        )
-        .order_by(models.TokenLedger.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-    return [
-        TokenAddHistoryEntry(
-            amount=float(r.amount or 0),
-            reason=r.reason or "",
-            created_at=r.created_at.isoformat() + "Z" if r.created_at else "",
-            detail=_token_add_detail(r.reason or "", getattr(r, "extra", None)),
-        )
-        for r in rows
-    ]
+    """Token add history for the current user (newest first). Uses raw SQL for reliability."""
+    out: List[TokenAddHistoryEntry] = []
+    try:
+        r = db.execute(
+            text("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'token_ledger'")
+        ).fetchone()
+        if not r:
+            return []
+        # Build balance-after by id: all ledger rows for user in chronological order
+        ledger_rows = db.execute(
+            text("""
+                SELECT id, activity_type, amount, created_at
+                FROM token_ledger
+                WHERE user_id = :uid
+                ORDER BY created_at ASC, id ASC
+            """),
+            {"uid": current_user.id},
+        ).fetchall()
+        balance_by_id: Dict[int, tuple] = {}
+        running = 0.0
+        for lr in ledger_rows:
+            lid, atype, amt, _ = lr[0], (lr[1] or "").strip(), float(lr[2] or 0), lr[3]
+            bal_before = running
+            if atype == "add":
+                running += amt
+            else:
+                running -= amt
+            balance_by_id[lid] = (bal_before, running)
+        # Add rows (newest first)
+        rows = db.execute(
+            text("""
+                SELECT id, amount, reason, created_at, metadata
+                FROM token_ledger
+                WHERE user_id = :uid AND activity_type = 'add'
+                ORDER BY created_at DESC, id DESC
+                LIMIT :lim
+            """),
+            {"uid": current_user.id, "lim": limit},
+        ).fetchall()
+        for row in rows:
+            row_id = row[0]
+            amount_val = float(row[1] or 0)
+            reason_val = (row[2] or "").strip()
+            created_at_val = row[3]
+            extra_val = row[4] if len(row) > 4 else None
+            if not isinstance(extra_val, dict):
+                extra_val = {}
+            if created_at_val and getattr(created_at_val, "isoformat", None):
+                created_str = created_at_val.isoformat()
+                if created_str and (getattr(created_at_val, "tzinfo", None) is None):
+                    created_str += "Z"
+            else:
+                created_str = "1970-01-01T00:00:00Z"
+            detail_str = _token_add_detail(reason_val, extra_val)
+            bal_before, bal_after = balance_by_id.get(row_id, (None, None))
+            out.append(
+                TokenAddHistoryEntry(
+                    amount=amount_val,
+                    reason=reason_val,
+                    created_at=created_str,
+                    detail=detail_str,
+                    balance_before=bal_before,
+                    balance_after=bal_after,
+                )
+            )
+        # Align first (newest) row with authoritative balance from user_token_balance
+        if out:
+            try:
+                rem_row = db.execute(
+                    text("SELECT tokens_remaining FROM user_token_balance WHERE user_id = :uid"),
+                    {"uid": current_user.id},
+                ).fetchone()
+                if rem_row is not None and rem_row[0] is not None:
+                    tokens_remaining = round(float(rem_row[0]), 2)
+                    first = out[0]
+                    out[0] = TokenAddHistoryEntry(
+                        amount=first.amount,
+                        reason=first.reason,
+                        created_at=first.created_at,
+                        detail=first.detail,
+                        balance_before=round(tokens_remaining - first.amount, 2),
+                        balance_after=tokens_remaining,
+                    )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("get_my_token_add_history user_id=%s error=%s", current_user.id, e)
+    return out
 
 
 @app.get("/api/v1/users/me/deduction-history", response_model=List[MyDeductionLogEntry])
@@ -3341,8 +3507,8 @@ def _trades_with_interest_usd(trades: Any, ticker_prices: Dict[str, float]) -> L
     return out
 
 
-def _ticker_prices_from_trades(trades: Any) -> Dict[str, float]:
-    """Collect unique non-USD currencies from trades and fetch their USD prices."""
+def _currencies_from_trades(trades: Any) -> set:
+    """Collect unique non-USD currencies from trades (for fold ticker union)."""
     need_price = set()
     if isinstance(trades, list):
         for row in trades:
@@ -3355,6 +3521,12 @@ def _ticker_prices_from_trades(trades: Any) -> Dict[str, float]:
                         need_price.add(c)
             except (TypeError, IndexError):
                 pass
+    return need_price
+
+
+def _ticker_prices_from_trades(trades: Any) -> Dict[str, float]:
+    """Collect unique non-USD currencies from trades and fetch their USD prices."""
+    need_price = _currencies_from_trades(trades)
     if not need_price:
         return {}
     from services.bitfinex_service import _get_tickers_sync
@@ -3631,6 +3803,7 @@ async def _daily_10_00_fetch_and_save(
 async def _gross_profit_from_ledgers(
     mgr: BitfinexManager,
     start_ms: Optional[int] = None,
+    fold_ticker_state: Optional[dict] = None,
 ) -> tuple[float, float, Optional[str]]:
     """
     Sum gross profit and fees from ledgers (Margin Funding Payment) for all lending currencies.
@@ -3642,12 +3815,20 @@ async def _gross_profit_from_ledgers(
         ledger_currencies = list(LEDGER_FUNDING_CURRENCIES)
     all_entries, _, last_err = await _fetch_all_margin_funding_entries(mgr, currencies=ledger_currencies)
     currencies_in_entries = {str(e[1]).strip() for e in all_entries if isinstance(e, (list, tuple)) and len(e) > 1 and e[1]}
-    usd_prices = _fetch_ticker_prices(currencies_in_entries) if currencies_in_entries else {}
+    if currencies_in_entries:
+        if fold_ticker_state:
+            usd_prices = await _get_fold_ticker_prices(currencies_in_entries, fold_ticker_state)
+        else:
+            usd_prices = _fetch_ticker_prices(currencies_in_entries)
+    else:
+        usd_prices = {}
     total_gross, total_fees = _gross_and_fees_from_ledger_entries(all_entries, start_ms=None, end_ms=None, usd_prices=usd_prices)
     return round(total_gross, 6), round(total_fees, 6), last_err if (last_err is not None and total_gross == 0 and total_fees == 0) else None
 
 
-async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[LendingStatsResponse, bool, List[FundingTradeRecord]]:
+async def _refresh_user_lending_snapshot(
+    user_id: int, db: Session, fold_ticker_state: Optional[dict] = None
+) -> tuple[LendingStatsResponse, bool, List[FundingTradeRecord]]:
     """
     Compute gross profit from Bitfinex: prefer ledgers (Margin Funding Payment from registration to latest),
     then fall back to funding trades. Persist to user_profit_snapshot and return (result, rate_limited, trade_records).
@@ -3664,7 +3845,7 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
 
     # Prefer ledgers-based gross profit (Margin Funding Payment between registration and latest)
     if start_ms is not None:
-        gross_ledgers, fees_ledgers, err_ledgers = await _gross_profit_from_ledgers(mgr, start_ms)
+        gross_ledgers, fees_ledgers, err_ledgers = await _gross_profit_from_ledgers(mgr, start_ms, fold_ticker_state)
         if err_ledgers and bitfinex_cache.is_rate_limit_error(err_ledgers):
             if snap and snap.gross_profit_usd is not None:
                 gross = float(snap.gross_profit_usd)
@@ -3738,7 +3919,11 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
             total_trades_count=getattr(snap, "total_trades_count", None) if snap else None,
         )
     else:
-        ticker_prices = _ticker_prices_from_trades(trades)
+        if fold_ticker_state:
+            currencies_trades = _currencies_from_trades(trades)
+            ticker_prices = await _get_fold_ticker_prices(currencies_trades, fold_ticker_state) if currencies_trades else {}
+        else:
+            ticker_prices = _ticker_prices_from_trades(trades)
         gross_delta, per_currency_breakdown = _interest_usd_from_trades_with_breakdown(trades, ticker_prices)
         fee_delta = gross_delta * BITFINEX_LENDER_FEE_PCT
         net_delta = gross_delta - fee_delta
@@ -3812,11 +3997,12 @@ async def _refresh_user_lending_snapshot(user_id: int, db: Session) -> tuple[Len
 
 
 async def _get_lending_stats_data(
-    user_id: int, db: Session, source: Optional[str] = None
+    user_id: int, db: Session, source: Optional[str] = None, fold_ticker_state: Optional[dict] = None
 ) -> tuple[LendingStatsResponse, dict]:
     """
     Shared logic for lending stats. Returns (response, headers_dict).
     Used by GET /stats/{user_id}/lending and dashboard-fold.
+    When fold_ticker_state is provided (from dashboard_fold), ticker is shared with wallets for single fetch.
     """
     out: dict = {}
     try:
@@ -3919,7 +4105,7 @@ async def _get_lending_stats_data(
             db_snap = float(fallback_gross) if fallback_gross is not None else None
             return (LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap), out)
         try:
-            result, rate_limited, records = await _refresh_user_lending_snapshot(user_id, db)
+            result, rate_limited, records = await _refresh_user_lending_snapshot(user_id, db, fold_ticker_state)
         except Exception:
             if fallback_gross is not None:
                 out["X-Data-Source"] = "db"
@@ -4013,6 +4199,30 @@ async def get_lending_stats(
     for k, v in headers.items():
         response.headers[k] = v
     return result
+
+
+async def _fetch_funding_trade_records_for_user(user: "models.User") -> List[dict]:
+    """
+    Fetch repaid funding trades from Bitfinex for the user and return list of trade records as dicts.
+    Used by dashboard_fold to attach trades when lending has gross but no trades (avoids second frontend request).
+    """
+    if not getattr(user, "vault", None):
+        return []
+    try:
+        keys = user.vault.get_keys()
+        mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+        start_ms = None
+        if getattr(user.vault, "created_at", None) and user.vault.created_at:
+            start_ms = int(user.vault.created_at.timestamp() * 1000)
+        trades, err = await _fetch_all_funding_trades(mgr, start_ms)
+        if err or not trades:
+            return []
+        ticker_prices = _ticker_prices_from_trades(trades)
+        records = _trades_with_interest_usd(trades, ticker_prices)
+        return [r.model_dump() for r in records]
+    except Exception as e:
+        logger.debug("_fetch_funding_trade_records_for_user user_id=%s: %s", user.id, e)
+        return []
 
 
 @app.get("/api/funding-trades", response_model=FundingTradesResponse)
@@ -4289,6 +4499,31 @@ def _get_token_balance_legacy_full(db: Session, user_id: int) -> Optional[dict]:
         }
     except Exception:
         return None
+
+
+def _get_token_balance_for_fold(db: Session, user_id: int) -> dict:
+    """Return token balance dict for dashboard-fold (no rate limit). Same source as GET /api/v1/users/me/token-balance."""
+    legacy = _get_token_balance_legacy_full(db, user_id)
+    if legacy is not None:
+        tokens_remaining = legacy["tokens_remaining"]
+        total_added = legacy["purchased_tokens"]
+        total_deducted = max(0.0, total_added - tokens_remaining)
+        return {
+            "tokens_remaining": tokens_remaining,
+            "total_tokens_added": total_added,
+            "total_tokens_deducted": total_deducted,
+        }
+    row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
+    if not row:
+        return {"tokens_remaining": 0.0, "total_tokens_added": 0.0, "total_tokens_deducted": 0.0}
+    tokens_remaining = float(row.tokens_remaining or 0)
+    total_added = float(row.purchased_tokens or 0)
+    total_deducted = max(0.0, total_added - tokens_remaining)
+    return {
+        "tokens_remaining": tokens_remaining,
+        "total_tokens_added": total_added,
+        "total_tokens_deducted": total_deducted,
+    }
 
 
 def _get_user_status_data(user_id: int, db: Session) -> UserStatusResponse:
@@ -4758,42 +4993,58 @@ def admin_token_add_logs(
     _: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
-    """Recent token add log entries (newest first) from token_ledger where activity_type='add'."""
-    if not hasattr(models, "TokenLedger"):
-        return []
+    """Recent token add log entries (newest first) from token_ledger where activity_type='add'. Uses raw SQL for reliability."""
+    out: List[TokenAddLogEntry] = []
     try:
         r = db.execute(
             text("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'token_ledger'")
         ).fetchone()
         if not r:
             return []
-    except Exception:
-        return []
-    q = (
-        db.query(models.TokenLedger, models.User.email)
-        .outerjoin(models.User, models.TokenLedger.user_id == models.User.id)
-        .filter(models.TokenLedger.activity_type == "add")
-        .order_by(models.TokenLedger.created_at.desc())
-    )
-    if user_id is not None:
-        q = q.filter(models.TokenLedger.user_id == user_id)
-    if start_date:
-        q = q.filter(models.TokenLedger.created_at >= datetime.fromisoformat(start_date + "T00:00:00"))
-    if end_date:
-        q = q.filter(models.TokenLedger.created_at <= datetime.fromisoformat(end_date + "T23:59:59.999999"))
-    rows = q.limit(limit).all()
-    return [
-        TokenAddLogEntry(
-            id=ledger.id,
-            user_id=ledger.user_id,
-            email=email,
-            amount=float(ledger.amount or 0),
-            reason=ledger.reason or "",
-            created_at=ledger.created_at.isoformat() + "Z" if ledger.created_at else "",
-            detail=_token_add_detail(ledger.reason or "", getattr(ledger, "extra", None)),
-        )
-        for ledger, email in rows
-    ]
+        sql = """
+            SELECT tl.id, tl.user_id, u.email, tl.amount, tl.reason, tl.created_at, tl.metadata
+            FROM token_ledger tl
+            LEFT JOIN users u ON u.id = tl.user_id
+            WHERE tl.activity_type = 'add'
+        """
+        params: Dict[str, Any] = {"lim": limit}
+        if user_id is not None:
+            sql += " AND tl.user_id = :uid"
+            params["uid"] = user_id
+        if start_date:
+            sql += " AND tl.created_at >= :start_dt"
+            params["start_dt"] = datetime.fromisoformat(start_date + "T00:00:00")
+        if end_date:
+            sql += " AND tl.created_at <= :end_dt"
+            params["end_dt"] = datetime.fromisoformat(end_date + "T23:59:59.999999")
+        sql += " ORDER BY tl.created_at DESC LIMIT :lim"
+        rows = db.execute(text(sql), params).fetchall()
+        for row in rows:
+            row_id = row[0]
+            uid = row[1]
+            email = row[2] if len(row) > 2 else None
+            amount_val = float(row[3] or 0)
+            reason_val = (row[4] or "").strip()
+            created_at_val = row[5]
+            extra_val = row[6] if len(row) > 6 else None
+            if not isinstance(extra_val, dict):
+                extra_val = {}
+            created_str = created_at_val.isoformat() + "Z" if created_at_val and getattr(created_at_val, "isoformat", None) else ""
+            detail_str = _token_add_detail(reason_val, extra_val)
+            out.append(
+                TokenAddLogEntry(
+                    id=row_id,
+                    user_id=uid,
+                    email=(email.strip() if isinstance(email, str) else None),
+                    amount=amount_val,
+                    reason=reason_val,
+                    created_at=created_str,
+                    detail=detail_str,
+                )
+            )
+    except Exception as e:
+        logger.warning("admin_token_add_logs error=%s", e)
+    return out
 
 
 @app.post("/admin/deduction/trigger")
@@ -4984,6 +5235,31 @@ async def admin_health(_: models.User = Depends(get_admin_user)):
     return health
 
 
+@app.get("/admin/stripe-config-check")
+def admin_stripe_config_check(_: models.User = Depends(get_admin_user)):
+    """
+    Resolve each STRIPE_PRICE_* env to product id and return (for verifying Whales/Pro/AI Ultra mapping).
+    Logs results at info level.
+    """
+    result: Dict[str, str] = {}
+    for key, env_val in [
+        ("STRIPE_PRICE_PRO_MONTHLY", STRIPE_PRICE_PRO_MONTHLY),
+        ("STRIPE_PRICE_PRO_YEARLY", STRIPE_PRICE_PRO_YEARLY),
+        ("STRIPE_PRICE_AI_ULTRA_MONTHLY", STRIPE_PRICE_AI_ULTRA_MONTHLY),
+        ("STRIPE_PRICE_AI_ULTRA_YEARLY", STRIPE_PRICE_AI_ULTRA_YEARLY),
+        ("STRIPE_PRICE_WHALES_MONTHLY", STRIPE_PRICE_WHALES_MONTHLY),
+        ("STRIPE_PRICE_WHALES_YEARLY", STRIPE_PRICE_WHALES_YEARLY),
+    ]:
+        try:
+            resolved = _resolve_stripe_env_to_product_id(env_val or "")
+            result[key] = resolved or "(empty or unresolved)"
+            logger.info("stripe_config_check %s -> %s", key, result[key])
+        except Exception as e:
+            result[key] = f"error: {e!s}"
+            logger.warning("stripe_config_check %s error=%s", key, e)
+    return result
+
+
 @app.get("/admin/logs/errors", response_model=List[ApiFailureOut])
 async def admin_logs_errors(
     limit: int = Query(100, ge=1, le=200),
@@ -5171,13 +5447,14 @@ def admin_bulk_add_tokens(
 ):
     success = 0
     failed = 0
+    l1_pct, l2_pct, l3_pct = _get_referral_purchase_pct(db)
     for item in body.items:
         if item.amount <= 0:
             failed += 1
             continue
         token_ledger_svc.add_tokens(db, item.user_id, float(item.amount), "admin_bulk_add", extra={"batch": True})
         usd_value = float(item.amount) / 100.0  # 1 USD = 100 tokens
-        apply_referral_rewards_on_purchase(db, item.user_id, usd_value)
+        apply_referral_rewards_on_purchase(db, item.user_id, usd_value, reward_purchase_l1=l1_pct, reward_purchase_l2=l2_pct, reward_purchase_l3=l3_pct)
         db.commit()
         success += 1
         _admin_audit(admin_user.email or "", "bulk_token_add", {"user_id": item.user_id, "amount": item.amount})
@@ -5412,7 +5689,7 @@ def user_referral_downline(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
-    """List users who signed up with current user's referral code, with masked email and USDT earned from each (L1 only)."""
+    """List users who signed up with current user's referral code, with masked email and USDT Credit earned from each (L1: from their purchases and token burns)."""
     from sqlalchemy import func
     referred = (
         db.query(models.User.id, models.User.email, models.User.created_at)
@@ -5588,6 +5865,172 @@ def user_usdt_withdraw_history(
     ]
 
 
+@app.get("/api/v1/user/usdt-history")
+def user_usdt_history(
+    limit: int = Query(50, ge=1, le=200),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """List current user's USDT credit history (rewards, withdrawals, admin adjusts). Same data as admin usdt_history but scoped to current user."""
+    rows = (
+        db.query(models.UsdtHistory)
+        .filter(models.UsdtHistory.user_id == current_user.id)
+        .order_by(models.UsdtHistory.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "user_id": r.user_id,
+            "amount": float(r.amount or 0),
+            "reason": r.reason or "",
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+            "admin_email": r.admin_email,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/v1/user/referral-bundle")
+def user_referral_bundle(
+    limit: int = Query(50, ge=1, le=200),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Single response with referral-info, usdt-credit, usdt-withdraw-history, referral-reward-history,
+    referral-downline, and usdt-history. Same shapes as the individual endpoints; use when loading
+    Referral & USDT tab to avoid six separate requests.
+    """
+    from sqlalchemy import func
+    # referralInfo
+    uc = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == current_user.id).first()
+    total_earned = float(uc.total_earned or 0) if uc else 0.0
+    level1 = db.query(models.User).filter(models.User.id == current_user.referred_by).first() if current_user.referred_by else None
+    referred_count = db.query(models.User).filter(models.User.referred_by == current_user.id).count()
+    referral_info = {
+        "referral_code": current_user.referral_code or "",
+        "referrer_id": current_user.referred_by,
+        "referrer_email": level1.email if level1 else None,
+        "total_usdt_credit_earned": total_earned,
+        "referred_users_count": referred_count,
+        "usdt_withdraw_address": (current_user.usdt_withdraw_address or "").strip() or None,
+    }
+    # usdtCredit
+    uc_balance = _get_or_create_usdt_credit(current_user.id, db)
+    balance = float(uc_balance.usdt_credit or 0)
+    pending_rows = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+        models.WithdrawalRequest.status == "pending",
+    ).all()
+    locked = sum(float(r.amount) for r in pending_rows)
+    usdt_credit = {
+        "usdt_credit": balance,
+        "locked_pending": locked,
+        "available": max(0.0, balance - locked),
+    }
+    # usdt-withdraw-history (withdrawals)
+    w_rows = db.query(models.WithdrawalRequest).filter(
+        models.WithdrawalRequest.user_id == current_user.id,
+    ).order_by(models.WithdrawalRequest.created_at.desc()).limit(100).all()
+    withdrawals = [
+        {
+            "id": r.id,
+            "amount": r.amount,
+            "to_address": r.address,
+            "status": r.status,
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+            "processed_at": r.processed_at.isoformat() + "Z" if r.processed_at else None,
+            "rejection_note": r.rejection_note,
+        }
+        for r in w_rows
+    ]
+    # referral-reward-history
+    rr_rows = (
+        db.query(models.ReferralReward, models.User)
+        .join(models.User, models.User.id == models.ReferralReward.burning_user_id)
+        .filter(
+            (models.ReferralReward.level_1_id == current_user.id)
+            | (models.ReferralReward.level_2_id == current_user.id)
+            | (models.ReferralReward.level_3_id == current_user.id)
+        )
+        .order_by(models.ReferralReward.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    reward_history = []
+    for rr, burning_user in rr_rows:
+        if rr.level_1_id == current_user.id:
+            amount = float(rr.reward_l1 or 0)
+            level = 1
+        elif rr.level_2_id == current_user.id:
+            amount = float(rr.reward_l2 or 0)
+            level = 2
+        else:
+            amount = float(rr.reward_l3 or 0)
+            level = 3
+        if amount <= 0:
+            continue
+        reward_history.append({
+            "created_at": rr.created_at.isoformat() + "Z" if rr.created_at else None,
+            "burning_user_id": rr.burning_user_id,
+            "downline_email": burning_user.email if burning_user else None,
+            "amount_usdt_credit": amount,
+            "level": level,
+        })
+    # referral-downline
+    referred = (
+        db.query(models.User.id, models.User.email, models.User.created_at)
+        .filter(models.User.referred_by == current_user.id)
+        .order_by(models.User.created_at.desc())
+        .all()
+    )
+    downline = []
+    for uid, email, created_at in referred:
+        total_from_them = (
+            db.query(func.coalesce(func.sum(models.ReferralReward.reward_l1), 0))
+            .filter(
+                models.ReferralReward.level_1_id == current_user.id,
+                models.ReferralReward.burning_user_id == uid,
+            )
+            .scalar()
+        )
+        downline.append({
+            "user_id": uid,
+            "email_masked": _mask_email(email),
+            "created_at": created_at.isoformat() + "Z" if created_at else None,
+            "total_usdt_earned_from_them": float(total_from_them or 0),
+        })
+    # usdt-history
+    uh_rows = (
+        db.query(models.UsdtHistory)
+        .filter(models.UsdtHistory.user_id == current_user.id)
+        .order_by(models.UsdtHistory.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    usdt_history = [
+        {
+            "id": r.id,
+            "user_id": r.user_id,
+            "amount": float(r.amount or 0),
+            "reason": r.reason or "",
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+            "admin_email": r.admin_email,
+        }
+        for r in uh_rows
+    ]
+    return {
+        "referralInfo": referral_info,
+        "usdtCredit": usdt_credit,
+        "withdrawals": withdrawals,
+        "rewardHistory": reward_history,
+        "downline": downline,
+        "usdtHistory": usdt_history,
+    }
+
+
 # --- User: Create withdrawal request (legacy; uses body address) ---
 class WithdrawalRequestCreate(BaseModel):
     amount: float
@@ -5733,6 +6176,17 @@ def _get_deduction_multiplier(db: Session) -> float:
         return 1.0
 
 
+def _get_referral_purchase_pct(db: Session) -> tuple[float, float, float]:
+    """Read L1/L2/L3 purchase reward percentages from admin_settings; defaults 10, 5, 2. Return as decimals (0.10, 0.05, 0.02)."""
+    def pct(key: str, default: float) -> float:
+        raw = _get_setting(db, key, str(default))
+        try:
+            return max(0.0, min(100.0, float(raw))) / 100.0
+        except (ValueError, TypeError):
+            return default / 100.0
+    return (pct("referral_purchase_l1_pct", 10.0), pct("referral_purchase_l2_pct", 5.0), pct("referral_purchase_l3_pct", 2.0))
+
+
 @app.get("/admin/settings", response_model=List[AdminSettingOut])
 def admin_get_settings(
     _: models.User = Depends(get_admin_user),
@@ -5741,12 +6195,14 @@ def admin_get_settings(
     keys = [
         "registration_bonus_tokens", "min_withdrawal_usdt", "daily_deduction_utc_hour",
         "deduction_multiplier",
+        "referral_purchase_l1_pct", "referral_purchase_l2_pct", "referral_purchase_l3_pct",
         "bot_auto_start", "referral_system_enabled", "withdrawal_enabled", "maintenance_mode",
     ]
     out = []
     defaults = {
         "registration_bonus_tokens": "150", "min_withdrawal_usdt": "10", "daily_deduction_utc_hour": "10",
         "deduction_multiplier": "1",
+        "referral_purchase_l1_pct": "10", "referral_purchase_l2_pct": "5", "referral_purchase_l3_pct": "2",
         "bot_auto_start": "true", "referral_system_enabled": "true", "withdrawal_enabled": "true", "maintenance_mode": "false",
     }
     for k in keys:
@@ -5770,6 +6226,15 @@ def admin_update_settings(
     if body.deduction_multiplier is not None:
         mult = max(0.01, min(100.0, float(body.deduction_multiplier)))
         updates.append(("deduction_multiplier", str(mult)))
+    if body.referral_purchase_l1_pct is not None:
+        v = max(0.0, min(100.0, float(body.referral_purchase_l1_pct)))
+        updates.append(("referral_purchase_l1_pct", str(v)))
+    if body.referral_purchase_l2_pct is not None:
+        v = max(0.0, min(100.0, float(body.referral_purchase_l2_pct)))
+        updates.append(("referral_purchase_l2_pct", str(v)))
+    if body.referral_purchase_l3_pct is not None:
+        v = max(0.0, min(100.0, float(body.referral_purchase_l3_pct)))
+        updates.append(("referral_purchase_l3_pct", str(v)))
     if body.bot_auto_start is not None:
         updates.append(("bot_auto_start", "true" if body.bot_auto_start else "false"))
     if body.referral_system_enabled is not None:
@@ -6144,6 +6609,15 @@ import time
 
 _ticker_cache: Dict[tuple, tuple] = {}  # (symbols_tuple) -> (prices_dict, cached_at)
 TICKER_CACHE_TTL_SEC = 60
+TICKER_CACHE_MAX_ENTRIES = 2000  # Cap so many symbol sets don't grow unbounded
+
+
+def _evict_oldest_ticker_entry() -> None:
+    """Evict one oldest ticker cache entry when over limit."""
+    if len(_ticker_cache) <= TICKER_CACHE_MAX_ENTRIES:
+        return
+    oldest_key = min(_ticker_cache.keys(), key=lambda k: _ticker_cache[k][1])
+    del _ticker_cache[oldest_key]
 
 
 def _fetch_ticker_prices(currencies: set) -> Dict[str, float]:
@@ -6171,8 +6645,33 @@ def _fetch_ticker_prices(currencies: set) -> Dict[str, float]:
                         out[sym] = float(row[7]) if row[7] is not None else 0.0
             except (TypeError, ValueError, IndexError):
                 continue
+    _evict_oldest_ticker_entry()
     _ticker_cache[cache_key] = (out, now)
     return out
+
+
+async def _get_fold_ticker_prices(currencies: set, fold_state: dict) -> Dict[str, float]:
+    """
+    Request-scoped ticker for dashboard_fold: merge symbols from both wallets and lending,
+    then fetch once for the union. fold_state: {requested, prices, lock, event, arrived}.
+    """
+    if not currencies:
+        return {}
+    lock = fold_state["lock"]
+    event = fold_state["event"]
+    async with lock:
+        fold_state["requested"] |= currencies
+        fold_state["arrived"] += 1
+        if fold_state["arrived"] == 2:
+            event.set()
+    try:
+        await asyncio.wait_for(event.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pass
+    async with lock:
+        if not fold_state["prices"]:
+            fold_state["prices"] = _fetch_ticker_prices(fold_state["requested"])
+        return dict(fold_state["prices"])
 
 
 def _funding_balances_from_wallets(wallets: Any) -> Dict[str, float]:
@@ -6195,9 +6694,9 @@ def _funding_balances_from_wallets(wallets: Any) -> Dict[str, float]:
     return result
 
 
-async def _portfolio_allocation_snapshot(mgr: BitfinexManager) -> tuple:
+async def _portfolio_allocation_snapshot(mgr: BitfinexManager, fold_ticker_state: Optional[dict] = None) -> tuple:
     """
-    Wallets, credits, offers in rapid succession; one ticker fetch.
+    Wallets, credits, offers in rapid succession; one ticker fetch (or shared fold ticker when fold_ticker_state provided).
     Retries up to 3 times with backoff on transient failures (stable logic like other platforms).
     Returns (summary_dict, log_str, rate_limited: bool).
     Actively Earning = credits USD (from offers API); Pending = offers USD (from credits API); Idle = Total - credits - offers.
@@ -6246,7 +6745,10 @@ async def _portfolio_allocation_snapshot(mgr: BitfinexManager) -> tuple:
     currencies_for_ticker = _currencies_above_ticker_threshold(
         all_currencies, funding_balances, credits_per_currency, offers_per_currency
     )
-    prices = _fetch_ticker_prices(currencies_for_ticker)
+    if fold_ticker_state:
+        prices = await _get_fold_ticker_prices(currencies_for_ticker, fold_ticker_state)
+    else:
+        prices = _fetch_ticker_prices(currencies_for_ticker)
     stablecoins = ("USD", "USDt", "USDT", "UST")
 
     total_wallet_usd = _per_currency_to_usd(funding_balances, prices, stablecoins)
@@ -6354,10 +6856,13 @@ def _empty_wallet_response():
     }
 
 
-async def _get_wallet_data(user_id: int, user: "models.User", db: Session) -> tuple[dict, str]:
+async def _get_wallet_data(
+    user_id: int, user: "models.User", db: Session, fold_ticker_state: Optional[dict] = None
+) -> tuple[dict, str]:
     """
     Shared logic for wallet summary. Returns (data_dict, source) where source is "cache" or "live".
     On error returns (_empty_wallet_response(), "live"). Raises HTTPException only for 503 incomplete.
+    When fold_ticker_state is provided (from dashboard_fold), ticker is shared with lending path for single fetch.
     """
     try:
         cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
@@ -6399,7 +6904,7 @@ async def _get_wallet_data(user_id: int, user: "models.User", db: Session) -> tu
     keys = user.vault.get_keys()
     mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
     try:
-        summary, log_str, rate_limited = await _portfolio_allocation_snapshot(mgr)
+        summary, log_str, rate_limited = await _portfolio_allocation_snapshot(mgr, fold_ticker_state)
         if os.getenv("LOG_PORTFOLIO_ALLOCATION"):
             print(f"[user_id={user_id}] {log_str}")
         if rate_limited:
@@ -6479,52 +6984,95 @@ async def dashboard_fold(
     """
     Single response with wallets, botStats, userStatus, and lending for the dashboard.
     Same shapes as the individual endpoints so frontend normalizers work.
+    Runs wallets, bot_stats, and lending in parallel to reduce latency.
     """
     user_id = current_user.id
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
     vault = getattr(user, "vault", None)
-    wallets_data = _empty_wallet_response()
-    if vault:
+    default_user_status = {
+        "plan_tier": "trial",
+        "rebalance_interval": 0,
+        "tokens_remaining": 0.0,
+        "tokens_used": 0,
+        "initial_token_credit": 0,
+        "gross_profit_usd": 0.0,
+        "pro_expiry": None,
+        "created_at": None,
+    }
+
+    # Shared ticker state so wallets and lending do one Bitfinex ticker fetch for the union of currencies
+    fold_ticker_state = {
+        "requested": set(),
+        "prices": {},
+        "lock": asyncio.Lock(),
+        "event": asyncio.Event(),
+        "arrived": 0,
+    }
+
+    async def _wallets():
+        if not vault:
+            return _empty_wallet_response()
         try:
-            wallets_data, _ = await _get_wallet_data(user_id, user, db)
-        except HTTPException:
+            data, _ = await _get_wallet_data(user_id, user, db, fold_ticker_state)
+            return data
+        except HTTPException as e:
+            if e.status_code == 503:
+                return _empty_wallet_response()
             raise
         except Exception:
+            return _empty_wallet_response()
+
+    async def _bot_stats():
+        try:
+            return await _get_bot_stats_data(user_id, db)
+        except Exception:
+            return {"active": False, "engines": [], "total_loaned": "0.00", "bot_status": "stopped"}
+
+    async def _lending():
+        try:
+            lending_resp, _ = await _get_lending_stats_data(user_id, db, fold_ticker_state=fold_ticker_state)
+            return lending_resp.model_dump()
+        except Exception:
+            return {"gross_profit": 0.0, "bitfinex_fee": 0.0, "net_profit": 0.0}
+
+    wallets_data, bot_stats, lending_data = await asyncio.gather(_wallets(), _bot_stats(), _lending())
+
+    # When lending has gross profit but no trades (e.g. from cache/DB), fill trades in fold so frontend skips GET /api/funding-trades
+    if (
+        vault
+        and (lending_data.get("gross_profit") or 0) > 0
+        and not (lending_data.get("trades") and len(lending_data.get("trades", [])) > 0)
+    ):
+        try:
+            trade_records = await _fetch_funding_trade_records_for_user(user)
+            if trade_records:
+                lending_data["trades"] = trade_records
+                lending_data["total_trades_count"] = len(trade_records)
+        except Exception:
             pass
-    try:
-        bot_stats = await _get_bot_stats_data(user_id, db)
-    except Exception:
-        bot_stats = {"active": False, "engines": [], "total_loaned": "0.00", "bot_status": "stopped"}
+
     try:
         user_status = _get_user_status_data(user_id, db)
         user_status_data = user_status.model_dump()
     except HTTPException:
         raise
     except Exception:
-        user_status_data = {
-            "plan_tier": "trial",
-            "rebalance_interval": 0,
-            "tokens_remaining": 0.0,
-            "tokens_used": 0,
-            "initial_token_credit": 0,
-            "gross_profit_usd": 0.0,
-            "pro_expiry": None,
-            "created_at": None,
-        }
-    try:
-        lending_resp, _ = await _get_lending_stats_data(user_id, db)
-        lending_data = lending_resp.model_dump()
-    except Exception:
-        lending_data = {"gross_profit": 0.0, "bitfinex_fee": 0.0, "net_profit": 0.0}
+        user_status_data = default_user_status
+
     deduction_multiplier = _get_deduction_multiplier(db)
+    try:
+        token_balance = _get_token_balance_for_fold(db, user_id)
+    except Exception:
+        token_balance = {"tokens_remaining": 0.0, "total_tokens_added": 0.0, "total_tokens_deducted": 0.0}
     return {
         "wallets": wallets_data,
         "botStats": bot_stats,
         "userStatus": user_status_data,
         "lending": lending_data,
         "deduction_multiplier": deduction_multiplier,
+        "token_balance": token_balance,
     }
 
 
@@ -6547,9 +7095,37 @@ STRIPE_PRICE_WHALES_YEARLY = os.getenv("STRIPE_PRICE_WHALES_YEARLY", "")
 # Plan limits and rebalance (minutes) for webhook
 PLAN_REBALANCE_MIN = {"pro": 30, "ai_ultra": 3, "whales": 1}
 
+# Tier order for no-downgrade: trial/free < pro < ai_ultra < whales
+PLAN_TIER_RANK = {"trial": 0, "free": 0, "pro": 1, "ai_ultra": 2, "whales": 3}
+
+
+def _plan_tier_no_downgrade(current: str, new_from_payment: str) -> str:
+    """Return the higher of current and new plan (no downgrade). Used in subscription flows only."""
+    c = (current or "").strip().lower() or "trial"
+    n = (new_from_payment or "").strip().lower() or "trial"
+    rank_c = PLAN_TIER_RANK.get(c, 0)
+    rank_n = PLAN_TIER_RANK.get(n, 0)
+    return n if rank_n >= rank_c else c
+
+
 # Token award per subscription payment (added to purchased_tokens in webhook)
 PLAN_TOKEN_AWARD_MONTHLY = {"pro": 2000, "ai_ultra": 9000, "whales": 40000}
 PLAN_TOKEN_AWARD_YEARLY = {"pro": 24000, "ai_ultra": 108000, "whales": 480000}
+
+# Actual USD price per plan/interval (for referral reward base only; docstring: Pro 20/192, AI Ultra 60/576, Whales 200/1920)
+PLAN_USD_PRICE_MONTHLY = {"pro": 20, "ai_ultra": 60, "whales": 200}
+PLAN_USD_PRICE_YEARLY = {"pro": 192, "ai_ultra": 576, "whales": 1920}
+
+
+def _get_subscription_usd_price(plan: str, interval: str) -> float:
+    """Return actual USD price for plan/interval (for referral reward base). Default 0.0 if unknown."""
+    if (plan or "").lower() not in ("pro", "ai_ultra", "whales") or (interval or "").lower() not in ("monthly", "yearly"):
+        return 0.0
+    plan = (plan or "").lower()
+    interval = (interval or "monthly").lower()
+    if interval == "yearly":
+        return float(PLAN_USD_PRICE_YEARLY.get(plan, 0))
+    return float(PLAN_USD_PRICE_MONTHLY.get(plan, 0))
 
 
 class CreateCheckoutPayload(BaseModel):
@@ -6611,7 +7187,8 @@ def token_deposit(
     if payload.bypass_payment and os.getenv("ALLOW_DEV_CONNECT") == "1":
         try:
             token_ledger_svc.add_tokens(db, user_id, float(tokens_to_award), "deposit_usd", extra={"usd_amount": amount_float})
-            apply_referral_rewards_on_purchase(db, user_id, amount_float)
+            l1_pct, l2_pct, l3_pct = _get_referral_purchase_pct(db)
+            apply_referral_rewards_on_purchase(db, user_id, amount_float, reward_purchase_l1=l1_pct, reward_purchase_l2=l2_pct, reward_purchase_l3=l3_pct)
             db.commit()
             logger.info("token_deposit_bypass user_id=%s usd=%s tokens_added=%s", user_id, amount_float, tokens_to_award)
         except Exception as e:
@@ -6772,7 +7349,7 @@ def _plan_interval_from_invoice(invoice_data: dict) -> tuple:
             except Exception as e:
                 logger.warning("stripe_webhook invoice retrieve expand error=%s", e)
         if not data_list:
-            logger.warning("stripe_webhook invoice no line items invoice_id=%s", invoice_data.get("id"))
+            logger.warning("_plan_interval_from_invoice default invoice_id=%s reason=no_line_items", invoice_data.get("id"))
             return plan, interval
         first = data_list[0]
         price_obj = first.get("price")
@@ -6785,13 +7362,14 @@ def _plan_interval_from_invoice(invoice_data: dict) -> tuple:
             if isinstance(price_id, dict):
                 price_id = price_id.get("id")
         if not price_id:
-            logger.warning("stripe_webhook invoice first line has no price or pricing.price_details")
+            logger.warning("_plan_interval_from_invoice default invoice_id=%s reason=no_price_or_pricing", invoice_data.get("id"))
             return plan, interval
         price = stripe.Price.retrieve(price_id)
         product_id = price.get("product")
         if isinstance(product_id, dict):
             product_id = product_id.get("id")
         if not product_id:
+            logger.warning("_plan_interval_from_invoice default invoice_id=%s reason=no_product_on_price", invoice_data.get("id"))
             return plan, interval
         product_id = (product_id or "").strip()
         recur = price.get("recurring") or {}
@@ -6811,9 +7389,9 @@ def _plan_interval_from_invoice(invoice_data: dict) -> tuple:
         elif product_id == pro_m or product_id == pro_y:
             plan = "pro"
         else:
-            logger.warning("stripe_webhook invoice unknown product_id=%s", product_id)
+            logger.warning("_plan_interval_from_invoice default invoice_id=%s reason=unknown_product_id product_id=%s", invoice_data.get("id"), product_id)
     except Exception as e:
-        logger.warning("_plan_interval_from_invoice error=%s", e)
+        logger.warning("_plan_interval_from_invoice error=%s invoice_id=%s", e, invoice_data.get("id"))
     return plan, interval
 
 
@@ -6834,9 +7412,10 @@ def subscription_bypass(
     if plan not in ("pro", "ai_ultra", "whales") or interval not in ("monthly", "yearly"):
         raise HTTPException(status_code=400, detail="Invalid plan or interval.")
     interval_days = 365 if interval == "yearly" else 30
-    if plan in PLAN_REBALANCE_MIN:
-        current_user.plan_tier = plan
-        current_user.rebalance_interval = PLAN_REBALANCE_MIN[plan]
+    effective_plan = _plan_tier_no_downgrade(current_user.plan_tier or "trial", plan)
+    if effective_plan in PLAN_REBALANCE_MIN:
+        current_user.plan_tier = effective_plan
+        current_user.rebalance_interval = PLAN_REBALANCE_MIN[effective_plan]
     now = datetime.utcnow()
     base = current_user.pro_expiry if current_user.pro_expiry and current_user.pro_expiry > now else now
     current_user.pro_expiry = base + timedelta(days=interval_days)
@@ -6848,8 +7427,9 @@ def subscription_bypass(
     if tokens_to_award > 0:
         reason = "subscription_yearly" if interval == "yearly" else "subscription_monthly"
         token_ledger_svc.add_tokens(db, current_user.id, float(tokens_to_award), reason, extra={"plan": plan, "interval": interval})
-        usd_value = tokens_to_award / 100.0
-        apply_referral_rewards_on_purchase(db, current_user.id, usd_value)
+        referral_usd = _get_subscription_usd_price(plan, interval)
+        l1_pct, l2_pct, l3_pct = _get_referral_purchase_pct(db)
+        apply_referral_rewards_on_purchase(db, current_user.id, referral_usd, reward_purchase_l1=l1_pct, reward_purchase_l2=l2_pct, reward_purchase_l3=l3_pct)
         logger.info(
             "subscription_bypass user_id=%s plan=%s interval=%s tokens_added=%s",
             current_user.id, plan, interval, tokens_to_award,
@@ -6946,12 +7526,21 @@ async def stripe_webhook(request: Request):
         if meta.get("type") == "tokens":
             user_id = int(meta.get("user_id") or 0)
             tokens = int(meta.get("tokens") or 0)
+            session_id = (session.get("id") if hasattr(session, "get") else None) or getattr(session, "id", None)
+            session_id = (session_id or "").strip() if isinstance(session_id, str) else ""
             if user_id and tokens > 0:
                 db = next(database.get_db())
                 try:
+                    if not token_ledger_svc.try_register_checkout_session(db, session_id):
+                        _stripe_webhook_log("tokens_deposit already_processed session_id=%s", session_id)
+                        return {"received": True}
                     amount_usd = float(meta.get("amount_usd") or 0) or (tokens / 100.0)
-                    token_ledger_svc.add_tokens(db, user_id, float(tokens), "deposit_usd", extra={"usd_amount": amount_usd})
-                    apply_referral_rewards_on_purchase(db, user_id, amount_usd)
+                    token_ledger_svc.add_tokens(
+                        db, user_id, float(tokens), "deposit_usd",
+                        extra={"usd_amount": amount_usd, "stripe_session_id": session_id},
+                    )
+                    l1_pct, l2_pct, l3_pct = _get_referral_purchase_pct(db)
+                    apply_referral_rewards_on_purchase(db, user_id, amount_usd, reward_purchase_l1=l1_pct, reward_purchase_l2=l2_pct, reward_purchase_l3=l3_pct)
                     db.commit()
                     new_bal = token_ledger_svc.get_tokens_remaining(db, user_id)
                     _stripe_webhook_log("tokens_deposit user_id=%s tokens_added=%s new_balance=%s", user_id, tokens, new_bal)
@@ -6960,33 +7549,144 @@ async def stripe_webhook(request: Request):
             else:
                 _stripe_webhook_log("tokens_deposit_skip user_id=%s tokens=%s", user_id, tokens)
             return {"received": True}
+        # Subscription checkout: award tokens from session metadata (or subscription metadata fallback)
+        sub_id = session.get("subscription") or getattr(session, "subscription", None)
+        if isinstance(sub_id, dict):
+            sub_id = (sub_id.get("id") or "").strip() or None
+        elif sub_id and not isinstance(sub_id, str):
+            sub_id = getattr(sub_id, "id", None)
+        plan = (meta.get("plan") or "").strip().lower()
+        interval = (meta.get("interval") or "monthly").strip().lower()
+        uid_str = (meta.get("user_id") or "").strip()
+        # If session metadata is empty (Stripe may attach only to subscription), get from Subscription
+        if sub_id and (not plan or not uid_str):
+            try:
+                sub_obj = stripe.Subscription.retrieve(sub_id)
+                sub_meta = (sub_obj.metadata or {}) if hasattr(sub_obj, "metadata") else {}
+                if not plan and sub_meta.get("plan"):
+                    plan = (sub_meta.get("plan") or "").strip().lower()
+                if not interval and sub_meta.get("interval"):
+                    interval = (sub_meta.get("interval") or "monthly").strip().lower()
+                if not uid_str and sub_meta.get("user_id"):
+                    uid_str = (sub_meta.get("user_id") or "").strip()
+                _stripe_webhook_log("checkout.session.completed fallback from subscription metadata plan=%s interval=%s user_id=%s", plan, interval, uid_str)
+            except Exception as e:
+                _stripe_webhook_log("checkout.session.completed subscription retrieve error=%s", str(e))
+        if sub_id and uid_str and plan in ("pro", "ai_ultra", "whales") and interval in ("monthly", "yearly"):
+            session_id = (session.get("id") if hasattr(session, "get") else None) or getattr(session, "id", None)
+            session_id = (session_id or "").strip() if isinstance(session_id, str) else ""
+            db = next(database.get_db())
+            try:
+                if not session_id:
+                    _stripe_webhook_log("checkout.session.completed subscription skip empty session_id")
+                    return {"received": True}
+                if not token_ledger_svc.try_register_checkout_session(db, session_id):
+                    _stripe_webhook_log("checkout.session.completed subscription already_processed session_id=%s", session_id)
+                    return {"received": True}
+                if token_ledger_svc.subscription_session_already_processed(db, session_id):
+                    _stripe_webhook_log("checkout.session.completed subscription already_in_ledger session_id=%s", session_id)
+                    return {"received": True}
+                user = db.query(models.User).filter(models.User.id == int(uid_str)).first()
+                if not user:
+                    _stripe_webhook_log("checkout.session.completed subscription no_user user_id=%s", uid_str)
+                    return {"received": True}
+                interval_days = 365 if interval == "yearly" else 30
+                effective_plan = _plan_tier_no_downgrade(user.plan_tier or "trial", plan)
+                if effective_plan in PLAN_REBALANCE_MIN:
+                    user.plan_tier = effective_plan
+                    user.rebalance_interval = PLAN_REBALANCE_MIN[effective_plan]
+                now = datetime.utcnow()
+                base = user.pro_expiry if user.pro_expiry and user.pro_expiry > now else now
+                user.pro_expiry = base + timedelta(days=interval_days)
+                tokens_to_award = (
+                    PLAN_TOKEN_AWARD_YEARLY.get(plan, 0) if interval == "yearly"
+                    else PLAN_TOKEN_AWARD_MONTHLY.get(plan, 0)
+                )
+                if tokens_to_award > 0:
+                    reason = "subscription_yearly" if interval == "yearly" else "subscription_monthly"
+                    sub_extra = {"plan": plan, "interval": interval, "stripe_session_id": session_id}
+                    if sub_id:
+                        sub_extra["stripe_subscription_id"] = sub_id if isinstance(sub_id, str) else getattr(sub_id, "id", None)
+                    token_ledger_svc.add_tokens(db, user.id, float(tokens_to_award), reason, extra=sub_extra)
+                    referral_usd = _get_subscription_usd_price(plan, interval)
+                    l1_pct, l2_pct, l3_pct = _get_referral_purchase_pct(db)
+                    apply_referral_rewards_on_purchase(db, user.id, referral_usd, reward_purchase_l1=l1_pct, reward_purchase_l2=l2_pct, reward_purchase_l3=l3_pct)
+                    new_bal = token_ledger_svc.get_tokens_remaining(db, user.id)
+                    _stripe_webhook_log(
+                        "checkout.session.completed subscription_token_award user_id=%s plan=%s interval=%s tokens_added=%s new_balance=%s",
+                        user.id, plan, interval, tokens_to_award, new_bal,
+                    )
+                    logger.info(
+                        "stripe_webhook checkout.session.completed subscription user_id=%s plan=%s interval=%s tokens=%s",
+                        user.id, plan, interval, tokens_to_award,
+                    )
+                db.commit()
+            except Exception as e:
+                _stripe_webhook_log("checkout.session.completed subscription error=%s", str(e))
+                logger.exception("stripe_webhook checkout.session.completed subscription: %s", e)
+                raise
+            finally:
+                db.close()
+            return {"received": True}
 
     if event["type"] == "invoice.payment_succeeded":
         data = event["data"]["object"]
         email = data.get("customer_email") or (data.get("customer_details") or {}).get("email")
         sub_id_raw = data.get("subscription")
-        sub_id = sub_id_raw.get("id") if isinstance(sub_id_raw, dict) else sub_id_raw
+        if isinstance(sub_id_raw, dict):
+            sub_id = (sub_id_raw.get("id") or "").strip() or None
+        elif isinstance(sub_id_raw, str) and sub_id_raw.strip():
+            sub_id = sub_id_raw.strip()
+        else:
+            sub_id = None
+
+        # If payload had no subscription id (e.g. some webhook payloads omit it), get it from the invoice
+        if not sub_id and data.get("id"):
+            try:
+                inv = stripe.Invoice.retrieve(data["id"], expand=["subscription"])
+                sub_raw = getattr(inv, "subscription", None)
+                if isinstance(sub_raw, str) and sub_raw.strip():
+                    sub_id = sub_raw.strip()
+                    logger.info("stripe_webhook invoice sub_id_from_retrieve sub_id=%s invoice_id=%s", sub_id, data.get("id"))
+                    _stripe_webhook_log("invoice sub_id resolved from Invoice.retrieve sub_id=%s", sub_id)
+                elif sub_raw and getattr(sub_raw, "id", None):
+                    sub_id = sub_raw.id
+                    logger.info("stripe_webhook invoice sub_id_from_retrieve sub_id=%s invoice_id=%s", sub_id, data.get("id"))
+                    _stripe_webhook_log("invoice sub_id resolved from Invoice.retrieve sub_id=%s", sub_id)
+            except Exception as e:
+                logger.warning("stripe_webhook invoice retrieve for sub_id error=%s", str(e))
+                _stripe_webhook_log("invoice retrieve for sub_id error=%s", str(e))
 
         db: Session = next(database.get_db())
+        sub_for_metadata = None  # reused for plan/interval fallback if needed
         try:
-            user = db.query(models.User).filter(models.User.email == email).first() if email else None
-            if not user and sub_id:
+            user = None
+            # Prefer subscription metadata when it's a subscription invoice (our checkout sets user_id there)
+            if sub_id:
                 try:
-                    sub = stripe.Subscription.retrieve(sub_id)
-                    meta = sub.metadata or {}
+                    sub_for_metadata = stripe.Subscription.retrieve(sub_id)
+                    meta = sub_for_metadata.metadata or {}
                     uid_str = meta.get("user_id")
                     if uid_str:
                         user = db.query(models.User).filter(models.User.id == int(uid_str)).first()
                         if user:
-                            _stripe_webhook_log("invoice user_lookup by_sub_metadata user_id=%s email_from_invoice=%s", user.id, email)
+                            logger.info("stripe_webhook invoice user_resolution by_sub_metadata user_id=%s sub_id=%s", user.id, sub_id)
+                            _stripe_webhook_log("invoice user_lookup by_sub_metadata user_id=%s email=%s", user.id, email)
                 except Exception as e:
+                    logger.warning("stripe_webhook invoice sub_retrieve sub_id=%s error=%s", sub_id, str(e))
                     _stripe_webhook_log("invoice sub_retrieve sub_id=%s error=%s", sub_id, str(e))
+            if not user and email:
+                user = db.query(models.User).filter(models.User.email == email).first()
+                if user:
+                    logger.info("stripe_webhook invoice user_resolution by_email user_id=%s email=%s", user.id, email)
+                    _stripe_webhook_log("invoice user_lookup by_email user_id=%s", user.id)
 
             _stripe_webhook_log(
                 "invoice.payment_succeeded email=%s sub_id=%s user_id=%s",
                 email, sub_id, user.id if user else None,
             )
             if not user:
+                logger.warning("stripe_webhook invoice skip no_user email=%s sub_id=%s", email, sub_id)
                 _stripe_webhook_log("invoice skip no_user_for_email")
                 return {"received": True}
 
@@ -6996,14 +7696,30 @@ async def stripe_webhook(request: Request):
                 logger.info("stripe_webhook invoice already processed invoice_id=%s user_id=%s", invoice_id, user.id)
                 return {"received": True}
 
-            # Always derive plan/interval from invoice line items (canonical source; resilient to sub_id null or metadata delay)
-            plan, interval = _plan_interval_from_invoice(data)
+            # Plan/interval: prefer subscription metadata (our checkout sets it); fallback to invoice line items
+            plan, interval = "pro", "monthly"
+            if sub_id:
+                try:
+                    sub = sub_for_metadata if sub_for_metadata is not None else stripe.Subscription.retrieve(sub_id)
+                    meta = (sub.metadata or {}) if hasattr(sub, "metadata") else {}
+                    meta_plan = (meta.get("plan") or "").strip().lower()
+                    meta_interval = (meta.get("interval") or "monthly").strip().lower()
+                    if meta_plan in ("pro", "ai_ultra", "whales") and meta_interval in ("monthly", "yearly"):
+                        plan, interval = meta_plan, meta_interval
+                        logger.info("stripe_webhook invoice plan_interval from sub metadata plan=%s interval=%s", plan, interval)
+                        _stripe_webhook_log("invoice plan from sub_metadata plan=%s interval=%s", plan, interval)
+                except Exception as e:
+                    logger.warning("stripe_webhook invoice sub metadata error=%s", str(e))
+            if (plan, interval) == ("pro", "monthly"):
+                plan, interval = _plan_interval_from_invoice(data)
+                logger.info("stripe_webhook invoice plan_from_invoice plan=%s interval=%s", plan, interval)
+                _stripe_webhook_log("invoice plan from invoice lines plan=%s interval=%s", plan, interval)
             interval_days = 365 if interval == "yearly" else 30
-            _stripe_webhook_log("invoice plan from invoice lines plan=%s interval=%s", plan, interval)
 
-            if plan in PLAN_REBALANCE_MIN:
-                user.plan_tier = plan
-                user.rebalance_interval = PLAN_REBALANCE_MIN[plan]
+            effective_plan = _plan_tier_no_downgrade(user.plan_tier or "trial", plan)
+            if effective_plan in PLAN_REBALANCE_MIN:
+                user.plan_tier = effective_plan
+                user.rebalance_interval = PLAN_REBALANCE_MIN[effective_plan]
 
             now = datetime.utcnow()
             base = user.pro_expiry if user.pro_expiry and user.pro_expiry > now else now
@@ -7018,14 +7734,26 @@ async def stripe_webhook(request: Request):
                 "invoice plan=%s interval=%s tokens_to_award=%s user_id=%s",
                 plan, interval, tokens_to_award, user.id,
             )
-            if tokens_to_award > 0:
+            # Only add tokens in invoice when we have sub_id (so we can idempotency-check). When sub_id is None,
+            # tokens were (or will be) awarded in checkout.session.completed; do not add here (avoids 2–4x over-credit on retries).
+            already_awarded = sub_id and token_ledger_svc.subscription_id_already_awarded(db, user.id, sub_id)
+            if already_awarded:
+                _stripe_webhook_log("invoice skip_token_add already_awarded_via_checkout sub_id=%s user_id=%s", sub_id, user.id)
+                logger.info("stripe_webhook invoice skip token add (already awarded via checkout) sub_id=%s user_id=%s", sub_id, user.id)
+            if sub_id is None:
+                _stripe_webhook_log("invoice skip_token_add sub_id_is_none user_id=%s (tokens from checkout.session.completed only)", user.id)
+                logger.info("stripe_webhook invoice skip token add (sub_id None) user_id=%s", user.id)
+            if tokens_to_award > 0 and not already_awarded and sub_id is not None:
                 reason = "subscription_yearly" if interval == "yearly" else "subscription_monthly"
                 sub_extra = {"plan": plan, "interval": interval}
                 if invoice_id:
                     sub_extra["stripe_invoice_id"] = invoice_id
+                logger.info("stripe_webhook invoice about_to_add_tokens user_id=%s amount=%s", user.id, tokens_to_award)
                 token_ledger_svc.add_tokens(db, user.id, float(tokens_to_award), reason, extra=sub_extra)
-                usd_value = tokens_to_award / 100.0
-                apply_referral_rewards_on_purchase(db, user.id, usd_value)
+                logger.info("stripe_webhook invoice add_tokens_done user_id=%s", user.id)
+                referral_usd = _get_subscription_usd_price(plan, interval)
+                l1_pct, l2_pct, l3_pct = _get_referral_purchase_pct(db)
+                apply_referral_rewards_on_purchase(db, user.id, referral_usd, reward_purchase_l1=l1_pct, reward_purchase_l2=l2_pct, reward_purchase_l3=l3_pct)
                 new_bal = token_ledger_svc.get_tokens_remaining(db, user.id)
                 _stripe_webhook_log(
                     "subscription_token_award user_id=%s plan=%s interval=%s tokens_added=%s new_balance=%s",
@@ -7036,18 +7764,25 @@ async def stripe_webhook(request: Request):
                     user.id, plan, interval, tokens_to_award, now.isoformat(),
                 )
 
-            if user.referred_by:
-                referrer = db.query(models.User).filter(models.User.id == user.referred_by).first()
-                if referrer:
-                    ref_base = (
-                        referrer.pro_expiry
-                        if referrer.pro_expiry and referrer.pro_expiry > now
-                        else now
-                    )
-                    referrer.pro_expiry = ref_base + timedelta(days=7)
-
+            # Commit token award and user/pro_expiry so they persist even if referrer logic fails
             db.commit()
+            logger.info("stripe_webhook invoice commit_done user_id=%s", user.id)
             _stripe_webhook_log("invoice commit_ok user_id=%s", user.id)
+
+            # Referrer update in separate try so webhook still returns 200 on referrer failure
+            if user.referred_by:
+                try:
+                    referrer = db.query(models.User).filter(models.User.id == user.referred_by).first()
+                    if referrer:
+                        ref_base = (
+                            referrer.pro_expiry
+                            if referrer.pro_expiry and referrer.pro_expiry > now
+                            else now
+                        )
+                        referrer.pro_expiry = ref_base + timedelta(days=7)
+                        db.commit()
+                except Exception as ref_e:
+                    logger.warning("stripe_webhook invoice referrer_update_failed user_id=%s error=%s", user.id, str(ref_e))
         except Exception as e:
             _stripe_webhook_log("invoice exception user_id=%s error=%s", getattr(user, "id", None), str(e))
             logger.exception("stripe_webhook invoice.payment_succeeded: %s", e)

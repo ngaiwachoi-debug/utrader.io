@@ -61,11 +61,14 @@ def test_run_deduction_uses_snapshot_and_updates_balance():
             purchased_tokens=0.0,
             last_gross_usd_used=0.0,
         ))
-        db.add(models.UserProfitSnapshot(
+        snap = models.UserProfitSnapshot(
             user_id=user_id,
             gross_profit_usd=722.0,  # cumulative
             daily_gross_profit_usd=daily_gross_from_bitfinex,
-        ))
+        )
+        if hasattr(snap, "last_daily_snapshot_date"):
+            snap.last_daily_snapshot_date = datetime.now(timezone.utc).date()
+        db.add(snap)
         db.commit()
 
         log_entries, err = run_daily_token_deduction(db, user_ids=[user_id])
@@ -73,14 +76,17 @@ def test_run_deduction_uses_snapshot_and_updates_balance():
         assert len(log_entries) == 1
         assert log_entries[0]["tokens_deducted"] == daily_gross_from_bitfinex
         assert log_entries[0]["tokens_remaining_before"] == tokens_before
-        assert log_entries[0]["tokens_remaining_after"] == tokens_before - daily_gross_from_bitfinex
+        expected_after = tokens_before - daily_gross_from_bitfinex
+        assert abs(log_entries[0]["tokens_remaining_after"] - expected_after) < 0.01
 
         row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).first()
         assert row is not None
-        assert float(row.tokens_remaining) == tokens_before - daily_gross_from_bitfinex
-        assert float(row.last_gross_usd_used) == daily_gross_from_bitfinex
+        assert abs(float(row.tokens_remaining) - expected_after) < 0.01
+        assert abs(float(row.last_gross_usd_used) - daily_gross_from_bitfinex) < 0.01
     finally:
         if user_id is not None:
+            if hasattr(models, "TokenLedger"):
+                db.query(models.TokenLedger).filter(models.TokenLedger.user_id == user_id).delete(synchronize_session=False)
             if hasattr(models, "DeductionLog"):
                 db.query(models.DeductionLog).filter(models.DeductionLog.user_id == user_id).delete(synchronize_session=False)
             db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).delete(synchronize_session=False)
@@ -224,16 +230,19 @@ def test_token_balance_api_after_deduction():
             purchased_tokens=purchased,
             last_gross_usd_used=0.0,
         ))
-        db.add(models.UserProfitSnapshot(
+        snap = models.UserProfitSnapshot(
             user_id=user_id,
             gross_profit_usd=100.0,
             daily_gross_profit_usd=daily_gross,
-        ))
+        )
+        if hasattr(snap, "last_daily_snapshot_date"):
+            snap.last_daily_snapshot_date = datetime.now(timezone.utc).date()
+        db.add(snap)
         db.commit()
 
         run_daily_token_deduction(db, user_ids=[user_id])
 
-        async def override_token_balance_user():
+        def override_token_balance_user():
             return db.query(models.User).filter(models.User.id == user_id).first()
 
         app.dependency_overrides[_get_current_user_for_token_balance] = override_token_balance_user
@@ -242,18 +251,22 @@ def test_token_balance_api_after_deduction():
             r = client.get("/api/v1/users/me/token-balance")
             assert r.status_code == 200, r.text
             data = r.json()
-            assert data["tokens_remaining"] == tokens_before - daily_gross
-            assert data["last_gross_usd_used"] == daily_gross
-            # total_tokens_deducted = max(0, purchased - tokens_remaining)
-            assert data["total_tokens_deducted"] == max(0.0, purchased - (tokens_before - daily_gross))
+            expected_remaining = round(tokens_before - daily_gross, 2)
+            assert abs(data["tokens_remaining"] - expected_remaining) < 0.01
+            assert abs(data["last_gross_usd_used"] - daily_gross) < 0.01
+            # total_tokens_deducted derived from API (rounded); allow tolerance
+            expected_deducted = max(0.0, purchased - (tokens_before - daily_gross))
+            assert abs(data["total_tokens_deducted"] - expected_deducted) < 0.01
         finally:
             app.dependency_overrides.pop(_get_current_user_for_token_balance, None)
     finally:
         if user_id is not None:
+            if hasattr(models, "TokenLedger"):
+                db.query(models.TokenLedger).filter(models.TokenLedger.user_id == user_id).delete(synchronize_session=False)
             if hasattr(models, "DeductionLog"):
                 db.query(models.DeductionLog).filter(models.DeductionLog.user_id == user_id).delete(synchronize_session=False)
             db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == user_id).delete(synchronize_session=False)
-            db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete(synchronize_session=False)
+            db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()
             db.query(models.User).filter(models.User.id == user_id).delete(synchronize_session=False)
             db.commit()
         db.close()

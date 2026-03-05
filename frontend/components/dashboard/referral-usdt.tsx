@@ -11,6 +11,19 @@ import { useT } from "@/lib/i18n"
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 const REFRESH_COOLDOWN_SEC = 15
 
+const USDT_REASON_LABELS: Record<string, string> = {
+  withdrawal: "Withdrawal",
+  admin_adjust: "Admin adjustment",
+  referral_earnings_purchase: "Referral rewards",
+  referral_earnings: "Referral rewards",
+}
+
+function formatUsdtReason(reason: string): string {
+  if (!reason) return "—"
+  const normalized = reason.trim().toLowerCase()
+  return USDT_REASON_LABELS[normalized] ?? reason.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
 export function ReferralUsdt() {
   const t = useT()
   const userId = useCurrentUserId()
@@ -22,6 +35,7 @@ export function ReferralUsdt() {
   const withdrawals = data?.withdrawals ?? []
   const rewardHistory = data?.rewardHistory ?? []
   const downline = data?.downline ?? []
+  const usdtHistory = data?.usdtHistory ?? []
 
   const [withdrawAmount, setWithdrawAmount] = useState("")
   const [submitting, setSubmitting] = useState(false)
@@ -219,7 +233,7 @@ export function ReferralUsdt() {
           <Users className="h-5 w-5" />
           Referred users
         </h2>
-        <p className="text-xs text-muted-foreground mb-4">People who signed up with your referral code and USDT Credit you earned from them (L1).</p>
+        <p className="text-xs text-muted-foreground mb-4">People who signed up with your referral code. &quot;USDT earned from them&quot; is the sum of L1 rewards from their purchases and token burns (same source as Referral rewards in USDT reward history).</p>
         {downline.length > 0 ? (
           <div className="overflow-x-auto rounded-lg border border-border">
             <table className="w-full text-sm">
@@ -248,31 +262,29 @@ export function ReferralUsdt() {
         )}
       </div>
 
-      {/* Card: Reward history */}
+      {/* Card: USDT activity history (rewards, withdrawals, admin adjusts) */}
       <div className="rounded-xl border border-border bg-card p-5">
         <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground mb-2">
           <History className="h-5 w-5" />
-          Reward history
+          USDT reward history
         </h2>
-        <p className="text-xs text-muted-foreground mb-4">Each row is one reward event (L1/L2/L3 from token burns or purchases).</p>
-        {rewardHistory.length > 0 ? (
+        <p className="text-xs text-muted-foreground mb-4">Your USDT Credit activity: referral earnings, withdrawals, and admin adjustments.</p>
+        {usdtHistory.length > 0 ? (
           <div className="overflow-x-auto rounded-lg border border-border">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border bg-secondary/50">
                   <th className="text-left py-2.5 px-3">Date</th>
-                  <th className="text-left py-2.5 px-3">Downline</th>
-                  <th className="text-left py-2.5 px-3">Level</th>
-                  <th className="text-right py-2.5 px-3">Amount (USDT Credit)</th>
+                  <th className="text-right py-2.5 px-3">Amount</th>
+                  <th className="text-left py-2.5 px-3">Reason</th>
                 </tr>
               </thead>
               <tbody>
-                {rewardHistory.map((r, i) => (
-                  <tr key={i} className="border-b border-border/50">
-                    <td className="py-2.5 px-3 text-muted-foreground">{r.created_at ? new Date(r.created_at).toLocaleString() : "—"}</td>
-                    <td className="py-2.5 px-3">{r.downline_email ?? `User #${r.burning_user_id}`}</td>
-                    <td className="py-2.5 px-3">L{r.level ?? 1}</td>
-                    <td className="py-2.5 px-3 text-right">{r.amount_usdt_credit.toFixed(4)}</td>
+                {usdtHistory.map((r) => (
+                  <tr key={r.id} className="border-b border-border/50">
+                    <td className="py-2.5 px-3 text-muted-foreground">{r.created_at ? new Date(r.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "—"}</td>
+                    <td className="py-2.5 px-3 text-right font-medium">{r.amount >= 0 ? "+" : ""}{r.amount.toFixed(4)}</td>
+                    <td className="py-2.5 px-3">{formatUsdtReason(r.reason)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -280,7 +292,7 @@ export function ReferralUsdt() {
           </div>
         ) : (
           <p className="rounded-lg border border-border bg-secondary/30 py-4 px-4 text-sm text-muted-foreground text-center">
-            No one has signed up with your code yet.
+            No USDT activity yet.
           </p>
         )}
       </div>

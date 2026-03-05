@@ -56,9 +56,10 @@ export default function DashboardPage() {
 function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof useSearchParams> | null }) {
   const t = useT()
   const pathname = usePathname()
+  const router = useRouter()
   const userId = useCurrentUserId()
   const id = userId ?? 0
-  const { prefetch } = useDashboardData()
+  const { prefetch, getUserStatus, getWallets, getTokenBalance } = useDashboardData()
   const userStatus = useUserStatus(id)
   const planTier = normalizePlanTier(userStatus.data?.plan_tier ?? "trial")
   const [activePage, setActivePage] = useState("profit-center")
@@ -72,6 +73,21 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
   useEffect(() => {
     if (searchParams?.get("page") === "subscription") setActivePage("subscription")
   }, [searchParams])
+
+  useEffect(() => {
+    const sub = searchParams?.get("subscription")
+    const tokens = searchParams?.get("tokens")
+    const isSuccess = sub === "success" || tokens === "success"
+    if (!isSuccess || userId == null) return
+    getUserStatus(id).refetch()
+    getWallets(id).refetch()
+    getTokenBalance(id).refetch()
+    const next = new URLSearchParams(searchParams?.toString() ?? "")
+    next.delete("subscription")
+    next.delete("tokens")
+    const q = next.toString()
+    router.replace(pathname + (q ? `?${q}` : ""))
+  }, [searchParams?.get("subscription"), searchParams?.get("tokens"), userId, pathname, id, getUserStatus, getWallets, getTokenBalance, router])
 
   const handleUpgrade = () => setActivePage("subscription")
 

@@ -93,6 +93,16 @@ async def run_bot_task(ctx, user_id: int):
         user.rebalance_interval = cfg["sleep_minutes"]
         db.commit()
 
+        # If user already clicked Stop (e.g. duplicate/queued job picked up after stop), exit without running
+        if getattr(user, "bot_desired_state", None) == "stopped":
+            await _term(redis, user_id, "Shutdown: bot already stopped (skipping).")
+            try:
+                user.bot_status = "stopped"
+                db.commit()
+            except Exception:
+                db.rollback()
+            return
+
         await _term(redis, user_id, "API keys found. Checking token balance...")
 
         # Token gate at start: run only when tokens_remaining > 0 (same as POST /start-bot)
@@ -167,6 +177,7 @@ async def run_bot_task(ctx, user_id: int):
 
         # Kill-switch loop – token balance only.
         loop_count = 0
+        shutdown_requested_logged = [False]  # Only log "stop requested" once per task
         try:
             while True:
                 tokens_remaining = _tokens_remaining_for_user(db, user_id)
@@ -190,7 +201,9 @@ async def run_bot_task(ctx, user_id: int):
                     db.expire(user)
                     user = db.query(models.User).filter(models.User.id == user_id).first()
                     if user and getattr(user, "bot_desired_state", None) == "stopped":
-                        await _term(redis, user_id, "Shutdown: stop requested from dashboard.")
+                        if not shutdown_requested_logged[0]:
+                            shutdown_requested_logged[0] = True
+                            await _term(redis, user_id, "Shutdown: stop requested from dashboard.")
                         print(f"[SHUTDOWN] User {user_id} bot_desired_state=stopped. Exiting.")
                         user.bot_status = "stopped"
                         db.commit()
@@ -204,10 +217,12 @@ async def run_bot_task(ctx, user_id: int):
                 await engine_task
 
     except asyncio.CancelledError:
-        # Normal stop (user clicked Stop): set both so desired state stays in sync
+        # Normal stop (user clicked Stop): set both so desired state stays in sync; log "task cancelled" only once
         print(f"[SHUTDOWN] Task for User {user_id} was cancelled gracefully.")
         try:
-            await _term(ctx.get("redis"), user_id, "Shutdown: task cancelled.")
+            redis_term = ctx.get("redis")
+            if redis_term:
+                await _term(redis_term, user_id, "Shutdown: task cancelled.")
         except Exception:
             pass
         try:

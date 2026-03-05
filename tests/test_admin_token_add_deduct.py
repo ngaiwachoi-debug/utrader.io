@@ -96,8 +96,10 @@ def test_admin_add_and_deduct_tokens():
             app.dependency_overrides.pop(get_current_user, None)
     finally:
         if target_user is not None:
-            db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == target_user.id).delete()
-            db.query(models.User).filter(models.User.id == target_user.id).delete()
+            tid = target_user.id
+            db.query(models.TokenLedger).filter(models.TokenLedger.user_id == tid).delete(synchronize_session=False)
+            db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == tid).delete()
+            db.query(models.User).filter(models.User.id == tid).delete()
             db.commit()
         db.close()
 

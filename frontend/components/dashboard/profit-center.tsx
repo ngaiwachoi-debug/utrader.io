@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from "react"
 import {
   DollarSign,
-  Clock,
   RefreshCw,
   Wallet,
 } from "lucide-react"
@@ -11,7 +10,7 @@ import { Spinner } from "@/components/ui/spinner"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { getBackendToken } from "@/lib/auth"
-import { useLendingStats, useUserStatus, useDeductionMultiplier, type LendingStatsTrade } from "@/lib/dashboard-data-context"
+import { useLendingStats, useUserStatus, useDeductionMultiplier, useTokenBalance, type LendingStatsTrade } from "@/lib/dashboard-data-context"
 import {
   AreaChart,
   Area,
@@ -83,6 +82,42 @@ const chartData = [
   { date: "02-25", volume: 21000, interest: 58 },
 ]
 
+/** Isolated so the 1s cooldown tick only re-renders this button, not the charts. */
+function RefreshButtonWithCooldown({
+  refreshCooldownUntil,
+  onRefresh,
+  refreshing,
+  loading,
+  t,
+}: {
+  refreshCooldownUntil: number
+  onRefresh: () => void
+  refreshing: boolean
+  loading: boolean
+  t: (key: string, opts?: { n?: number }) => string
+}) {
+  const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((refreshCooldownUntil - Date.now()) / 1000))
+      setRefreshCooldownSec(remaining)
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [refreshCooldownUntil])
+  const disabled = refreshing || loading || refreshCooldownSec > 0
+  return (
+    <button
+      type="button"
+      onClick={onRefresh}
+      disabled={disabled}
+      className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground hover:bg-secondary disabled:opacity-50"
+    >
+      <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+      {refreshing ? "Refreshing…" : refreshCooldownSec > 0 ? `${t("liveStatus.refreshIn", { n: refreshCooldownSec })}` : "Refresh Gross Profit"}
+    </button>
+  )
+}
+
 type ProfitCenterProps = { onUpgradeClick?: () => void }
 
 export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
@@ -92,17 +127,11 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const lendingStats = useLendingStats(id)
   const userStatus = useUserStatus(id)
   const deductionMultiplier = useDeductionMultiplier()
+  const { data: tokenBalance } = useTokenBalance(id)
   const [timeRange, setTimeRange] = useState("30d")
   const [showBreakdown, setShowBreakdown] = useState(false)
   const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
-  const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
   const [refreshing, setRefreshing] = useState(false)
-  const [tokenBalance, setTokenBalance] = useState<{
-    tokens_remaining: number
-    total_tokens_added: number
-    total_tokens_deducted: number
-  } | null>(null)
-  const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
 
   const data = lendingStats.data
   const loading = lendingStats.loading && !data
@@ -125,52 +154,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
   const fundingTrades = useMemo(() => data?.trades ?? [], [data?.trades])
   const calculationBreakdown = data?.calculation_breakdown ?? null
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const remaining = Math.max(0, Math.ceil((refreshCooldownUntil - Date.now()) / 1000))
-      setRefreshCooldownSec(remaining)
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [refreshCooldownUntil])
-
-  useEffect(() => {
-    if (userId == null) {
-      setTokenBalance(null)
-      setTokenBalanceLoading(false)
-      return
-    }
-    let cancelled = false
-    const run = async () => {
-      setTokenBalanceLoading(true)
-      try {
-        const token = await getBackendToken()
-        if (!token || cancelled) return
-        const res = await fetch(`${API_BACKEND}/api/v1/users/me/token-balance`, {
-          credentials: "include",
-          headers: { Authorization: `Bearer ${token}` },
-        })
-        if (cancelled) return
-        if (res.ok) {
-          const data = await res.json()
-          if (!cancelled) {
-            setTokenBalance({
-              tokens_remaining: Number(data.tokens_remaining) ?? 0,
-              total_tokens_added: Number(data.total_tokens_added) ?? 0,
-              total_tokens_deducted: Number(data.total_tokens_deducted) ?? 0,
-            })
-          }
-        } else {
-          if (!cancelled) setTokenBalance(null)
-        }
-      } catch {
-        if (!cancelled) setTokenBalance(null)
-      } finally {
-        if (!cancelled) setTokenBalanceLoading(false)
-      }
-    }
-    run()
-    return () => { cancelled = true }
-  }, [userId])
+  // Token balance comes from dashboard-fold (useTokenBalance); no separate request on load.
 
   // Derive chart from trades (useMemo avoids setState-in-useEffect loop when fundingTrades ref changes)
   const chartHistory = useMemo(() => {
@@ -219,15 +203,13 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
             {t("dashboard.profitCenterDesc")}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={handleRefresh}
-          disabled={refreshing || loading || refreshCooldownSec > 0}
-          className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground hover:bg-secondary disabled:opacity-50"
-        >
-          <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-          {refreshing ? "Refreshing…" : refreshCooldownSec > 0 ? `${t("liveStatus.refreshIn", { n: refreshCooldownSec })}` : "Refresh Gross Profit"}
-        </button>
+        <RefreshButtonWithCooldown
+          refreshCooldownUntil={refreshCooldownUntil}
+          onRefresh={handleRefresh}
+          refreshing={refreshing}
+          loading={loading}
+          t={t}
+        />
       </div>
 
       {error && (
@@ -244,7 +226,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
         </div>
         <p className="text-xs text-muted-foreground mb-4">{t("dashboard.tokenUsageRule", { multiplier: deductionMultiplier })}</p>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-          {tokenBalanceLoading && !tokenBalance ? (
+          {loading && !tokenBalance ? (
             <span className="text-xl font-bold text-primary">…</span>
           ) : (
             <span className="text-xl font-bold text-primary">
@@ -291,11 +273,21 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
           <div className="flex gap-4 mt-1.5 text-xs">
             <span className="flex items-center gap-1.5">
               <span className="h-2 w-4 rounded-full bg-primary" />
-              {t("dashboard.tokensRemaining")}
+              {t("dashboard.tokensRemaining")}{" "}
+              <span className="font-medium tabular-nums text-foreground">
+                {tokensRemaining != null && Number.isFinite(tokensRemaining)
+                  ? Number(tokensRemaining).toLocaleString(undefined, { maximumFractionDigits: 2 })
+                  : "—"}
+              </span>
             </span>
             <span className="flex items-center gap-1.5">
               <span className="h-2 w-4 rounded-full bg-amber-500/80" />
-              {t("dashboard.tokensUsed")}
+              {t("dashboard.tokensUsed")}{" "}
+              <span className="font-medium tabular-nums text-foreground">
+                {tokenBalance != null
+                  ? Number(tokenBalance?.total_tokens_deducted ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })
+                  : "—"}
+              </span>
             </span>
           </div>
         </div>

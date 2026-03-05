@@ -3,6 +3,7 @@ Token service: user_token_balance is source of truth; token_ledger logs every ad
 """
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 try:
     import models
@@ -66,6 +67,84 @@ def subscription_invoice_already_processed(db: Session, user_id: int, stripe_inv
                 LIMIT 1
             """),
             {"uid": user_id, "inv_id": stripe_invoice_id},
+        ).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
+def subscription_session_already_processed(db: Session, stripe_session_id: str) -> bool:
+    """
+    Return True if we have already recorded a subscription token award for this Stripe checkout session (idempotency).
+    """
+    if not stripe_session_id or not _has_token_ledger:
+        return False
+    if not _token_ledger_table_exists(db):
+        return False
+    try:
+        r = db.execute(
+            text("""
+                SELECT 1 FROM token_ledger
+                WHERE activity_type = 'add'
+                  AND reason IN ('subscription_monthly', 'subscription_yearly')
+                  AND (metadata->>'stripe_session_id') = :sid
+                LIMIT 1
+            """),
+            {"sid": stripe_session_id},
+        ).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
+def try_register_checkout_session(db: Session, stripe_session_id: str) -> bool:
+    """
+    Register a checkout session for idempotency (one token award per session).
+    Returns True if this is the first time we see this session_id (caller should add tokens).
+    Returns False if already processed (duplicate/retry) or session_id empty — caller should skip.
+    Uses table stripe_processed_checkout_sessions (session_id PRIMARY KEY) so duplicates get IntegrityError.
+    """
+    if not stripe_session_id or not stripe_session_id.strip():
+        return False
+    try:
+        db.execute(
+            text("INSERT INTO stripe_processed_checkout_sessions (session_id) VALUES (:sid)"),
+            {"sid": stripe_session_id.strip()},
+        )
+        db.flush()
+        return True
+    except IntegrityError:
+        return False
+    except Exception:
+        try:
+            r = db.execute(
+                text("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'stripe_processed_checkout_sessions'")
+            ).fetchone()
+            if not r:
+                return not subscription_session_already_processed(db, stripe_session_id)
+        except Exception:
+            pass
+        return False
+
+
+def subscription_id_already_awarded(db: Session, user_id: int, stripe_subscription_id: str) -> bool:
+    """
+    Return True if we have already awarded tokens for this Stripe subscription (e.g. from checkout.session.completed).
+    """
+    if not stripe_subscription_id or not _has_token_ledger:
+        return False
+    if not _token_ledger_table_exists(db):
+        return False
+    try:
+        r = db.execute(
+            text("""
+                SELECT 1 FROM token_ledger
+                WHERE user_id = :uid AND activity_type = 'add'
+                  AND reason IN ('subscription_monthly', 'subscription_yearly')
+                  AND (metadata->>'stripe_subscription_id') = :sub_id
+                LIMIT 1
+            """),
+            {"uid": user_id, "sub_id": stripe_subscription_id},
         ).fetchone()
         return r is not None
     except Exception:

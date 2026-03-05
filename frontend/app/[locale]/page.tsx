@@ -2,21 +2,31 @@
 
 import { useState } from "react"
 import Link from "next/link"
-import { useRouter, useParams } from "next/navigation"
+import { useRouter, useParams, useSearchParams } from "next/navigation"
 import { signIn } from "next-auth/react"
 import { useT } from "@/lib/i18n"
 import { setDevBackendToken } from "@/lib/auth"
 import { TrendingUp, Zap, Shield, BarChart3 } from "lucide-react"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+const PENDING_REFERRAL_KEY = "pending_referral_code"
 
 export default function LandingPage() {
   const t = useT()
   const router = useRouter()
   const params = useParams()
+  const searchParams = useSearchParams()
   const locale = (params?.locale as string) || "en"
+  const ref = (searchParams.get("ref") || "").trim()
   const [devLoginLoading, setDevLoginLoading] = useState(false)
   const [devLoginError, setDevLoginError] = useState<string | null>(null)
+
+  const handleGoogleSignIn = () => {
+    if (typeof window !== "undefined" && ref) {
+      localStorage.setItem(PENDING_REFERRAL_KEY, ref)
+    }
+    void signIn("google", { callbackUrl: "/dashboard" })
+  }
 
   async function handleDevLoginAsChoiwangai() {
     setDevLoginError(null)
@@ -94,7 +104,7 @@ export default function LandingPage() {
         <div className="flex flex-wrap items-center justify-center gap-4">
           <button
             type="button"
-            onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+            onClick={handleGoogleSignIn}
             className="inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-base font-semibold text-white hover:bg-primary/90 transition-colors"
           >
             <Zap className="h-5 w-5" />
@@ -155,7 +165,7 @@ export default function LandingPage() {
         </p>
         <button
           type="button"
-          onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+          onClick={handleGoogleSignIn}
           className="inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-base font-semibold text-white hover:bg-primary/90 transition-colors"
         >
           {t("login.signInWithGoogle")}

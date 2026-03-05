@@ -26,7 +26,7 @@ import {
   CheckCircle,
 } from "lucide-react"
 import { useCurrentUserId } from "@/lib/current-user-context"
-import { useReferralData, useDeductionMultiplier } from "@/lib/dashboard-data-context"
+import { useReferralData, useDeductionMultiplier, useTokenBalance } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
 import {
   calculateTotalBudget,
@@ -34,19 +34,18 @@ import {
   calculateUsagePercentage,
 } from "@/lib/calculateTokenUsage"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
-const TOKEN_BALANCE_POLL_MS = 30_000
-const TOKEN_BALANCE_CACHE_MS = 10_000
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api-backend"
+const TOKEN_BALANCE_POLL_MS = 60_000
 
 type TokenBalanceState = {
   tokens_remaining: number
   total_tokens_added: number
   total_tokens_deducted: number
-  last_gross_usd_used: number
-  updated_at: string | null
+  last_gross_usd_used?: number
+  updated_at?: string | null
 }
 
-type TokenAddHistoryEntry = { amount: number; reason: string; created_at: string; detail?: string | null }
+type TokenAddHistoryEntry = { amount: number; reason: string; created_at: string; detail?: string | null; balance_before?: number | null; balance_after?: number | null }
 
 function tokenAddReasonLabel(reason: string): string {
   const map: Record<string, string> = {
@@ -93,72 +92,22 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const [proExpiry, setProExpiry] = useState<string | null>(null)
   const [createdAt, setCreatedAt] = useState<string | null>(null)
 
-  // Token Usage: from /api/v1/users/me/token-balance
-  const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
-  const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
+  // Token balance from dashboard-fold (useTokenBalance); no separate request on load.
+  const { data: tokenBalanceFromContext, refetch: refetchTokenBalance } = useTokenBalance(id)
+  const tokenBalance: TokenBalanceState | null = tokenBalanceFromContext
+    ? {
+        tokens_remaining: tokenBalanceFromContext.tokens_remaining,
+        total_tokens_added: tokenBalanceFromContext.total_tokens_added,
+        total_tokens_deducted: tokenBalanceFromContext.total_tokens_deducted,
+      }
+    : null
+  const tokenBalanceLoading = userId != null && tokenBalanceFromContext == null
   const [tokenBalanceError, setTokenBalanceError] = useState<string | null>(null)
-  const tokenBalanceLastFetch = useRef<number>(0)
+  const tokenBalanceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Token add history: from /api/v1/users/me/token-add-history
   const [tokenAddHistory, setTokenAddHistory] = useState<TokenAddHistoryEntry[]>([])
   const [tokenAddHistoryLoading, setTokenAddHistoryLoading] = useState(false)
-
-  const fetchTokenBalance = async () => {
-    const token = await getBackendToken()
-    if (!token) {
-      setTokenBalanceLoading(false)
-      return
-    }
-    const now = Date.now()
-    if (tokenBalance != null && now - tokenBalanceLastFetch.current < TOKEN_BALANCE_CACHE_MS) {
-      return
-    }
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, {
-        credentials: "include",
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (res.status === 401) {
-        setTokenBalanceError(null)
-        return
-      }
-      if (res.status === 429) {
-        setTokenBalanceError(t("settings.rateLimitToken"))
-        setTokenBalanceLoading(false)
-        return
-      }
-      if (res.status >= 500) {
-        setTokenBalanceError(t("settings.tokenDataContactSupport"))
-        setTokenBalanceLoading(false)
-        return
-      }
-      if (!res.ok) {
-        setTokenBalanceError(t("settings.tokenUsageFailed"))
-        setTokenBalanceLoading(false)
-        return
-      }
-      const data = await res.json()
-      if (process.env.NODE_ENV === "development") {
-        console.log("[TokenUsage] Fetched token data:", data)
-      }
-      tokenBalanceLastFetch.current = now
-      setTokenBalance({
-        tokens_remaining: Number(data.tokens_remaining) ?? 0,
-        total_tokens_added: Number(data.total_tokens_added) ?? 0,
-        total_tokens_deducted: Number(data.total_tokens_deducted) ?? 0,
-        last_gross_usd_used: Number(data.last_gross_usd_used) ?? 0,
-        updated_at: data.updated_at ?? null,
-      })
-      setTokenBalanceError(null)
-    } catch (e) {
-      if (process.env.NODE_ENV === "development") {
-        console.error("[TokenUsage] Failed to fetch:", e)
-      }
-      setTokenBalanceError(t("settings.tokenUsageFailed"))
-    } finally {
-      setTokenBalanceLoading(false)
-    }
-  }
 
   const fetchTokenAddHistory = async () => {
     const token = await getBackendToken()
@@ -186,17 +135,37 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
       setPlanName("Trial Plan")
       setProExpiry(null)
       setCreatedAt(null)
-      setTokenBalance(null)
-      setTokenBalanceLoading(false)
       setTokenBalanceError(null)
       setTokenAddHistory([])
       return
     }
-    fetchTokenBalance()
     fetchTokenAddHistory()
-    const interval = setInterval(fetchTokenBalance, TOKEN_BALANCE_POLL_MS)
-    return () => clearInterval(interval)
   }, [userId])
+
+  // Token balance: poll only on Token activity tab and when tab is visible (reduces server load)
+  useEffect(() => {
+    if (userId == null || activeTab !== "token-activity") return
+    const startPolling = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return
+      tokenBalanceIntervalRef.current = setInterval(refetchTokenBalance, TOKEN_BALANCE_POLL_MS)
+    }
+    const stopPolling = () => {
+      if (tokenBalanceIntervalRef.current) {
+        clearInterval(tokenBalanceIntervalRef.current)
+        tokenBalanceIntervalRef.current = null
+      }
+    }
+    startPolling()
+    const onVisibility = () => {
+      stopPolling()
+      if (document.visibilityState === "visible") startPolling()
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility)
+      stopPolling()
+    }
+  }, [userId, activeTab, refetchTokenBalance])
 
   useEffect(() => {
     if (userId == null) return
@@ -341,7 +310,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
             <div>
               <p className="text-xs font-semibold text-foreground">{t("settings.tokenUsage")}</p>
               <p className="text-xs text-muted-foreground">
-                {tokenUsage != null ? `${Math.round(tokenUsage.pct)}% Used` : tokenBalance != null ? "0% Used" : "—"}
+                {tokenUsage != null ? `${Math.round(100 - tokenUsage.pct)}% Remaining` : tokenBalance != null ? "100% Remaining" : "—"}
               </p>
             </div>
           </div>
@@ -387,63 +356,25 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
                 <div
                   className="absolute inset-y-0 left-0 rounded transition-all duration-500"
                   style={{
-                    width: `${Math.min(100, Math.max(0, tokenUsage.pct))}%`,
+                    width: `${Math.min(100, Math.max(0, 100 - tokenUsage.pct))}%`,
                     borderRadius: 4,
                     background:
-                      tokenUsage.pct <= 50 ? "#10b981" : tokenUsage.pct <= 80 ? "#f59e0b" : "#ef4444",
+                      (100 - tokenUsage.pct) >= 50 ? "#10b981" : (100 - tokenUsage.pct) >= 20 ? "#f59e0b" : "#ef4444",
                   }}
                 />
                 <span className="absolute inset-0 flex items-center justify-center text-xs font-medium text-white" style={{ textShadow: "0 0 1px rgba(0,0,0,0.5)" }}>
-                  {Math.round(tokenUsage.pct)}% Used
+                  {Math.round(100 - tokenUsage.pct)}% Remaining
                 </span>
               </div>
               <div className="flex items-center justify-between mt-1.5">
                 <span className="text-xs text-muted-foreground">
-                  {t("settings.tokensUsedRemaining", { used: Math.round(tokenUsage.used), remaining: Math.round(tokenUsage.remaining) })}
+                  {t("settings.tokensRemainingUsed", { remaining: Math.round(tokenUsage.remaining), used: Math.round(tokenUsage.used) })}
                 </span>
                 <span className="text-xs text-muted-foreground">
                   {t("settings.totalBudget", { total: Math.round(tokenUsage.totalBudget) })}
                 </span>
               </div>
             </>
-          )}
-        </div>
-
-        {/* Token added history */}
-        <div className="mt-4">
-          <span className="text-xs font-medium text-foreground">{t("settings.tokenAddedHistory")}</span>
-          {tokenAddHistoryLoading ? (
-            <p className="text-xs text-muted-foreground mt-1">Loading…</p>
-          ) : tokenAddHistory.length === 0 ? (
-            <p className="text-xs text-muted-foreground mt-1">No token add history yet.</p>
-          ) : (
-            <div className="mt-1 overflow-x-auto max-h-40 border border-border rounded-md">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b border-border bg-muted/50">
-                    <th className="text-left py-1.5 px-2">Date</th>
-                    <th className="text-left py-1.5 px-2">Amount</th>
-                    <th className="text-left py-1.5 px-2">Reason</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {tokenAddHistory.slice(0, 30).map((e, i) => (
-                    <tr key={i} className="border-b border-border/50">
-                      <td className="py-1.5 px-2">
-                        {e.created_at ? (() => {
-                          try {
-                            const d = new Date(e.created_at)
-                            return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
-                          } catch { return e.created_at }
-                          })() : "—"}
-                      </td>
-                      <td className="py-1.5 px-2">{e.amount}</td>
-                      <td className="py-1.5 px-2">{e.detail ?? tokenAddReasonLabel(e.reason)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
           )}
         </div>
       </div>
@@ -480,7 +411,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
         {activeTab === "notifications" && <NotificationsTab dailyEmail={dailyEmail} setDailyEmail={setDailyEmail} />}
         {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} userId={userId} />}
         {activeTab === "community" && <CommunityTab />}
-        {activeTab === "token-activity" && <TokenActivityTab />}
+        {activeTab === "token-activity" && <TokenActivityTab refetchTokenBalance={refetchTokenBalance} />}
       </div>
     </div>
   )
@@ -1197,70 +1128,100 @@ type DeductionHistoryEntry = {
   account_switch_note: string | null
 }
 
-function TokenActivityTab() {
+function TokenActivityTab({ refetchTokenBalance }: { refetchTokenBalance: () => Promise<void> }) {
   const t = useT()
+  const userId = useCurrentUserId()
+  const id = userId ?? 0
+  const { data: tokenBalance } = useTokenBalance(id)
   const [addLog, setAddLog] = useState<TokenAddHistoryEntry[]>([])
   const [deductionLog, setDeductionLog] = useState<DeductionHistoryEntry[]>([])
   const [addLoading, setAddLoading] = useState(true)
   const [deductionLoading, setDeductionLoading] = useState(true)
 
+  const fetchTokenActivity = async () => {
+    const token = await getBackendToken()
+    if (!token) return
+    setAddLoading(true)
+    setDeductionLoading(true)
+    try {
+      const [addRes, dedRes] = await Promise.all([
+        fetch(`${API_BASE}/api/v1/users/me/token-add-history?limit=200`, {
+          credentials: "include",
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch(`${API_BASE}/api/v1/users/me/deduction-history?limit=200`, {
+          credentials: "include",
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      ])
+      if (addRes.ok) {
+        const data = await addRes.json()
+        setAddLog(Array.isArray(data) ? data : [])
+      } else {
+        setAddLog([])
+      }
+      if (dedRes.ok) {
+        const data = await dedRes.json()
+        setDeductionLog(Array.isArray(data) ? data : [])
+      } else {
+        setDeductionLog([])
+      }
+      await refetchTokenBalance()
+    } finally {
+      setAddLoading(false)
+      setDeductionLoading(false)
+    }
+  }
+
   useEffect(() => {
     let cancelled = false
-    const run = async () => {
-      const token = await getBackendToken()
-      if (!token || cancelled) return
-      setAddLoading(true)
-      setDeductionLoading(true)
-      try {
-        const [addRes, dedRes] = await Promise.all([
-          fetch(`${API_BASE}/api/v1/users/me/token-add-history?limit=200`, {
-            credentials: "include",
-            headers: { Authorization: `Bearer ${token}` },
-          }),
-          fetch(`${API_BASE}/api/v1/users/me/deduction-history?limit=200`, {
-            credentials: "include",
-            headers: { Authorization: `Bearer ${token}` },
-          }),
-        ])
-        if (cancelled) return
-        if (addRes.ok) {
-          const data = await addRes.json()
-          setAddLog(Array.isArray(data) ? data : [])
-        } else {
-          setAddLog([])
-        }
-        if (dedRes.ok) {
-          const data = await dedRes.json()
-          setDeductionLog(Array.isArray(data) ? data : [])
-        } else {
-          setDeductionLog([])
-        }
-      } finally {
-        if (!cancelled) {
-          setAddLoading(false)
-          setDeductionLoading(false)
-        }
-      }
-    }
-    run()
+    fetchTokenActivity().then(() => {}, () => {})
     return () => { cancelled = true }
   }, [])
 
   const formatDate = (iso: string) => {
+    if (iso == null || String(iso).trim() === "") return "—"
     try {
       const d = new Date(iso)
+      if (Number.isNaN(d.getTime())) return "—"
       return d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
     } catch {
-      return iso
+      return "—"
     }
   }
 
   return (
     <div className="flex flex-col gap-8">
-      <div>
-        <h3 className="text-lg font-semibold text-foreground">{t("settings.tokenActivityTitle")}</h3>
-        <p className="text-xs text-muted-foreground mt-1">All token additions and deductions for your account (newest first).</p>
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <h3 className="text-lg font-semibold text-foreground">{t("settings.tokenActivityTitle")}</h3>
+          <p className="text-xs text-muted-foreground mt-1">{t("settings.tokenActivitySubtitle")}</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => fetchTokenActivity()}
+          disabled={addLoading || deductionLoading}
+          className="shrink-0 rounded-lg border border-border bg-muted/50 px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50 flex items-center gap-1.5"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${(addLoading || deductionLoading) ? "animate-spin" : ""}`} />
+          Refresh
+        </button>
       </div>
+
+      {/* Authoritative balance summary (same source as Settings) */}
+      {tokenBalance != null && (
+        <div className="flex items-center justify-between rounded-lg border border-border bg-muted/30 px-4 py-2.5 text-xs">
+          <span className="text-muted-foreground">
+            {t("settings.tokensRemainingUsed", {
+              remaining: Math.round(tokenBalance.tokens_remaining),
+              used: Math.round(tokenBalance.total_tokens_deducted),
+            })}
+          </span>
+          <span className="text-muted-foreground">
+            {t("settings.totalBudget", { total: Math.round(tokenBalance.total_tokens_added) })}
+          </span>
+        </div>
+      )}
 
       {/* Token add log */}
       <div>
@@ -1271,14 +1232,16 @@ function TokenActivityTab() {
         {addLoading ? (
           <p className="text-xs text-muted-foreground">Loading…</p>
         ) : addLog.length === 0 ? (
-          <p className="text-xs text-muted-foreground">{t("settings.noTokenAddHistory")}</p>
+          <p className="text-xs text-muted-foreground">{t("settings.noTokenAddHistoryShort")}</p>
         ) : (
           <div className="overflow-x-auto rounded-lg border border-border max-h-64">
             <table className="w-full text-xs">
               <thead className="bg-muted/50 sticky top-0">
                 <tr className="border-b border-border">
                   <th className="text-left py-2 px-3 font-medium">Date</th>
+                  <th className="text-left py-2 px-3 font-medium">Balance before</th>
                   <th className="text-left py-2 px-3 font-medium">Amount</th>
+                  <th className="text-left py-2 px-3 font-medium">Balance after</th>
                   <th className="text-left py-2 px-3 font-medium">Reason</th>
                 </tr>
               </thead>
@@ -1286,7 +1249,9 @@ function TokenActivityTab() {
                 {addLog.map((e, i) => (
                   <tr key={i} className="border-b border-border/50 hover:bg-muted/30">
                     <td className="py-2 px-3">{formatDate(e.created_at)}</td>
+                    <td className="py-2 px-3">{e.balance_before != null && Number.isFinite(e.balance_before) ? Number(e.balance_before).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}</td>
                     <td className="py-2 px-3 font-medium">+{Number(e.amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                    <td className="py-2 px-3">{e.balance_after != null && Number.isFinite(e.balance_after) ? Number(e.balance_after).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}</td>
                     <td className="py-2 px-3">{e.detail ?? tokenAddReasonLabel(e.reason)}</td>
                   </tr>
                 ))}

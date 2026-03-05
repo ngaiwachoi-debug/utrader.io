@@ -2,7 +2,10 @@
 Cache for Bitfinex-backed API responses to stay under rate limits.
 Bitfinex: 10–90 requests/min per endpoint; IP blocked 60s on ERR_RATE_LIMIT.
 
-- Per-user, per-endpoint cache with TTL.
+- Per-user, per-endpoint cache with short TTL (90s wallets, 120s lending). This is for
+  rate-limit protection only; do not use for long-lived caching of real-time data.
+- Call invalidate(user_id, KEY_*) after any server-side action that changes wallets or
+  lending for that user so the next request gets live data.
 - If Bitfinex returns rate limit, return cached data and cooldown until next allowed call.
 - Response headers indicate source (live vs cache) and when cache expires.
 """
@@ -15,6 +18,9 @@ from typing import Any, Dict, Optional, Tuple
 CACHE_TTL_WALLETS_SEC = 90   # wallets + credits: 90s
 CACHE_TTL_LENDING_SEC = 120  # funding trades + tickers: 120s
 RATE_LIMIT_COOLDOWN_SEC = 60  # when Bitfinex returns ERR_RATE_LIMIT, don't call again for 60s
+
+# Cap in-memory entries so 1000+ users don't grow unbounded (evict oldest when over limit).
+MAX_CACHE_ENTRIES = 5000
 
 _cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
 _lock = asyncio.Lock()
@@ -69,6 +75,17 @@ async def is_in_cooldown(user_id: int, endpoint: str) -> bool:
         return bool(cooldown_until and time.monotonic() < cooldown_until)
 
 
+def _evict_oldest_if_over_limit() -> None:
+    """Caller must hold _lock. Evict one oldest entry (by cached_at) when over MAX_CACHE_ENTRIES."""
+    if len(_cache) <= MAX_CACHE_ENTRIES:
+        return
+    oldest_key = min(
+        _cache.keys(),
+        key=lambda k: _cache[k].get("cached_at", 0),
+    )
+    del _cache[oldest_key]
+
+
 async def set_cached(user_id: int, endpoint: str, data: Any) -> None:
     async with _lock:
         key = _cache_key(user_id, endpoint)
@@ -77,6 +94,7 @@ async def set_cached(user_id: int, endpoint: str, data: Any) -> None:
             "cached_at": time.monotonic(),
             "cooldown_until": 0,
         }
+        _evict_oldest_if_over_limit()
 
 
 async def invalidate(user_id: int, endpoint: str) -> None:
@@ -98,6 +116,7 @@ async def set_rate_limit_cooldown(user_id: int, endpoint: str) -> None:
         if "cached_at" not in entry:
             entry["cached_at"] = 0
         _cache[key] = entry
+        _evict_oldest_if_over_limit()
 
 
 async def cache_expires_at(user_id: int, endpoint: str) -> Optional[float]:

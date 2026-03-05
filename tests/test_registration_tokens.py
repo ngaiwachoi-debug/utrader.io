@@ -60,23 +60,15 @@ def test_award_registration_tokens_creates_record_with_150_tokens():
                 pass  # table may not exist in test DB
     finally:
         if user_id is not None:
-            for _ in range(2):
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-                try:
-                    if hasattr(models, "TokenLedger"):
-                        db.query(models.TokenLedger).filter(models.TokenLedger.user_id == user_id).delete(synchronize_session=False)
-                except Exception:
-                    pass
             try:
-                db.rollback()
+                if hasattr(models, "TokenLedger"):
+                    db.query(models.TokenLedger).filter(models.TokenLedger.user_id == user_id).delete(synchronize_session=False)
+                db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete(synchronize_session=False)
+                db.query(models.User).filter(models.User.id == user_id).delete(synchronize_session=False)
+                db.commit()
             except Exception:
-                pass
-            db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()
-            db.query(models.User).filter(models.User.id == user_id).delete()
-            db.commit()
+                db.rollback()
+                raise
         db.close()
 
 
@@ -135,21 +127,14 @@ def test_award_registration_tokens_adds_150_when_record_exists():
     finally:
         if user_id is not None:
             try:
-                db.rollback()
-            except Exception:
-                pass
-            try:
                 if hasattr(models, "TokenLedger"):
                     db.query(models.TokenLedger).filter(models.TokenLedger.user_id == user_id).delete(synchronize_session=False)
+                db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete(synchronize_session=False)
+                db.query(models.User).filter(models.User.id == user_id).delete(synchronize_session=False)
+                db.commit()
             except Exception:
-                pass
-            try:
                 db.rollback()
-            except Exception:
-                pass
-            db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == user_id).delete()
-            db.query(models.User).filter(models.User.id == user_id).delete()
-            db.commit()
+                raise
         db.close()
 
 

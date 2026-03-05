@@ -4,7 +4,7 @@ import { useState, useEffect } from "react"
 import { Crown, Users, Zap, Check, Loader2, ChevronDown, ChevronUp, Coins, ArrowDownCircle } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
-import { useDeductionMultiplier } from "@/lib/dashboard-data-context"
+import { useDeductionMultiplier, useDashboardData } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
 import { calculateTotalBudget, calculateUsagePercentage } from "@/lib/calculateTokenUsage"
 
@@ -36,6 +36,8 @@ export function Subscription() {
   const t = useT()
   const userId = useCurrentUserId()
   const deductionMultiplier = useDeductionMultiplier()
+  const { getUserStatus, getWallets, getTokenBalance } = useDashboardData()
+  const id = userId ?? 0
   const [loading, setLoading] = useState<string | null>(null)
   const [planTier, setPlanTier] = useState<string>("trial")
   const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
@@ -138,6 +140,9 @@ export function Subscription() {
               setTokenBalance({ tokens_remaining: Number(bal.tokens_remaining) ?? 0, total_tokens_added: Number(bal.total_tokens_added) ?? 0, total_tokens_deducted: Number(bal.total_tokens_deducted) ?? 0 })
               setTokenBalanceError(null)
             }
+            getUserStatus(id).refetch()
+            getWallets(id).refetch()
+            getTokenBalance(id).refetch()
           }
         } else {
           alert(data.detail ?? data.message ?? "Subscription bypass failed.")
@@ -188,20 +193,39 @@ export function Subscription() {
     setDepositMessage(null)
     setLoadingTokens(true)
     try {
+      if (!bypassPayment) {
+        const res = await fetch(`${API_BASE}/api/create-checkout-session-tokens`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          credentials: "include",
+          body: JSON.stringify({ amount_usd: amount }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (res.ok && data.url) {
+          window.location.href = data.url
+          return
+        }
+        setDepositMessage({
+          type: "error",
+          text: (data.detail as string) || (data.message as string) || "Unable to start checkout. Please try again.",
+        })
+        setLoadingTokens(false)
+        return
+      }
       const res = await fetch(`${API_BASE}/api/v1/tokens/deposit`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         credentials: "include",
-        body: JSON.stringify({ usd_amount: amount, bypass_payment: bypassPayment }),
+        body: JSON.stringify({ usd_amount: amount, bypass_payment: true }),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.status === "success" && data.tokens_to_award != null) {
         setDepositMessage({
           type: "success",
-          text: bypassPayment ? `${data.tokens_to_award} tokens added.` : `${data.tokens_to_award} tokens will be added after payment`,
+          text: `${data.tokens_to_award} tokens added.`,
         })
         setAddTokensUsd("")
-        if (bypassPayment && userId != null) {
+        if (userId != null) {
           const balanceRes = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, {
             credentials: "include",
             headers: { Authorization: `Bearer ${token}` },
@@ -215,6 +239,9 @@ export function Subscription() {
             })
             setTokenBalanceError(null)
           }
+          getUserStatus(id).refetch()
+          getWallets(id).refetch()
+          getTokenBalance(id).refetch()
         }
       } else {
         setDepositMessage({

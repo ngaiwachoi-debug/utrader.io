@@ -1,16 +1,31 @@
 "use client"
 
-import { Suspense } from "react"
+import { Suspense, useEffect } from "react"
 import { signIn } from "next-auth/react"
 import { useSearchParams } from "next/navigation"
 import Link from "next/link"
 import { useT } from "@/lib/i18n"
+
+const PENDING_REFERRAL_KEY = "pending_referral_code"
 
 function LoginContent() {
   const t = useT()
   const searchParams = useSearchParams()
   const error = searchParams.get("error")
   const unauthorized = error === "AccessDenied" || error === "unauthorized_domain"
+  const ref = (searchParams.get("ref") || "").trim()
+
+  useEffect(() => {
+    if (!ref || typeof window === "undefined") return
+    localStorage.setItem(PENDING_REFERRAL_KEY, ref)
+  }, [ref])
+
+  const handleGoogleSignIn = () => {
+    if (typeof window !== "undefined" && ref) {
+      localStorage.setItem(PENDING_REFERRAL_KEY, ref)
+    }
+    void signIn("google", { callbackUrl: "/dashboard" })
+  }
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center p-4">
@@ -34,7 +49,7 @@ function LoginContent() {
 
         <button
           type="button"
-          onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+          onClick={handleGoogleSignIn}
           className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-3 text-base font-semibold text-white hover:bg-primary/90 transition-colors border-0"
         >
           <svg className="h-5 w-5" viewBox="0 0 24 24">

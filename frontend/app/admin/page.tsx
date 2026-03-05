@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useRef } from "react"
 import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
 import { useSession, signOut } from "next-auth/react"
@@ -26,6 +26,7 @@ import {
   Settings,
   UserPlus,
   Wallet,
+  FileBarChart,
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -138,6 +139,9 @@ function AdminSettingsFormInline({ settings, loading, backendToken, onSave }: { 
         const v2 = local.min_withdrawal_usdt; if (v2 !== undefined && v2 !== "") body.min_withdrawal_usdt = parseFloat(String(v2))
         const v3 = local.daily_deduction_utc_hour; if (v3 !== undefined && v3 !== "") body.daily_deduction_utc_hour = parseInt(String(v3), 10)
         const vMult = local.deduction_multiplier; if (vMult !== undefined && vMult !== "") { const n = parseFloat(String(vMult)); if (Number.isFinite(n)) body.deduction_multiplier = Math.max(0.01, Math.min(100, n)) }
+        const rL1 = local.referral_purchase_l1_pct; if (rL1 !== undefined && rL1 !== "") { const n = parseFloat(String(rL1)); if (Number.isFinite(n)) body.referral_purchase_l1_pct = Math.max(0, Math.min(100, n)) }
+        const rL2 = local.referral_purchase_l2_pct; if (rL2 !== undefined && rL2 !== "") { const n = parseFloat(String(rL2)); if (Number.isFinite(n)) body.referral_purchase_l2_pct = Math.max(0, Math.min(100, n)) }
+        const rL3 = local.referral_purchase_l3_pct; if (rL3 !== undefined && rL3 !== "") { const n = parseFloat(String(rL3)); if (Number.isFinite(n)) body.referral_purchase_l3_pct = Math.max(0, Math.min(100, n)) }
         const v4 = local.bot_auto_start; if (v4 !== undefined && v4 !== "") body.bot_auto_start = v4 === "true"
         const v5 = local.referral_system_enabled; if (v5 !== undefined && v5 !== "") body.referral_system_enabled = v5 === "true"
         const v6 = local.withdrawal_enabled; if (v6 !== undefined && v6 !== "") body.withdrawal_enabled = v6 === "true"
@@ -156,6 +160,7 @@ const SECTIONS = [
   { id: "deduction", label: "Deduction", icon: Coins },
   { id: "tokenAdd", label: "Token add log", icon: CirclePlus },
   { id: "usdtCredit", label: "USDT Credit", icon: Wallet },
+  { id: "usdtLog", label: "USDT log", icon: FileBarChart },
   { id: "withdrawals", label: "Withdrawals", icon: CreditCard },
   { id: "referrals", label: "Referrals", icon: UserPlus },
   { id: "notifications", label: "Notifications", icon: Send },
@@ -222,6 +227,9 @@ export default function AdminPage() {
   const [tokenAddUserId, setTokenAddUserId] = useState("")
   const [tokenAddStartDate, setTokenAddStartDate] = useState("")
   const [tokenAddEndDate, setTokenAddEndDate] = useState("")
+  const [usdtLogRows, setUsdtLogRows] = useState<{ id: number; user_id: number; amount: number; reason: string; created_at: string | null; admin_email: string | null }[]>([])
+  const [usdtLogLoading, setUsdtLogLoading] = useState(false)
+  const [usdtLogUserId, setUsdtLogUserId] = useState("")
 
   const handleSessionExpired = useCallback(() => {
     clearBackendTokenCache()
@@ -278,11 +286,31 @@ export default function AdminPage() {
     }
   }, [handleSessionExpired])
 
+  // Poll failures only when tab is visible to reduce server load
   useEffect(() => {
     if (!backendToken) return
     void fetchFailures(backendToken)
-    const interval = setInterval(() => fetchFailures(backendToken), 30_000)
-    return () => clearInterval(interval)
+    let intervalId: ReturnType<typeof setInterval> | null = null
+    const startPolling = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return
+      intervalId = setInterval(() => fetchFailures(backendToken), 60_000)
+    }
+    const stopPolling = () => {
+      if (intervalId) {
+        clearInterval(intervalId)
+        intervalId = null
+      }
+    }
+    startPolling()
+    const onVisibility = () => {
+      stopPolling()
+      if (document.visibilityState === "visible") startPolling()
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility)
+      stopPolling()
+    }
   }, [backendToken, fetchFailures])
 
   const fetchDeductionLogs = useCallback(async (token: string) => {
@@ -356,6 +384,38 @@ export default function AdminPage() {
   useEffect(() => {
     if (section === "tokenAdd" && backendToken) void fetchTokenAddLogs(backendToken)
   }, [section, backendToken, fetchTokenAddLogs])
+
+  const fetchUsdtLog = useCallback(
+    async (token: string) => {
+      try {
+        setUsdtLogLoading(true)
+        const params = new URLSearchParams({ limit: "200" })
+        if (usdtLogUserId.trim()) params.set("user_id", usdtLogUserId.trim())
+        const res = await fetch(`${API_BASE}/admin/usdt-history?${params}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (res.status === 401) {
+          handleSessionExpired()
+          return
+        }
+        if (!res.ok) {
+          setUsdtLogRows([])
+          return
+        }
+        const data = await res.json()
+        setUsdtLogRows(Array.isArray(data) ? data : [])
+      } catch {
+        setUsdtLogRows([])
+      } finally {
+        setUsdtLogLoading(false)
+      }
+    },
+    [handleSessionExpired, usdtLogUserId]
+  )
+
+  useEffect(() => {
+    if (section === "usdtLog" && backendToken) void fetchUsdtLog(backendToken)
+  }, [section, backendToken, fetchUsdtLog])
 
   useEffect(() => {
     if (section === "health" && backendToken) void fetchHealth(backendToken)
@@ -1015,6 +1075,9 @@ export default function AdminPage() {
               </CardHeader>
               <CardContent>
                 <p className="text-sm text-muted-foreground mb-3">Run daily token deduction now. Logs below.</p>
+                <p className="text-xs text-muted-foreground mb-3 rounded border border-border bg-muted/30 p-2">
+                  Auto deduction runs at <strong>10:30 UTC</strong> only when the backend is running. If it didn&apos;t run today (e.g. server was stopped at 10:30 UTC), click <strong>Manual trigger</strong> below to run it now.
+                </p>
                 <div className="flex flex-wrap gap-2 mb-3">
                   <span className="text-xs text-muted-foreground self-center">Filter by date:</span>
                   <Input type="date" placeholder="From" className="w-40" value={deductionStartDate} onChange={(e) => setDeductionStartDate(e.target.value)} />
@@ -1123,7 +1186,7 @@ export default function AdminPage() {
                     <p className="text-sm text-muted-foreground py-4">
                       {tokenAddError
                         ? "Failed to load token add logs. Check backend and auth."
-                        : "No token add logs yet. Logs come from the token_ledger table. Run migration add_token_ledger_and_balance_columns.sql if needed; new subscription, admin, and registration adds will then appear here."}
+                        : "No token add logs yet."}
                     </p>
                   )}
                 </div>
@@ -1175,6 +1238,70 @@ export default function AdminPage() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
+        {section === "usdtLog" && (
+          <Card>
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle>USDT log</CardTitle>
+              <Button size="sm" variant="outline" onClick={() => backendToken && fetchUsdtLog(backendToken)}>
+                <RefreshCw className="h-4 w-4 mr-1" /> Refresh
+              </Button>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground mb-3">All USDT Credit movements: referral earnings, withdrawals, admin adjustments.</p>
+              <div className="flex flex-wrap gap-2 mb-3">
+                <span className="text-xs text-muted-foreground self-center">Filter by user:</span>
+                <Input
+                  type="number"
+                  placeholder="User ID (empty = all)"
+                  className="w-40"
+                  value={usdtLogUserId}
+                  onChange={(e) => setUsdtLogUserId(e.target.value)}
+                />
+                <Button size="sm" variant="outline" onClick={() => backendToken && fetchUsdtLog(backendToken)}>
+                  Apply
+                </Button>
+              </div>
+              {usdtLogLoading ? (
+                <p className="text-sm text-muted-foreground">Loading…</p>
+              ) : (
+                <div className="overflow-x-auto max-h-96">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border">
+                        <th className="text-left py-2 px-2">ID</th>
+                        <th className="text-left py-2 px-2">User ID</th>
+                        <th className="text-right py-2 px-2">Amount</th>
+                        <th className="text-left py-2 px-2">Reason</th>
+                        <th className="text-left py-2 px-2">Created</th>
+                        <th className="text-left py-2 px-2">Admin</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {usdtLogRows.map((r) => (
+                        <tr key={r.id} className="border-b border-border/50">
+                          <td className="py-2 px-2">{r.id}</td>
+                          <td className="py-2 px-2">
+                            <Link href={`/admin/users/${r.user_id}`} className="text-primary hover:underline">
+                              {r.user_id}
+                            </Link>
+                          </td>
+                          <td className="py-2 px-2 text-right font-medium">{r.amount >= 0 ? "+" : ""}{Number(r.amount).toFixed(4)}</td>
+                          <td className="py-2 px-2">{r.reason || "—"}</td>
+                          <td className="py-2 px-2 text-muted-foreground">{r.created_at ? new Date(r.created_at).toLocaleString() : "—"}</td>
+                          <td className="py-2 px-2 text-muted-foreground text-xs">{(r.admin_email || "—").slice(0, 28)}{(r.admin_email && r.admin_email.length > 28) ? "…" : ""}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {usdtLogRows.length === 0 && !usdtLogLoading && (
+                    <p className="text-sm text-muted-foreground py-4">No USDT log entries yet.</p>
+                  )}
                 </div>
               )}
             </CardContent>
