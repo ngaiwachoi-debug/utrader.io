@@ -1,9 +1,10 @@
 "use client"
 
+import { useState, useEffect } from "react"
 import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
 import { signOut } from "next-auth/react"
-import { clearBackendTokenCache } from "@/lib/auth"
+import { clearBackendTokenCache, getBackendToken } from "@/lib/auth"
 import { Star, Search, Bell, HelpCircle, User, Globe, LogOut, Sun, Moon, AlertTriangle, Coins, Menu } from "lucide-react"
 import { useTheme } from "next-themes"
 import { useLanguage } from "@/lib/i18n"
@@ -16,9 +17,29 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useWallets, useUserStatus } from "@/lib/dashboard-data-context"
 import { InstallAppButton } from "@/components/dashboard/install-app-button"
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api-backend"
+
+type NotificationEntry = { id: number; title: string; content?: string | null; type: string; created_at: string }
+
+function relativeTime(iso: string): string {
+  try {
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return iso
+    const now = Date.now()
+    const diff = now - d.getTime()
+    if (diff < 60_000) return "Just now"
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} min ago`
+    if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h ago`
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+  } catch {
+    return iso
+  }
+}
 
 type HeaderProps = { onUpgradeClick?: () => void; onOpenMobileMenu?: () => void }
 
@@ -34,6 +55,37 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
   const { setTheme, resolvedTheme } = useTheme()
   const signedIn = status === "authenticated" && !!session?.user
   const isDark = resolvedTheme === "dark"
+
+  const [notifications, setNotifications] = useState<NotificationEntry[]>([])
+  const [notifsLoading, setNotifsLoading] = useState(true)
+
+  useEffect(() => {
+    if (userId == null) {
+      setNotifications([])
+      setNotifsLoading(false)
+      return
+    }
+    let cancelled = false
+    setNotifsLoading(true)
+    getBackendToken().then((token) => {
+      if (!token || cancelled) return
+      fetch(`${API_BASE}/api/v1/users/me/notifications?limit=5`, {
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+        .then((res) => (res.ok ? res.json() : []))
+        .then((data) => {
+          if (!cancelled) setNotifications(Array.isArray(data) ? data : [])
+        })
+        .catch(() => {
+          if (!cancelled) setNotifications([])
+        })
+        .finally(() => {
+          if (!cancelled) setNotifsLoading(false)
+        })
+    })
+    return () => { cancelled = true }
+  }, [userId])
 
   const totalUsdAll = wallets.data?.total_usd_all ?? null
   const usdOnly = wallets.data?.usd_only ?? null
@@ -107,10 +159,51 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
             <button className="hidden md:flex rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.search")}>
               <Search className="h-4 w-4" />
             </button>
-            <button className="relative hidden md:flex rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.notifications")}>
-              <Bell className="h-4 w-4" />
-              <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary" />
-            </button>
+            <Popover>
+              <PopoverTrigger asChild>
+                <button className="relative hidden md:flex rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.notifications")}>
+                  <Bell className="h-4 w-4" />
+                  {notifications.length > 0 && (
+                    <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary" />
+                  )}
+                </button>
+              </PopoverTrigger>
+              <PopoverContent className="w-80 p-0" align="end" sideOffset={8}>
+                <div className="border-b border-border px-3 py-2">
+                  <h3 className="text-sm font-semibold text-foreground">{t("header.notifications")}</h3>
+                </div>
+                <div className="max-h-64 overflow-y-auto">
+                  {notifsLoading && (
+                    <div className="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
+                      <Spinner className="h-4 w-4" />
+                      {t("notifications.loading")}
+                    </div>
+                  )}
+                  {!notifsLoading && notifications.length === 0 && (
+                    <p className="px-3 py-4 text-sm text-muted-foreground">{t("notifications.empty")}</p>
+                  )}
+                  {!notifsLoading && notifications.length > 0 && (
+                    <ul className="py-1">
+                      {notifications.map((n) => (
+                        <li key={n.id} className="border-b border-border/50 px-3 py-2 last:border-0">
+                          <p className="text-sm font-medium text-foreground line-clamp-1">{n.title}</p>
+                          <p className="text-[10px] text-muted-foreground mt-0.5">{relativeTime(n.created_at)}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div className="border-t border-border">
+                  <button
+                    type="button"
+                    onClick={() => router.push(`${pathname ?? ""}?page=settings&tab=notifications`)}
+                    className="w-full p-2 text-center text-sm font-medium text-primary hover:bg-secondary transition-colors"
+                  >
+                    {t("notifications.viewAll")}
+                  </button>
+                </div>
+              </PopoverContent>
+            </Popover>
             <button className="hidden sm:flex rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" aria-label={t("header.help")}>
               <HelpCircle className="h-4 w-4" />
             </button>

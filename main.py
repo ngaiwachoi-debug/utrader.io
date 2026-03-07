@@ -16,6 +16,7 @@ import re
 import string
 import secrets
 import threading
+import time as _time_module
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -24,8 +25,9 @@ import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -161,6 +163,72 @@ async def _get_api_failures(limit: int = 100) -> List[Dict[str, Any]]:
         copy = list(_api_failures)
     copy.reverse()
     return copy[:limit]
+
+
+# ────────── In-memory response cache ──────────
+# Per-endpoint TTL cache keyed by "endpoint:user_id". Avoids DB round-trips for
+# frequently polled GET endpoints. Invalidated on mutations (start/stop bot, token add, etc.).
+_response_cache: Dict[str, tuple] = {}  # key -> (monotonic_ts, response_data)
+_RESPONSE_CACHE_TTLS = {
+    "user-status": 30.0,
+    "bot-stats": 10.0,
+    "terminal-logs": 8.0,
+    "notifications": 60.0,
+    "dashboard-fold": 15.0,
+    "token-add-history": 30.0,
+    "deduction-history": 60.0,
+    "admin-users": 15.0,
+    "admin-settings": 60.0,
+    "admin-health": 30.0,
+    "admin-deduction-logs": 30.0,
+    "admin-token-add-logs": 30.0,
+    "admin-referrals": 30.0,
+    "admin-notifications": 60.0,
+}
+_RESPONSE_CACHE_MAX_SIZE = 5000
+
+
+def _rcache_get(key: str) -> Any:
+    """Return cached response or None if expired/missing."""
+    cached = _response_cache.get(key)
+    if cached is None:
+        return None
+    ts, data = cached
+    endpoint = key.split(":", 1)[0]
+    ttl = _RESPONSE_CACHE_TTLS.get(endpoint, 15.0)
+    if _time_module.monotonic() - ts > ttl:
+        _response_cache.pop(key, None)
+        return None
+    return data
+
+
+def _rcache_set(key: str, data: Any) -> None:
+    """Store response in cache."""
+    if len(_response_cache) > _RESPONSE_CACHE_MAX_SIZE:
+        cutoff = _time_module.monotonic() - 120
+        expired = [k for k, (ts, _) in _response_cache.items() if ts < cutoff]
+        for k in expired:
+            _response_cache.pop(k, None)
+    _response_cache[key] = (_time_module.monotonic(), data)
+
+
+def _rcache_invalidate_user(user_id: int) -> None:
+    """Invalidate all cached responses for a user (e.g. after bot start/stop, token add)."""
+    keys_to_remove = [k for k in _response_cache if k.endswith(f":{user_id}")]
+    for k in keys_to_remove:
+        _response_cache.pop(k, None)
+
+
+def _rcache_invalidate_prefix(prefix: str) -> None:
+    """Invalidate all cached responses matching a prefix (e.g. 'admin-users')."""
+    keys_to_remove = [k for k in _response_cache if k.startswith(prefix)]
+    for k in keys_to_remove:
+        _response_cache.pop(k, None)
+
+
+# ────────── Deduction multiplier cache ──────────
+_deduction_multiplier_cache: Optional[tuple] = None  # (monotonic_ts, value)
+_DEDUCTION_MULTIPLIER_TTL = 120.0  # 2 minutes
 
 
 def _get_scheduler_first_wait_sec() -> Optional[float]:
@@ -1130,6 +1198,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="bifinexbot.com API", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # NextAuth JWT (from /api/auth/token). Set NEXTAUTH_SECRET in env to enable.
 # Strip so CRLF/whitespace from .env don't break JWT verification.
@@ -1172,14 +1241,36 @@ def _redis_host_from_url(url: str) -> str:
         return "unknown"
 
 
+import asyncio
+_redis_pool_cache = None
+_redis_pool_lock = asyncio.Lock()
+
 async def get_redis():
-    """Create Redis pool from REDIS_URL (.env). Uses rediss:// with SSL for Upstash. Returns None on failure."""
-    try:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-        settings = RedisSettings.from_dsn(redis_url)
-        return await create_pool(settings)
-    except Exception:
-        return None
+    """Return a shared Redis pool (singleton). Creates the pool on first call; reuses it thereafter.
+    Includes a ping health check so stale Upstash connections are detected and recreated.
+    Returns None on failure."""
+    global _redis_pool_cache
+    if _redis_pool_cache is not None:
+        try:
+            await asyncio.wait_for(_redis_pool_cache.ping(), timeout=3)
+            return _redis_pool_cache
+        except Exception:
+            logger.warning("Redis pool health check failed; recreating pool.")
+            _redis_pool_cache = None
+
+    async with _redis_pool_lock:
+        if _redis_pool_cache is not None:
+            return _redis_pool_cache
+        try:
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+            if ".upstash.io" in redis_url and redis_url.startswith("redis://"):
+                redis_url = redis_url.replace("redis://", "rediss://", 1)
+            settings = RedisSettings.from_dsn(redis_url)
+            _redis_pool_cache = await asyncio.wait_for(create_pool(settings), timeout=REDIS_CONNECT_TIMEOUT)
+            return _redis_pool_cache
+        except Exception as e:
+            logger.error("Failed to create Redis pool: %s", e)
+            return None
 
 
 async def get_redis_or_raise():
@@ -1300,31 +1391,113 @@ def _get_or_create_user_from_google(idinfo: dict, referral_code: Optional[str], 
     return _get_or_create_user_by_email_for_session(email, referral_code, db)
 
 
+# ────────── User auth cache (bypasses DB for read-only endpoints) ──────────
+_user_auth_cache: Dict[str, tuple] = {}  # email -> (user_id, monotonic_ts)
+_user_full_cache: Dict[int, tuple] = {}  # uid -> (monotonic_ts, snapshot_dict)
+_USER_AUTH_TTL = 300.0  # 5 minutes
+_USER_FULL_CACHE_TTL = 30.0
+
+
+class _CachedUser:
+    """Lightweight read-only stand-in for models.User. Avoids DB round-trip for auth on GET requests."""
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict):
+        object.__setattr__(self, "_data", data)
+
+    def __getattr__(self, name):
+        d = object.__getattribute__(self, "_data")
+        if name in d:
+            return d[name]
+        return None
+
+    def __setattr__(self, name, value):
+        if name == "_data":
+            object.__setattr__(self, name, value)
+        else:
+            object.__getattribute__(self, "_data")[name] = value
+
+
+def _cache_user_snapshot(user: models.User):
+    """Store a serializable snapshot of user fields for fast auth bypass."""
+    try:
+        vault = getattr(user, "vault", None)
+        vault_snapshot = None
+        if vault is not None:
+            vault_snapshot = type("VaultSnapshot", (), {
+                "user_id": getattr(vault, "user_id", None),
+                "encrypted_key": getattr(vault, "encrypted_key", None),
+                "encrypted_secret": getattr(vault, "encrypted_secret", None),
+                "encrypted_gemini_key": getattr(vault, "encrypted_gemini_key", None),
+                "created_at": getattr(vault, "created_at", None),
+                "last_tested_at": getattr(vault, "last_tested_at", None),
+                "last_test_balance": getattr(vault, "last_test_balance", None),
+                "keys_updated_at": getattr(vault, "keys_updated_at", None),
+            })()
+        data = {
+            "id": user.id,
+            "email": user.email,
+            "plan_tier": user.plan_tier,
+            "lending_limit": user.lending_limit,
+            "rebalance_interval": user.rebalance_interval,
+            "pro_expiry": user.pro_expiry,
+            "referral_code": user.referral_code,
+            "referred_by": user.referred_by,
+            "usdt_withdraw_address": getattr(user, "usdt_withdraw_address", None),
+            "status": user.status,
+            "bot_status": user.bot_status,
+            "bot_desired_state": getattr(user, "bot_desired_state", None),
+            "key_deletions": getattr(user, "key_deletions", "{}"),
+            "created_at": user.created_at,
+            "vault": vault_snapshot,
+        }
+        _user_full_cache[user.id] = (_time_module.monotonic(), data)
+    except Exception as e:
+        logger.warning("[CACHE] _cache_user_snapshot failed: %s", e)
+
+
 def _get_user_by_email(email: str, db: Session) -> models.User:
     if not email or not email.endswith("@gmail.com"):
         raise HTTPException(status_code=400, detail="Only @gmail.com accounts are allowed.")
     try:
-        user = db.query(models.User).filter(models.User.email == email).first()
+        from sqlalchemy.orm import joinedload
+        user = db.query(models.User).options(joinedload(models.User.vault)).filter(models.User.email == email).first()
     except Exception as e:
         logger.exception("_get_user_by_email db query failed: %s", e)
         raise HTTPException(status_code=500, detail="Authentication service error. Please try again.")
     if not user:
         raise HTTPException(status_code=401, detail="User not registered.")
+    _user_auth_cache[email] = (user.id, _time_module.monotonic())
+    _cache_user_snapshot(user)
     return user
 
 
 async def get_current_user(
+    request: Request,
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(database.get_db),
 ) -> models.User:
     """
-    Verify Bearer token: either NextAuth JWT (from /api/auth/token) or Google ID token.
-    User is looked up by email from the token. If no valid session, return 401 with friendly message.
+    Verify Bearer token. For GET requests, returns a cached user snapshot when possible
+    to avoid DB round-trip. For POST/PUT/DELETE, always loads from DB.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
     email = _extract_email_from_bearer_token(authorization)
+    is_read_only = request.method in ("GET", "HEAD", "OPTIONS")
+
+    if is_read_only:
+        cached_entry = _user_auth_cache.get(email)
+        if cached_entry:
+            uid, ts = cached_entry
+            if _time_module.monotonic() - ts < _USER_AUTH_TTL:
+                full_cached = _user_full_cache.get(uid)
+                if full_cached:
+                    fts, data = full_cached
+                    if _time_module.monotonic() - fts < _USER_FULL_CACHE_TTL:
+                        return _CachedUser(data)
+
     return _get_user_by_email(email, db)
 
 
@@ -1719,6 +1892,15 @@ class MyDeductionLogEntry(BaseModel):
     account_switch_note: Optional[str] = None
 
 
+class NotificationResponse(BaseModel):
+    """GET /api/v1/users/me/notifications: user-facing notification (admin sent)."""
+    id: int
+    title: str
+    content: Optional[str] = None
+    type: str  # info | warning | announcement
+    created_at: str  # ISO 8601
+
+
 class ApiFailureOut(BaseModel):
     id: str
     ts: str
@@ -1861,6 +2043,7 @@ class AdminSettingsUpdateBody(BaseModel):
     referral_system_enabled: Optional[bool] = None
     withdrawal_enabled: Optional[bool] = None
     maintenance_mode: Optional[bool] = None
+    api_keys_help_url: Optional[str] = None
 
 
 class UserOverviewOut(BaseModel):
@@ -1917,6 +2100,8 @@ async def _get_bot_stats_data(user_id: int, db: Session) -> dict:
     redis = await get_redis()
     user = db.query(models.User).filter(models.User.id == user_id).first()
     bot_status = getattr(user, "bot_status", None) if user else None
+    vault = getattr(user, "vault", None) if user else None
+    has_api_keys = bool(vault and getattr(vault, "encrypted_key", None))
 
     if redis is None:
         return {
@@ -1924,13 +2109,20 @@ async def _get_bot_stats_data(user_id: int, db: Session) -> dict:
             "engines": [],
             "total_loaned": "0.00",
             "bot_status": bot_status or "stopped",
+            "has_api_keys": has_api_keys,
         }
     keys = await redis.keys(f"status:{user_id}:*")
     all_engines = []
-    for key in keys:
-        raw_data = await redis.get(key)
-        if raw_data:
-            all_engines.append(json.loads(raw_data))
+    if keys:
+        raw_data_list = await redis.mget(keys)
+        for raw_data in raw_data_list:
+            if raw_data:
+                if isinstance(raw_data, bytes):
+                    raw_data = raw_data.decode("utf-8")
+                try:
+                    all_engines.append(json.loads(raw_data))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
     active = bot_status in ("running", "starting")
     if not all_engines:
         return {
@@ -1938,6 +2130,7 @@ async def _get_bot_stats_data(user_id: int, db: Session) -> dict:
             "engines": [],
             "total_loaned": "0.00",
             "bot_status": bot_status or "stopped",
+            "has_api_keys": has_api_keys,
         }
     total_val = sum(float(str(e.get("loaned", 0)).replace(",", "") or 0) for e in all_engines)
     return {
@@ -1945,6 +2138,7 @@ async def _get_bot_stats_data(user_id: int, db: Session) -> dict:
         "engines": all_engines,
         "total_loaned": f"{total_val:,.2f}",
         "bot_status": bot_status or "running",
+        "has_api_keys": has_api_keys,
     }
 
 
@@ -1957,7 +2151,28 @@ async def get_all_bot_stats(
     """Fetches live heartbeat data from Redis. Caller must be the same user. Includes bot_status from DB."""
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
-    return await _get_bot_stats_data(user_id, db)
+
+    cache_key = f"bot-stats:{user_id}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        result = await _get_bot_stats_data(user_id, db)
+        _rcache_set(cache_key, result)
+        return result
+    except Exception as e:
+        logger.warning("bot-stats user_id=%s error=%s", user_id, e)
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        bot_status = getattr(user, "bot_status", None) if user else None
+        vault = getattr(user, "vault", None) if user else None
+        return {
+            "active": bot_status in ("running", "starting"),
+            "engines": [],
+            "total_loaned": "0.00",
+            "bot_status": bot_status or "stopped",
+            "has_api_keys": bool(vault and getattr(vault, "encrypted_key", None)),
+        }
 
 
 # --- Whales terminal: cached logs + summary; user end: auth required, own data only ---
@@ -1970,12 +2185,20 @@ async def get_terminal_logs(
     user_id: int,
     current_user: models.User = Depends(get_current_user),
 ):
-    """Returns last 300 terminal log lines and optional summary (strategy, regime, idle, next rebalance). Caller must be the same user."""
+    """Returns last 300 terminal log lines and optional summary. Uses response cache."""
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
+
+    cache_key = f"terminal-logs:{user_id}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
     except (asyncio.TimeoutError, Exception):
+        return {"lines": [], "summary": None}
+    if redis is None:
         return {"lines": [], "summary": None}
     lines_decoded: list = []
     summary_obj: dict | None = None
@@ -1994,7 +2217,9 @@ async def get_terminal_logs(
             summary_obj = json.loads(raw)
     except Exception:
         summary_obj = None
-    return {"lines": lines_decoded, "summary": summary_obj}
+    result = {"lines": lines_decoded, "summary": summary_obj}
+    _rcache_set(cache_key, result)
+    return result
 
 
 def _detail_invalid_keys(msg: str) -> str:
@@ -2050,11 +2275,21 @@ async def connect_exchange(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
+    """
+    Validate and save Bitfinex API keys. First-time insert allowed anytime.
+    Overwrite blocked 09:55–10:35 UTC (daily fee calculation window).
+    """
     vault_existing = (
         db.query(models.APIVault)
         .filter(models.APIVault.user_id == current_user.id)
         .first()
     )
+    if vault_existing and vault_existing.encrypted_key and _is_api_key_lock_window():
+        logger.info("API key lock: POST /connect-exchange (overwrite) blocked for user_id=%s", current_user.id)
+        raise HTTPException(
+            status_code=403,
+            detail="API key modification disabled during daily fee processing (09:55–10:35 UTC).",
+        )
     balance, result = await _validate_and_save_bitfinex_keys(
         payload, current_user, db
     )
@@ -2074,6 +2309,18 @@ async def api_version(response: Response):
     """No-auth endpoint to verify which backend is running (gross-profit DB fallback support)."""
     response.headers["Cache-Control"] = "public, max-age=60"
     return {"version": "gross-profit-db-fallback", "source_db_supported": True}
+
+
+@app.get("/api/public/api-keys-help-url")
+def get_api_keys_help_url(
+    db: Session = Depends(database.get_db),
+    response: Response = None,
+):
+    """Public endpoint to get the API keys help URL from admin settings."""
+    if response is not None:
+        response.headers["Cache-Control"] = "public, max-age=300"
+    url = _get_setting(db, "api_keys_help_url", "#")
+    return {"url": url}
 
 
 @app.get("/api/ranking", response_model=RankingResponse)
@@ -2217,6 +2464,7 @@ async def get_api_keys_status(
 
 
 async def _get_current_user_for_token_balance(
+    request: Request,
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(database.get_db),
 ) -> models.User:
@@ -2227,7 +2475,7 @@ async def _get_current_user_for_token_balance(
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        return await get_current_user(authorization=authorization, db=db)
+        return await get_current_user(request=request, authorization=authorization, db=db)
     except HTTPException as e:
         if e.status_code == 401:
             raise HTTPException(status_code=401, detail="Not authenticated")
@@ -2297,47 +2545,35 @@ async def get_my_token_add_history(
     current_user: models.User = Depends(_get_current_user_for_token_balance),
     db: Session = Depends(database.get_db),
 ):
-    """Token add history for the current user (newest first). Uses raw SQL for reliability."""
+    """Token add history for the current user (newest first). Uses response cache + optimised single query."""
+    uid = current_user.id
+    cache_key = f"token-add-history:{uid}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     out: List[TokenAddHistoryEntry] = []
     try:
-        r = db.execute(
-            text("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'token_ledger'")
-        ).fetchone()
-        if not r:
-            return []
-        # Build balance-after by id: all ledger rows for user in chronological order
-        ledger_rows = db.execute(
-            text("""
-                SELECT id, activity_type, amount, created_at
-                FROM token_ledger
-                WHERE user_id = :uid
-                ORDER BY created_at ASC, id ASC
-            """),
-            {"uid": current_user.id},
-        ).fetchall()
-        balance_by_id: Dict[int, tuple] = {}
-        running = 0.0
-        for lr in ledger_rows:
-            lid, atype, amt, _ = lr[0], (lr[1] or "").strip(), float(lr[2] or 0), lr[3]
-            bal_before = running
-            if atype == "add":
-                running += amt
-            else:
-                running -= amt
-            balance_by_id[lid] = (bal_before, running)
-        # Add rows (newest first)
         rows = db.execute(
             text("""
-                SELECT id, amount, reason, created_at, metadata
-                FROM token_ledger
-                WHERE user_id = :uid AND activity_type = 'add'
-                ORDER BY created_at DESC, id DESC
+                WITH adds AS (
+                    SELECT id, amount, reason, created_at, metadata,
+                           SUM(amount) OVER (ORDER BY created_at ASC, id ASC) AS running_after
+                    FROM token_ledger
+                    WHERE user_id = :uid AND activity_type = 'add'
+                ),
+                bal AS (
+                    SELECT tokens_remaining FROM user_token_balance WHERE user_id = :uid
+                )
+                SELECT a.id, a.amount, a.reason, a.created_at, a.metadata,
+                       a.running_after, b.tokens_remaining
+                FROM adds a LEFT JOIN bal b ON TRUE
+                ORDER BY a.created_at DESC, a.id DESC
                 LIMIT :lim
             """),
-            {"uid": current_user.id, "lim": limit},
+            {"uid": uid, "lim": limit},
         ).fetchall()
         for row in rows:
-            row_id = row[0]
             amount_val = float(row[1] or 0)
             reason_val = (row[2] or "").strip()
             created_at_val = row[3]
@@ -2351,7 +2587,9 @@ async def get_my_token_add_history(
             else:
                 created_str = "1970-01-01T00:00:00Z"
             detail_str = _token_add_detail(reason_val, extra_val)
-            bal_before, bal_after = balance_by_id.get(row_id, (None, None))
+            running_after = float(row[5]) if row[5] is not None else None
+            bal_before = round(running_after - amount_val, 2) if running_after is not None else None
+            bal_after = round(running_after, 2) if running_after is not None else None
             out.append(
                 TokenAddHistoryEntry(
                     amount=amount_val,
@@ -2362,28 +2600,21 @@ async def get_my_token_add_history(
                     balance_after=bal_after,
                 )
             )
-        # Align first (newest) row with authoritative balance from user_token_balance
-        if out:
-            try:
-                rem_row = db.execute(
-                    text("SELECT tokens_remaining FROM user_token_balance WHERE user_id = :uid"),
-                    {"uid": current_user.id},
-                ).fetchone()
-                if rem_row is not None and rem_row[0] is not None:
-                    tokens_remaining = round(float(rem_row[0]), 2)
-                    first = out[0]
-                    out[0] = TokenAddHistoryEntry(
-                        amount=first.amount,
-                        reason=first.reason,
-                        created_at=first.created_at,
-                        detail=first.detail,
-                        balance_before=round(tokens_remaining - first.amount, 2),
-                        balance_after=tokens_remaining,
-                    )
-            except Exception:
-                pass
+        if out and rows and rows[0][6] is not None:
+            tokens_remaining = round(float(rows[0][6]), 2)
+            first = out[0]
+            out[0] = TokenAddHistoryEntry(
+                amount=first.amount,
+                reason=first.reason,
+                created_at=first.created_at,
+                detail=first.detail,
+                balance_before=round(tokens_remaining - first.amount, 2),
+                balance_after=tokens_remaining,
+            )
     except Exception as e:
-        logger.warning("get_my_token_add_history user_id=%s error=%s", current_user.id, e)
+        logger.warning("get_my_token_add_history user_id=%s error=%s", uid, e)
+
+    _rcache_set(cache_key, out)
     return out
 
 
@@ -2393,18 +2624,23 @@ async def get_my_deduction_history(
     current_user: models.User = Depends(_get_current_user_for_token_balance),
     db: Session = Depends(database.get_db),
 ):
-    """Deduction log for the current user (newest first). From deduction_log table."""
+    """Deduction log for the current user (newest first). Uses response cache."""
+    uid = current_user.id
+    cache_key = f"deduction-history:{uid}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     if not hasattr(models, "DeductionLog"):
         return []
     rows = (
         db.query(models.DeductionLog)
-        .filter(models.DeductionLog.user_id == current_user.id)
+        .filter(models.DeductionLog.user_id == uid)
         .order_by(models.DeductionLog.timestamp_utc.desc())
         .limit(limit)
         .all()
     )
     def _ts_str(row: "models.DeductionLog") -> str:
-        """Never return empty timestamp: use timestamp_utc, else created_at, else sentinel."""
         if row.timestamp_utc:
             ts = row.timestamp_utc
             return ts.isoformat() if getattr(ts, "tzinfo", None) else ts.isoformat() + "Z"
@@ -2413,7 +2649,7 @@ async def get_my_deduction_history(
             return created.isoformat() if getattr(created, "tzinfo", None) else created.isoformat() + "Z"
         return "1970-01-01T00:00:00Z"
 
-    return [
+    result = [
         MyDeductionLogEntry(
             gross_profit=float(r.daily_gross_profit_usd or 0),
             tokens_deducted=float(r.tokens_deducted or 0),
@@ -2425,6 +2661,54 @@ async def get_my_deduction_history(
         )
         for r in rows
     ]
+    _rcache_set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/users/me/notifications", response_model=List[NotificationResponse])
+async def get_my_notifications(
+    limit: int = Query(50, ge=1, le=100),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
+):
+    """Notifications for the current user. Uses response cache (60s TTL)."""
+    uid = current_user.id
+    cache_key = f"notifications:{uid}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows = (
+        db.query(models.AdminNotification)
+        .filter(
+            or_(
+                models.AdminNotification.target_user_id.is_(None),
+                models.AdminNotification.target_user_id == uid,
+            )
+        )
+        .order_by(models.AdminNotification.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    def _created_str(row: "models.AdminNotification") -> str:
+        created = getattr(row, "created_at", None)
+        if not created:
+            return "1970-01-01T00:00:00Z"
+        return created.isoformat() + "Z" if getattr(created, "tzinfo", None) is None else created.isoformat()
+
+    result = [
+        NotificationResponse(
+            id=r.id,
+            title=r.title or "",
+            content=getattr(r, "content", None),
+            type=getattr(r, "type", None) or "info",
+            created_at=_created_str(r),
+        )
+        for r in rows
+    ]
+    _rcache_set(cache_key, result)
+    return result
 
 
 @app.post("/api/keys/test")
@@ -3011,20 +3295,31 @@ async def _clear_arq_job_keys(redis, job_id: str) -> None:
     """Remove ARQ keys for job_id so the same id can be enqueued again (idempotent start after stop).
     Must also remove job_id from the abort sorted set (arq:abort), otherwise the worker sees it as aborted and logs 'aborted before start'."""
     try:
-        await redis.delete(ARQ_JOB_PREFIX + job_id)
-        await redis.delete(ARQ_RESULT_PREFIX + job_id)
-        await redis.zrem(ARQ_QUEUE_NAME, job_id)
-        await redis.zrem(ARQ_ABORT_SS, job_id)
+        await redis.delete(ARQ_JOB_PREFIX + job_id, ARQ_RESULT_PREFIX + job_id)
+        # Using gather to execute zrem in parallel to save round-trip latency to Upstash
+        await asyncio.gather(
+            redis.zrem(ARQ_QUEUE_NAME, job_id),
+            redis.zrem(ARQ_ABORT_SS, job_id),
+            return_exceptions=True
+        )
     except Exception:
         pass
 
 
 async def _enqueue_bot_task(redis, user_id: int) -> bool:
     """Enqueue run_bot_task for user_id. Returns True if enqueued, False if already running/queued.
-    Fixed: Clear ARQ keys before enqueue so re-enqueue after stop always works (ARQ blocks same job_id until result key is gone).
+    Checks the per-user Redis run lock first to prevent enqueue while a previous run is still active.
     """
     job_id = f"bot_user_{user_id}"
-    await _clear_arq_job_keys(redis, job_id)  # Clear before enqueue to avoid "duplicate job_id" when re-starting after stop
+    lock_key = f"bot_run_lock:{user_id}"
+    try:
+        existing_lock = await redis.get(lock_key)
+        if existing_lock is not None:
+            logger.info("_enqueue_bot_task user_id=%s skipped: run lock held (another instance active)", user_id)
+            return False
+    except Exception:
+        pass
+    await _clear_arq_job_keys(redis, job_id)
     job = await redis.enqueue_job("run_bot_task", user_id, _job_id=job_id)
     if job is not None:
         return True
@@ -3040,7 +3335,6 @@ async def start_bot(
 ):
     await _bot_action_rate_limit(current_user.id)
     await _check_start_cooldown(current_user.id)
-    await _record_start_success(current_user.id)  # record so next start is cooldown-limited
     # Plan C: set desired state first
     if hasattr(current_user, "bot_desired_state"):
         current_user.bot_desired_state = "running"
@@ -3064,6 +3358,7 @@ async def start_bot(
     if status_before in ("running", "starting") and desired == "running":
         return {"status": "success", "message": "Bot already running or queued.", "bot_status": status_before}
     redis = await get_redis_or_raise()
+    await _record_start_success(current_user.id)  # record so next start is cooldown-limited
     enqueued = await _enqueue_bot_task(redis, current_user.id)
     if enqueued:
         try:
@@ -3080,6 +3375,7 @@ async def start_bot(
         db.commit()
     except Exception:
         db.rollback()
+    _rcache_invalidate_user(current_user.id)
     logger.info("start_bot user_id=%s action=start enqueued=False (already running/queued) bot_status=%s", current_user.id, getattr(current_user, "bot_status", None))
     return {"status": "success", "message": "Bot already running or queued.", "bot_status": getattr(current_user, "bot_status", None) or "running"}
 
@@ -3093,7 +3389,6 @@ async def stop_bot(
     logger.info("stop_bot ENTRY user_id=%s", user_id)
     await _bot_action_rate_limit(user_id)
     await _check_stop_cooldown(user_id)
-    await _record_stop_success(user_id)  # record so next stop is cooldown-limited
     from arq.jobs import Job
     status_before = getattr(current_user, "bot_status", None) or "stopped"
     logger.info("stop_bot user_id=%s status_before=%s updating DB", user_id, status_before)
@@ -3119,29 +3414,38 @@ async def stop_bot(
     job_id = f"bot_user_{user_id}"
     try:
         redis = await get_redis_or_raise()
+        await _record_stop_success(user_id)  # record so next stop is cooldown-limited
         logger.info("stop_bot user_id=%s job_id=%s calling job.abort(timeout=5)", user_id, job_id)
         job = Job(job_id=job_id, redis=redis)
         aborted = await job.abort(timeout=5)
         logger.info("stop_bot user_id=%s job.abort() returned aborted=%s", user_id, aborted)
         await _clear_arq_job_keys(redis, job_id)
-        logger.info("stop_bot user_id=%s ARQ keys cleared", user_id)
+        # Release the per-user run lock so a fresh start can proceed immediately
+        try:
+            await redis.delete(f"bot_run_lock:{user_id}")
+        except Exception:
+            pass
+        logger.info("stop_bot user_id=%s ARQ keys + run lock cleared", user_id)
     except asyncio.TimeoutError:
         _write_stop_bot_debug(user_id, status_before, False, "job.abort() timed out (5s)")
         try:
             redis = await get_redis_or_raise()
             await _clear_arq_job_keys(redis, job_id)
+            await redis.delete(f"bot_run_lock:{user_id}")
         except Exception as e2:
             logger.exception("stop_bot user_id=%s clear keys after timeout failed: %s", user_id, e2)
-        logger.warning("stop_bot user_id=%s abort timed out (5s), cleared keys", user_id)
+        logger.warning("stop_bot user_id=%s abort timed out (5s), cleared keys+lock", user_id)
     except Exception as e:
         logger.exception("stop_bot user_id=%s Redis/job.abort failed: %s", user_id, e)
         _write_stop_bot_debug(user_id, status_before, False, str(e))
         try:
             redis = await get_redis_or_raise()
             await _clear_arq_job_keys(redis, job_id)
-            logger.info("stop_bot user_id=%s ARQ keys cleared after exception", user_id)
+            await redis.delete(f"bot_run_lock:{user_id}")
+            logger.info("stop_bot user_id=%s ARQ keys + run lock cleared after exception", user_id)
         except Exception as e2:
             logger.exception("stop_bot user_id=%s clear_arq_job_keys failed: %s", user_id, e2)
+    _rcache_invalidate_user(user_id)
     logger.info("stop_bot EXIT user_id=%s aborted=%s bot_status_before=%s bot_status_after=stopped", user_id, aborted, status_before)
     _write_stop_bot_debug(user_id, status_before, aborted, None)
     return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
@@ -3231,17 +3535,23 @@ async def stop_bot_for_user(
         job = Job(job_id=job_id, redis=redis)
         aborted = await job.abort(timeout=5)
         await _clear_arq_job_keys(redis, job_id)
+        try:
+            await redis.delete(f"bot_run_lock:{user_id}")
+        except Exception:
+            pass
     except asyncio.TimeoutError:
         try:
             redis = await get_redis_or_raise()
             await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+            await redis.delete(f"bot_run_lock:{user_id}")
         except Exception:
             pass
-        logger.warning("stop_bot_for_user user_id=%s abort timed out (5s), cleared keys", user_id)
+        logger.warning("stop_bot_for_user user_id=%s abort timed out (5s), cleared keys+lock", user_id)
     except Exception:
         try:
             redis = await get_redis_or_raise()
             await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+            await redis.delete(f"bot_run_lock:{user_id}")
         except Exception:
             pass
     logger.info("stop_bot_for_user user_id=%s aborted=%s bot_status_before=%s bot_status_after=stopped", user_id, aborted, status_before)
@@ -3302,8 +3612,11 @@ def get_stats(
     user_id: int,
     start: Optional[datetime] = Query(None),
     end: Optional[datetime] = Query(None),
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
     """
     Returns Choice A style stats:
     - Gross Profit
@@ -3334,8 +3647,11 @@ def get_stats_history(
     user_id: int,
     start: Optional[datetime] = Query(None),
     end: Optional[datetime] = Query(None),
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
 ):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
     """
     Returns time-series for Gross Profit / True ROI charts from performance_logs (and trial/funding data).
     When tables are empty, returns [] so the frontend can show "No data yet".
@@ -4187,9 +4503,12 @@ async def _get_lending_stats_data(
 async def get_lending_stats(
     user_id: int,
     response: Response,
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db),
     source: Optional[str] = Query(None, description="If 'db', return persisted snapshot only (bypass cache)."),
 ):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
     """
     Gross profit = sum of interest from Bitfinex funding trades between registration date and latest.
     Net = Gross × (1 - 15%). Cached to respect Bitfinex rate limits.
@@ -4345,7 +4664,9 @@ async def cron_refresh_lending_stats(
 
 
 @app.get("/user-token-balance/{user_id}", response_model=TokenBalanceResponse)
-def get_user_token_balance(user_id: int, db: Session = Depends(database.get_db)):
+def get_user_token_balance(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(database.get_db)):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this user.")
     """
     Token balance: remaining = total_tokens_added - total_tokens_deducted (no Bitfinex call).
     """
@@ -4583,8 +4904,16 @@ def get_user_status(
     """
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
+
+    cache_key = f"user-status:{user_id}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        return _get_user_status_data(user_id, db)
+        result = _get_user_status_data(user_id, db)
+        _rcache_set(cache_key, result)
+        return result
     except HTTPException:
         raise
     except (ProgrammingError, SQLAlchemyError) as e:
@@ -4600,10 +4929,15 @@ def list_users(
     _: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
+    cache_key = "admin-users:all"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     users = db.query(models.User).all()
     balance_rows = db.query(models.UserTokenBalance).all()
     balances = {b.user_id: float(b.tokens_remaining or 0) for b in balance_rows}
-    return [
+    result = [
         AdminUserOut(
             id=u.id,
             email=u.email,
@@ -4617,6 +4951,8 @@ def list_users(
         )
         for u in users
     ]
+    _rcache_set(cache_key, result)
+    return result
 
 
 @app.patch("/admin/users/{user_id}", response_model=AdminUserOut)
@@ -4701,6 +5037,7 @@ def admin_add_tokens(
     db.commit()
     logger.info("admin_token_add db_amended user_id=%s amount_added=%s tokens_remaining_after=%s", user_id, payload.amount, new_remaining)
     _admin_audit(admin_user.email or "", "admin_token_add", {"user_id": user_id, "amount": payload.amount})
+    _rcache_invalidate_user(user_id)
     return AdminTokenAdjustResponse(tokens_remaining=new_remaining)
 
 
@@ -4726,6 +5063,7 @@ def admin_deduct_tokens(
     db.commit()
     logger.info("admin_token_deduct db_amended user_id=%s amount_deducted=%s tokens_remaining_after=%s", user_id, payload.amount, new_remaining)
     _admin_audit(admin_user.email or "", "admin_token_deduct", {"user_id": user_id, "amount": payload.amount})
+    _rcache_invalidate_user(user_id)
     return AdminTokenAdjustResponse(tokens_remaining=new_remaining)
 
 
@@ -4869,17 +5207,23 @@ async def admin_bot_stop(
         job = Job(job_id=job_id, redis=redis)
         aborted = await job.abort(timeout=5)
         await _clear_arq_job_keys(redis, job_id)
+        try:
+            await redis.delete(f"bot_run_lock:{user_id}")
+        except Exception:
+            pass
     except asyncio.TimeoutError:
         try:
             redis = await get_redis_or_raise()
             await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+            await redis.delete(f"bot_run_lock:{user_id}")
         except Exception:
             pass
-        logger.warning("admin_bot_stop user_id=%s abort timed out (5s), cleared keys", user_id)
+        logger.warning("admin_bot_stop user_id=%s abort timed out (5s), cleared keys+lock", user_id)
     except Exception:
         try:
             redis = await get_redis_or_raise()
             await _clear_arq_job_keys(redis, f"bot_user_{user_id}")
+            await redis.delete(f"bot_run_lock:{user_id}")
         except Exception:
             pass
     _admin_audit(admin_user.email or "", "bot_stop", {"user_id": user_id})
@@ -4895,6 +5239,8 @@ async def admin_bot_logs(
     try:
         redis = await asyncio.wait_for(get_redis(), timeout=REDIS_CONNECT_TIMEOUT)
     except (asyncio.TimeoutError, Exception):
+        return {"lines": []}
+    if redis is None:
         return {"lines": []}
     try:
         key = f"terminal_logs:{user_id}"
@@ -4928,7 +5274,11 @@ def admin_deduction_logs(
     _: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
-    """Recent deduction log entries (newest first). Persisted in deduction_log; optional start_date/end_date filter."""
+    """Recent deduction log entries (newest first). Cached 30s."""
+    cache_key = f"admin-deduction-logs:{limit}:{start_date}:{end_date}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         q = db.query(models.DeductionLog).order_by(models.DeductionLog.timestamp_utc.desc())
         if start_date:
@@ -4945,7 +5295,7 @@ def admin_deduction_logs(
                 return c.isoformat() if getattr(c, "tzinfo", None) else c.isoformat() + "Z"
             return "1970-01-01T00:00:00Z"
 
-        return [
+        result = [
             DeductionLogEntry(
                 user_id=r.user_id,
                 email=r.email,
@@ -4959,6 +5309,8 @@ def admin_deduction_logs(
             )
             for r in rows
         ]
+        _rcache_set(cache_key, result)
+        return result
     except Exception:
         with _deduction_logs_lock:
             copy = list(_deduction_logs)
@@ -4968,7 +5320,7 @@ def admin_deduction_logs(
         if end_date:
             copy = [e for e in copy if (e.get("timestamp") or "")[:10] <= end_date]
         out = copy[:limit]
-        return [
+        result = [
             DeductionLogEntry(
                 user_id=e["user_id"],
                 email=e.get("email"),
@@ -4982,6 +5334,8 @@ def admin_deduction_logs(
             )
             for e in out
         ]
+        _rcache_set(cache_key, result)
+        return result
 
 
 @app.get("/admin/token-add/logs", response_model=List[TokenAddLogEntry])
@@ -4993,14 +5347,14 @@ def admin_token_add_logs(
     _: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
-    """Recent token add log entries (newest first) from token_ledger where activity_type='add'. Uses raw SQL for reliability."""
+    """Recent token add log entries (newest first). Cached 30s for default queries."""
+    cache_key = f"admin-token-add-logs:{limit}:{user_id}:{start_date}:{end_date}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     out: List[TokenAddLogEntry] = []
     try:
-        r = db.execute(
-            text("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'token_ledger'")
-        ).fetchone()
-        if not r:
-            return []
         sql = """
             SELECT tl.id, tl.user_id, u.email, tl.amount, tl.reason, tl.created_at, tl.metadata
             FROM token_ledger tl
@@ -5021,8 +5375,8 @@ def admin_token_add_logs(
         rows = db.execute(text(sql), params).fetchall()
         for row in rows:
             row_id = row[0]
-            uid = row[1]
-            email = row[2] if len(row) > 2 else None
+            uid_val = row[1]
+            email_val = row[2] if len(row) > 2 else None
             amount_val = float(row[3] or 0)
             reason_val = (row[4] or "").strip()
             created_at_val = row[5]
@@ -5034,8 +5388,8 @@ def admin_token_add_logs(
             out.append(
                 TokenAddLogEntry(
                     id=row_id,
-                    user_id=uid,
-                    email=(email.strip() if isinstance(email, str) else None),
+                    user_id=uid_val,
+                    email=(email_val.strip() if isinstance(email_val, str) else None),
                     amount=amount_val,
                     reason=reason_val,
                     created_at=created_str,
@@ -5044,6 +5398,7 @@ def admin_token_add_logs(
             )
     except Exception as e:
         logger.warning("admin_token_add_logs error=%s", e)
+    _rcache_set(cache_key, out)
     return out
 
 
@@ -6086,22 +6441,28 @@ def admin_list_referrals(
     _: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
+    cache_key = "admin-referrals:all"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     users = db.query(models.User).all()
-    uc_map = {uc.user_id: float(uc.total_earned or 0) for uc in db.query(models.UserUsdtCredit).all()}
-    ref_earnings = {}  # placeholder: no separate referral_earnings column; use 0 or usdt from referrals
+    user_map = {u.id: u for u in users}
+    from collections import Counter
+    downline_counts = Counter(u.referred_by for u in users if u.referred_by is not None)
     out = []
     for u in users:
-        referrer = db.query(models.User).filter(models.User.id == u.referred_by).first() if u.referred_by else None
-        downline = db.query(models.User).filter(models.User.referred_by == u.id).count()
+        referrer = user_map.get(u.referred_by) if u.referred_by else None
         out.append(ReferralRow(
             user_id=u.id,
             email=u.email or "",
             referral_code=u.referral_code,
             referrer_id=u.referred_by,
             referrer_email=referrer.email if referrer else None,
-            downline_count=downline,
-            referral_earnings=ref_earnings.get(u.id, 0.0),
+            downline_count=downline_counts.get(u.id, 0),
+            referral_earnings=0.0,
         ))
+    _rcache_set(cache_key, out)
     return out
 
 
@@ -6153,11 +6514,18 @@ def admin_list_notifications(
     _: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
+    cache_key = f"admin-notifications:{limit}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     rows = db.query(models.AdminNotification).order_by(models.AdminNotification.created_at.desc()).limit(limit).all()
-    return [
+    result = [
         {"id": r.id, "title": r.title, "content": r.content, "type": r.type, "target_user_id": r.target_user_id, "created_at": r.created_at.isoformat() + "Z" if r.created_at else None}
         for r in rows
     ]
+    _rcache_set(cache_key, result)
+    return result
 
 
 # --- Admin: Settings ---
@@ -6167,13 +6535,20 @@ def _get_setting(db: Session, key: str, default: str) -> str:
 
 
 def _get_deduction_multiplier(db: Session) -> float:
-    """Read deduction_multiplier from admin_settings; default 1.0. Clamp to [0.01, 100]."""
+    """Read deduction_multiplier from admin_settings; default 1.0. Clamp to [0.01, 100]. Cached for 2 min."""
+    global _deduction_multiplier_cache
+    if _deduction_multiplier_cache is not None:
+        ts, val = _deduction_multiplier_cache
+        if _time_module.monotonic() - ts < _DEDUCTION_MULTIPLIER_TTL:
+            return val
     raw = _get_setting(db, "deduction_multiplier", "1")
     try:
         v = float(raw)
-        return max(0.01, min(100.0, v))
+        result = max(0.01, min(100.0, v))
     except (ValueError, TypeError):
-        return 1.0
+        result = 1.0
+    _deduction_multiplier_cache = (_time_module.monotonic(), result)
+    return result
 
 
 def _get_referral_purchase_pct(db: Session) -> tuple[float, float, float]:
@@ -6192,22 +6567,28 @@ def admin_get_settings(
     _: models.User = Depends(get_admin_user),
     db: Session = Depends(database.get_db),
 ):
+    cache_key = "admin-settings:all"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     keys = [
         "registration_bonus_tokens", "min_withdrawal_usdt", "daily_deduction_utc_hour",
         "deduction_multiplier",
         "referral_purchase_l1_pct", "referral_purchase_l2_pct", "referral_purchase_l3_pct",
         "bot_auto_start", "referral_system_enabled", "withdrawal_enabled", "maintenance_mode",
+        "api_keys_help_url",
     ]
-    out = []
     defaults = {
         "registration_bonus_tokens": "150", "min_withdrawal_usdt": "10", "daily_deduction_utc_hour": "10",
         "deduction_multiplier": "1",
         "referral_purchase_l1_pct": "10", "referral_purchase_l2_pct": "5", "referral_purchase_l3_pct": "2",
         "bot_auto_start": "true", "referral_system_enabled": "true", "withdrawal_enabled": "true", "maintenance_mode": "false",
+        "api_keys_help_url": "#",
     }
-    for k in keys:
-        out.append(AdminSettingOut(key=k, value=_get_setting(db, k, defaults.get(k, ""))))
-    return out
+    result = [AdminSettingOut(key=k, value=_get_setting(db, k, defaults.get(k, ""))) for k in keys]
+    _rcache_set(cache_key, result)
+    return result
 
 
 @app.post("/admin/settings/update")
@@ -6243,6 +6624,8 @@ def admin_update_settings(
         updates.append(("withdrawal_enabled", "true" if body.withdrawal_enabled else "false"))
     if body.maintenance_mode is not None:
         updates.append(("maintenance_mode", "true" if body.maintenance_mode else "false"))
+    if body.api_keys_help_url is not None:
+        updates.append(("api_keys_help_url", str(body.api_keys_help_url).strip()))
     for k, v in updates:
         row = db.query(models.AdminSetting).filter(models.AdminSetting.key == k).first()
         if row:
@@ -6251,6 +6634,9 @@ def admin_update_settings(
             db.add(models.AdminSetting(key=k, value=v))
     db.commit()
     _admin_audit(admin_user.email or "", "settings_update", {"keys": [u[0] for u in updates]})
+    _rcache_invalidate_prefix("admin-settings")
+    global _deduction_multiplier_cache
+    _deduction_multiplier_cache = None
     return {"ok": True}
 
 
@@ -6704,11 +7090,10 @@ async def _portfolio_allocation_snapshot(mgr: BitfinexManager, fold_ticker_state
     max_attempts = 3
     wallets, credits, offers = None, None, None
     for attempt in range(max_attempts):
-        wallets, credits, offers = await asyncio.gather(
-            mgr.wallets(),
-            mgr.funding_credits(),
-            mgr.funding_offers(),
-        )
+        wallets = await mgr.wallets()
+        credits = await mgr.funding_credits()
+        offers = await mgr.funding_offers()
+        
         w_err = wallets[1] if isinstance(wallets, tuple) else None
         c_err = credits[1] if isinstance(credits, tuple) else None
         o_err = offers[1] if isinstance(offers, tuple) else None
@@ -6727,11 +7112,12 @@ async def _portfolio_allocation_snapshot(mgr: BitfinexManager, fold_ticker_state
     credits_data = credits[0] if isinstance(credits, tuple) else None
     offers_data = offers[0] if isinstance(offers, tuple) else None
 
-    # Only compute when we have all three; otherwise return None so caller can serve cache or 503.
+    # Only compute when we have all three; otherwise return None so caller can serve cache or 200+incomplete.
     if wallets_data is None or credits_data is None or offers_data is None:
         log_incomplete = (
             f"Portfolio Allocation: incomplete (wallets={wallets_data is not None}, "
-            f"credits={credits_data is not None}, offers={offers_data is not None})"
+            f"credits={credits_data is not None}, offers={offers_data is not None}); "
+            f"errors: wallets={w_err!r}, credits={c_err!r}, offers={o_err!r}"
         )
         return None, log_incomplete, rate_limited
 
@@ -6861,23 +7247,24 @@ async def _get_wallet_data(
 ) -> tuple[dict, str]:
     """
     Shared logic for wallet summary. Returns (data_dict, source) where source is "cache" or "live".
-    On error returns (_empty_wallet_response(), "live"). Raises HTTPException only for 503 incomplete.
+    On error returns (_empty_wallet_response(), "live", incomplete). Raises HTTPException only for auth/404.
+    When snapshot is incomplete and no cache, returns 200 with empty data and incomplete=True so dashboard still loads.
     When fold_ticker_state is provided (from dashboard_fold), ticker is shared with lending path for single fetch.
     """
     try:
         cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
     except Exception as e:
         logger.exception("wallets/%s cache get failed: %s", user_id, e)
-        return _empty_wallet_response(), "live"
+        return _empty_wallet_response(), "live", False
     try:
         if cached is not None:
             data, from_cache = cached
             if from_cache and data is not None:
-                return data, "cache"
+                return data, "cache", False
         in_cooldown = await bitfinex_cache.is_in_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
     except Exception as e:
         logger.exception("wallets/%s cache/cooldown failed: %s", user_id, e)
-        return _empty_wallet_response(), "live"
+        return _empty_wallet_response(), "live", False
     if in_cooldown:
         return {
             "total_usd_all": 0.0,
@@ -6900,7 +7287,7 @@ async def _get_wallet_data(
             "credits_detail": [],
             "offers_detail": [],
             "_rate_limited": True,
-        }, "cache"
+        }, "cache", False
     keys = user.vault.get_keys()
     mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
     try:
@@ -6910,12 +7297,13 @@ async def _get_wallet_data(
         if rate_limited:
             await bitfinex_cache.set_rate_limit_cooldown(user_id, bitfinex_cache.KEY_WALLETS)
         if summary is None:
+            logger.warning("wallets/%s snapshot incomplete: %s", user_id, log_str)
             cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
             if cached is not None:
                 data, _ = cached
                 if data is not None:
-                    return data, "cache"
-            raise HTTPException(status_code=503, detail="Wallet data incomplete; try again shortly.")
+                    return data, "cache", False
+            return _empty_wallet_response(), "live", True
     except HTTPException:
         raise
     except Exception as e:
@@ -6925,12 +7313,12 @@ async def _get_wallet_data(
             except Exception:
                 pass
         logger.exception("wallets/%s Bitfinex snapshot failed: %s", user_id, e)
-        return _empty_wallet_response(), "live"
+        return _empty_wallet_response(), "live", False
     try:
         await bitfinex_cache.set_cached(user_id, bitfinex_cache.KEY_WALLETS, summary)
     except Exception:
         pass
-    return summary, "live"
+    return summary, "live", False
 
 
 @app.get("/wallets/{user_id}")
@@ -6960,8 +7348,11 @@ async def wallet_summary(
     except Exception as e:
         logger.exception("wallets/%s load user/vault failed: %s", user_id, e)
         return _empty_wallet_response()
-    data, source = await _get_wallet_data(user_id, user, db)
+    data, source, incomplete = await _get_wallet_data(user_id, user, db)
     response.headers["X-Data-Source"] = source
+    response.headers["X-Authenticated-User-Id"] = str(current_user.id)
+    if incomplete:
+        response.headers["X-Data-Incomplete"] = "true"
     if source == "cache":
         exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_WALLETS)
         if exp is not None:
@@ -6983,9 +7374,32 @@ async def dashboard_fold(
 ):
     """
     Single response with wallets, botStats, userStatus, and lending for the dashboard.
-    Same shapes as the individual endpoints so frontend normalizers work.
-    Runs wallets, bot_stats, and lending in parallel to reduce latency.
+    Uses response cache (15s TTL). Sets X-Authenticated-User-Id header.
     """
+    uid = current_user.id
+    cache_key = f"dashboard-fold:{uid}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return JSONResponse(
+            content=cached,
+            headers={"X-Authenticated-User-Id": str(uid)},
+        )
+
+    try:
+        result = await _dashboard_fold_impl(current_user, db)
+        _rcache_set(cache_key, result)
+        return JSONResponse(
+            content=result,
+            headers={"X-Authenticated-User-Id": str(uid)},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("dashboard_fold user_id=%s error=%s", uid, e)
+        raise HTTPException(status_code=500, detail="Internal server error loading dashboard.")
+
+
+async def _dashboard_fold_impl(current_user: models.User, db: Session):
     user_id = current_user.id
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
@@ -7014,28 +7428,38 @@ async def dashboard_fold(
     async def _wallets():
         if not vault:
             return _empty_wallet_response()
+        db_w = database.SessionLocal()
         try:
-            data, _ = await _get_wallet_data(user_id, user, db, fold_ticker_state)
-            return data
-        except HTTPException as e:
-            if e.status_code == 503:
+            user_w = db_w.query(models.User).filter(models.User.id == user_id).first()
+            if not user_w:
                 return _empty_wallet_response()
+            data, _, _ = await _get_wallet_data(user_id, user_w, db_w, fold_ticker_state)
+            return data
+        except HTTPException:
             raise
         except Exception:
             return _empty_wallet_response()
+        finally:
+            db_w.close()
 
     async def _bot_stats():
+        db_b = database.SessionLocal()
         try:
-            return await _get_bot_stats_data(user_id, db)
+            return await _get_bot_stats_data(user_id, db_b)
         except Exception:
-            return {"active": False, "engines": [], "total_loaned": "0.00", "bot_status": "stopped"}
+            return {"active": False, "engines": [], "total_loaned": "0.00", "bot_status": "stopped", "has_api_keys": bool(vault)}
+        finally:
+            db_b.close()
 
     async def _lending():
+        db_l = database.SessionLocal()
         try:
-            lending_resp, _ = await _get_lending_stats_data(user_id, db, fold_ticker_state=fold_ticker_state)
+            lending_resp, _ = await _get_lending_stats_data(user_id, db_l, fold_ticker_state=fold_ticker_state)
             return lending_resp.model_dump()
         except Exception:
             return {"gross_profit": 0.0, "bitfinex_fee": 0.0, "net_profit": 0.0}
+        finally:
+            db_l.close()
 
     wallets_data, bot_stats, lending_data = await asyncio.gather(_wallets(), _bot_stats(), _lending())
 
@@ -7048,8 +7472,9 @@ async def dashboard_fold(
         try:
             trade_records = await _fetch_funding_trade_records_for_user(user)
             if trade_records:
-                lending_data["trades"] = trade_records
+                FOLD_TRADES_CAP = 100
                 lending_data["total_trades_count"] = len(trade_records)
+                lending_data["trades"] = trade_records[-FOLD_TRADES_CAP:]
         except Exception:
             pass
 
@@ -7191,6 +7616,7 @@ def token_deposit(
             apply_referral_rewards_on_purchase(db, user_id, amount_float, reward_purchase_l1=l1_pct, reward_purchase_l2=l2_pct, reward_purchase_l3=l3_pct)
             db.commit()
             logger.info("token_deposit_bypass user_id=%s usd=%s tokens_added=%s", user_id, amount_float, tokens_to_award)
+            _rcache_invalidate_user(user_id)
         except Exception as e:
             db.rollback()
             logger.exception("token_deposit_bypass failed: %s", e)
@@ -7440,6 +7866,7 @@ def subscription_bypass(
             ref_base = referrer.pro_expiry if referrer.pro_expiry and referrer.pro_expiry > now else now
             referrer.pro_expiry = ref_base + timedelta(days=7)
     db.commit()
+    _rcache_invalidate_user(current_user.id)
     return {
         "status": "success",
         "plan": plan,
@@ -7544,6 +7971,7 @@ async def stripe_webhook(request: Request):
                     db.commit()
                     new_bal = token_ledger_svc.get_tokens_remaining(db, user_id)
                     _stripe_webhook_log("tokens_deposit user_id=%s tokens_added=%s new_balance=%s", user_id, tokens, new_bal)
+                    _rcache_invalidate_user(user_id)
                 finally:
                     db.close()
             else:
@@ -7621,6 +8049,7 @@ async def stripe_webhook(request: Request):
                         user.id, plan, interval, tokens_to_award,
                     )
                 db.commit()
+                _rcache_invalidate_user(user.id)
             except Exception as e:
                 _stripe_webhook_log("checkout.session.completed subscription error=%s", str(e))
                 logger.exception("stripe_webhook checkout.session.completed subscription: %s", e)

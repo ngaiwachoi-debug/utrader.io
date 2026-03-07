@@ -1,8 +1,8 @@
 "use client"
 
-import { useEffect, useState, useRef, useMemo } from "react"
+import { useCallback, useEffect, useState, useRef, useMemo } from "react"
 import Link from "next/link"
-import { useRouter, usePathname } from "next/navigation"
+import { useRouter, usePathname, useSearchParams } from "next/navigation"
 import { toast } from "sonner"
 import { useSession } from "next-auth/react"
 import { useT } from "@/lib/i18n"
@@ -13,7 +13,6 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
-  Mail,
   MessageSquare,
   AlertTriangle,
   TrendingDown,
@@ -24,10 +23,13 @@ import {
   Trash2,
   RefreshCw,
   CheckCircle,
+  Pencil,
+  X,
 } from "lucide-react"
 import { useCurrentUserId } from "@/lib/current-user-context"
-import { useReferralData, useDeductionMultiplier, useTokenBalance } from "@/lib/dashboard-data-context"
+import { useReferralData, useDeductionMultiplier, useTokenBalance, useUserStatus } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
+import { Spinner } from "@/components/ui/spinner"
 import {
   calculateTotalBudget,
   calculateUsedTokens,
@@ -67,30 +69,49 @@ const INSUFFICIENT_TOKENS_MSG = "Please add tokens to run the bot. A minimum bal
 
 type SettingsPageProps = { onUpgradeClick?: () => void }
 
+const VALID_TABS: SettingsTab[] = ["general", "notifications", "api-keys", "community", "token-activity"]
+
+function getTabFromSearchParams(searchParams: ReturnType<typeof useSearchParams> | null): SettingsTab {
+  const tab = searchParams?.get("tab")
+  if (tab && VALID_TABS.includes(tab as SettingsTab)) return tab as SettingsTab
+  return "general"
+}
+
 export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const t = useT()
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
   const userId = useCurrentUserId()
   const id = userId ?? 0
   const { data: referralCacheData } = useReferralData(id)
   const deductionMultiplier = useDeductionMultiplier()
   const { data: session, status } = useSession()
   const signedIn = status === "authenticated" && !!session?.user
-  const [activeTab, setActiveTab] = useState<SettingsTab>("general")
+  const [activeTab, setActiveTab] = useState<SettingsTab>(() => getTabFromSearchParams(searchParams))
   const [showSecret, setShowSecret] = useState(false)
   const [darkMode, setDarkMode] = useState(true)
-  const [dailyEmail, setDailyEmail] = useState(false)
 
   // USDT withdrawal address (from referral cache or referral-info API)
   const cachedAddress = referralCacheData?.referralInfo?.usdt_withdraw_address ?? ""
   const [usdtWithdrawAddress, setUsdtWithdrawAddress] = useState<string>("")
   const [usdtAddressSaving, setUsdtAddressSaving] = useState(false)
+  const [isEditingUsdtAddress, setIsEditingUsdtAddress] = useState(false)
+  const originalUsdtAddressRef = useRef<string>("")
   const usdtAddressInitialized = useRef(false)
 
-  // Account & Membership: plan and registration (from user-status)
-  const [planTier, setPlanTier] = useState<string>("Trial User")
-  const [planName, setPlanName] = useState<string>("Trial Plan")
-  const [proExpiry, setProExpiry] = useState<string | null>(null)
-  const [createdAt, setCreatedAt] = useState<string | null>(null)
+  const userStatus = useUserStatus(id)
+  const rawTier = (userStatus.data?.plan_tier ?? "trial").toLowerCase()
+  const planTier = rawTier.toUpperCase() + " User"
+  const planName = rawTier === "pro" ? "Pro Plan"
+    : rawTier === "free" ? "Free Plan"
+    : rawTier === "ai_ultra" ? "AI Ultra"
+    : rawTier === "whales" ? "Whales Plan"
+    : rawTier === "expert" ? "Expert Plan"
+    : rawTier === "guru" ? "Guru Plan"
+    : "Trial Plan"
+  const proExpiry = userStatus.data?.pro_expiry ?? null
+  const createdAt = userStatus.data?.created_at ?? null
 
   // Token balance from dashboard-fold (useTokenBalance); no separate request on load.
   const { data: tokenBalanceFromContext, refetch: refetchTokenBalance } = useTokenBalance(id)
@@ -105,41 +126,11 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const [tokenBalanceError, setTokenBalanceError] = useState<string | null>(null)
   const tokenBalanceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // Token add history: from /api/v1/users/me/token-add-history
-  const [tokenAddHistory, setTokenAddHistory] = useState<TokenAddHistoryEntry[]>([])
-  const [tokenAddHistoryLoading, setTokenAddHistoryLoading] = useState(false)
-
-  const fetchTokenAddHistory = async () => {
-    const token = await getBackendToken()
-    if (!token) return
-    setTokenAddHistoryLoading(true)
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/users/me/token-add-history?limit=50`, {
-        credentials: "include",
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (res.ok) {
-        const data = await res.json()
-        setTokenAddHistory(Array.isArray(data) ? data : [])
-      }
-    } catch {
-      setTokenAddHistory([])
-    } finally {
-      setTokenAddHistoryLoading(false)
-    }
-  }
-
   useEffect(() => {
     if (userId == null) {
-      setPlanTier("Trial User")
-      setPlanName("Trial Plan")
-      setProExpiry(null)
-      setCreatedAt(null)
       setTokenBalanceError(null)
-      setTokenAddHistory([])
       return
     }
-    fetchTokenAddHistory()
   }, [userId])
 
   // Token balance: poll only on Token activity tab and when tab is visible (reduces server load)
@@ -167,39 +158,13 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
     }
   }, [userId, activeTab, refetchTokenBalance])
 
-  useEffect(() => {
-    if (userId == null) return
-    const fetchUserStatus = async () => {
-      try {
-        const token = await getBackendToken()
-        const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-        const res = await fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers })
-        if (!res.ok) return
-        const data = await res.json()
-        setPlanTier((data.plan_tier ?? "trial").toUpperCase() + " User")
-        const tier = (data.plan_tier ?? "trial").toLowerCase()
-        if (tier === "pro") setPlanName("Pro Plan")
-        else if (tier === "free") setPlanName("Free Plan")
-        else if (tier === "ai_ultra") setPlanName("AI Ultra")
-        else if (tier === "whales") setPlanName("Whales Plan")
-        else if (tier === "expert") setPlanName("Expert Plan")
-        else if (tier === "guru") setPlanName("Guru Plan")
-        else setPlanName("Trial Plan")
-        setProExpiry(data.pro_expiry ?? null)
-        setCreatedAt(data.created_at ?? null)
-      } catch (e) {
-        if (process.env.NODE_ENV === "development") console.error("Failed to fetch user status", e)
-      }
-    }
-    fetchUserStatus()
-  }, [userId])
-
   // Prefer referral cache for USDT address to avoid duplicate request when user already opened Referral page
   useEffect(() => {
     const addr = (cachedAddress ?? "").trim()
     if (addr && !usdtAddressInitialized.current) {
       usdtAddressInitialized.current = true
       setUsdtWithdrawAddress(addr)
+      originalUsdtAddressRef.current = addr
     }
   }, [cachedAddress])
 
@@ -215,6 +180,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
           const data = await res.json()
           const addr = (data.usdt_withdraw_address ?? "").trim()
           setUsdtWithdrawAddress(addr)
+          originalUsdtAddressRef.current = addr
           usdtAddressInitialized.current = true
         }
       } catch {
@@ -239,13 +205,21 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
         toast.error(typeof data.detail === "string" ? data.detail : "Failed to save address")
         return
       }
-      toast.success("USDT withdrawal address saved.")
+      toast.success("USDT withdrawal address saved successfully!")
+      originalUsdtAddressRef.current = usdtWithdrawAddress.trim() // Update original ref
+      setIsEditingUsdtAddress(false) // Exit edit mode after successful save
     } catch {
       toast.error("Failed to save")
     } finally {
       setUsdtAddressSaving(false)
     }
   }
+
+  // Sync activeTab from URL when user navigates (e.g. "View all" from header popover)
+  useEffect(() => {
+    const tab = getTabFromSearchParams(searchParams)
+    setActiveTab(tab)
+  }, [searchParams])
 
   const tabs: { id: SettingsTab; labelKey: string }[] = [
     { id: "general", labelKey: "settings.tabs.general" },
@@ -254,6 +228,14 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
     { id: "community", labelKey: "settings.tabs.community" },
     { id: "token-activity", labelKey: "settings.tabs.tokenActivity" },
   ]
+
+  const handleTabChange = (tabId: SettingsTab) => {
+    setActiveTab(tabId)
+    const next = new URLSearchParams(searchParams?.toString() ?? "")
+    next.set("page", "settings")
+    next.set("tab", tabId)
+    router.replace(`${pathname ?? ""}?${next.toString()}`, { scroll: false })
+  }
 
   // Calculated token usage (memoized)
   const tokenUsage = useMemo(() => {
@@ -384,7 +366,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
         {tabs.map((tab) => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => handleTabChange(tab.id)}
             className={`rounded-md px-4 py-2 text-xs font-medium transition-all ${
               activeTab === tab.id
                 ? "bg-card text-foreground shadow-sm border border-border"
@@ -406,12 +388,16 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
             setUsdtWithdrawAddress={setUsdtWithdrawAddress}
             onSaveUsdtAddress={saveUsdtAddress}
             usdtAddressSaving={usdtAddressSaving}
+            isEditingUsdtAddress={isEditingUsdtAddress}
+            setIsEditingUsdtAddress={setIsEditingUsdtAddress}
+            originalUsdtAddress={originalUsdtAddressRef.current}
+            setOriginalUsdtAddress={(v: string) => { originalUsdtAddressRef.current = v }}
           />
         )}
-        {activeTab === "notifications" && <NotificationsTab dailyEmail={dailyEmail} setDailyEmail={setDailyEmail} />}
+        {activeTab === "notifications" && <NotificationsTab />}
         {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} userId={userId} />}
         {activeTab === "community" && <CommunityTab />}
-        {activeTab === "token-activity" && <TokenActivityTab refetchTokenBalance={refetchTokenBalance} />}
+        {activeTab === "token-activity" && <TokenActivityTab />}
       </div>
     </div>
   )
@@ -425,6 +411,10 @@ function GeneralTab({
   setUsdtWithdrawAddress,
   onSaveUsdtAddress,
   usdtAddressSaving,
+  isEditingUsdtAddress,
+  setIsEditingUsdtAddress,
+  originalUsdtAddress,
+  setOriginalUsdtAddress,
 }: {
   darkMode: boolean
   setDarkMode: (v: boolean) => void
@@ -432,6 +422,10 @@ function GeneralTab({
   setUsdtWithdrawAddress: (v: string) => void
   onSaveUsdtAddress: () => Promise<void>
   usdtAddressSaving: boolean
+  isEditingUsdtAddress: boolean
+  setIsEditingUsdtAddress: (v: boolean) => void
+  originalUsdtAddress: string
+  setOriginalUsdtAddress: (v: string) => void
 }) {
   return (
     <div className="flex flex-col gap-6">
@@ -444,23 +438,61 @@ function GeneralTab({
         <div>
           <label className="text-sm font-medium text-foreground">USDT Withdrawal Address</label>
           <p className="text-xs text-muted-foreground mb-1">TRC20 (T...) or ERC20 (0x...). Used for USDT Credit withdrawal requests.</p>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={usdtWithdrawAddress}
-              onChange={(e) => setUsdtWithdrawAddress(e.target.value)}
-              placeholder="T... or 0x..."
-              className="mt-1 flex-1 rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground font-mono outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
-            />
-            <button
-              type="button"
-              onClick={onSaveUsdtAddress}
-              disabled={usdtAddressSaving}
-              className="mt-1 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            >
-              {usdtAddressSaving ? "Saving…" : "Save"}
-            </button>
-          </div>
+          {usdtWithdrawAddress && !isEditingUsdtAddress ? (
+            // View mode: show address as read-only (greyed out)
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={usdtWithdrawAddress}
+                readOnly
+                className="mt-1 flex-1 rounded-lg border border-border bg-muted/50 px-3 py-2.5 text-sm text-muted-foreground font-mono cursor-not-allowed"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  setOriginalUsdtAddress(usdtWithdrawAddress) // Capture current value as snapshot for cancel
+                  setIsEditingUsdtAddress(true)
+                }}
+                className="mt-1 flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium text-foreground hover:bg-secondary transition-colors"
+              >
+                <Pencil className="w-4 h-4" />
+                Edit
+              </button>
+            </div>
+          ) : (
+            // Edit mode: show editable input with Save/Cancel buttons
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={usdtWithdrawAddress}
+                onChange={(e) => setUsdtWithdrawAddress(e.target.value)}
+                placeholder="T... or 0x..."
+                className="mt-1 flex-1 rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground font-mono outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
+              />
+              <button
+                type="button"
+                onClick={onSaveUsdtAddress}
+                disabled={usdtAddressSaving}
+                className="mt-1 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {usdtAddressSaving ? "Saving…" : "Save"}
+              </button>
+              {originalUsdtAddress && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUsdtWithdrawAddress(originalUsdtAddress) // Restore original value
+                    setIsEditingUsdtAddress(false)
+                  }}
+                  disabled={usdtAddressSaving}
+                  className="mt-1 flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
+                >
+                  <X className="w-4 h-4" />
+                  Cancel
+                </button>
+              )}
+            </div>
+          )}
         </div>
         <div>
           <label className="text-sm font-medium text-foreground">Base Currency</label>
@@ -492,60 +524,130 @@ function GeneralTab({
 }
 
 /* ===================== NOTIFICATIONS TAB ===================== */
-function NotificationsTab({
-  dailyEmail,
-  setDailyEmail,
-}: {
-  dailyEmail: boolean
-  setDailyEmail: (v: boolean) => void
-}) {
+type NotificationEntry = { id: number; title: string; content?: string | null; type: string; created_at: string }
+
+function NotificationsTab() {
+  const t = useT()
+  const [notifications, setNotifications] = useState<NotificationEntry[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchNotifications = useCallback(async () => {
+    setError(null)
+    setLoading(true)
+    try {
+      const token = await getBackendToken()
+      if (!token) {
+        setNotifications([])
+        return
+      }
+      const res = await fetch(`${API_BASE}/api/v1/users/me/notifications?limit=50`, {
+        credentials: "include",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        setError(t("notifications.error"))
+        setNotifications([])
+        return
+      }
+      const data = await res.json()
+      setNotifications(Array.isArray(data) ? data : [])
+    } catch {
+      setError(t("notifications.error"))
+      setNotifications([])
+    } finally {
+      setLoading(false)
+    }
+  }, [t])
+
+  useEffect(() => {
+    fetchNotifications()
+  }, [fetchNotifications])
+
+  const formatDate = (iso: string) => {
+    if (!iso) return "—"
+    try {
+      const d = new Date(iso)
+      if (Number.isNaN(d.getTime())) return "—"
+      return d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
+    } catch {
+      return "—"
+    }
+  }
+
+  const typeLabel = (type: string) => {
+    if (type === "warning") return t("notifications.type.warning")
+    if (type === "announcement") return t("notifications.type.announcement")
+    return t("notifications.type.info")
+  }
+
   return (
     <div className="flex flex-col gap-6">
-      <div>
-        <h3 className="text-lg font-semibold text-foreground">Notifications</h3>
-        <p className="text-xs text-muted-foreground">Configure how you receive alerts and updates</p>
-      </div>
-
-      {/* Daily Email Reports */}
-      <div className="rounded-xl border border-border bg-secondary/30 p-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Mail className="h-5 w-5 text-muted-foreground" />
-            <div>
-              <p className="text-sm font-semibold text-foreground">Daily Email Reports</p>
-              <p className="text-xs text-muted-foreground">Receive a daily summary of your lending performance and key metrics</p>
-            </div>
-          </div>
-          <ToggleSwitch checked={dailyEmail} onChange={setDailyEmail} />
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <h3 className="text-lg font-semibold text-foreground">{t("notifications.title")}</h3>
+          <p className="text-xs text-muted-foreground">{t("notifications.emptyHint")}</p>
         </div>
+        <button
+          type="button"
+          onClick={() => fetchNotifications()}
+          disabled={loading}
+          className="shrink-0 rounded-lg border border-border bg-muted/50 px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50 flex items-center gap-1.5"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+          {t("notifications.refresh")}
+        </button>
       </div>
 
-      {/* Coming Soon Notifications */}
-      <div>
-        <p className="text-sm font-medium text-muted-foreground mb-3">Additional Notifications (Coming Soon)</p>
-        <div className="flex flex-col gap-3">
-          {[
-            { label: "Bot Errors", icon: AlertTriangle },
-            { label: "Low Utilization Rate", icon: TrendingDown },
-            { label: "Significant Rate Changes", icon: BarChart3 },
-          ].map((item) => (
-            <div key={item.label} className="flex items-center justify-between py-2">
-              <div className="flex items-center gap-3">
-                <item.icon className="h-4 w-4 text-muted-foreground/50" />
-                <span className="text-sm text-muted-foreground">{item.label}</span>
+      {loading && (
+        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+          <Spinner className="h-4 w-4" />
+          {t("notifications.loading")}
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between gap-2">
+          <span>{error}</span>
+          <button type="button" onClick={() => fetchNotifications()} className="rounded-md px-2 py-1 text-xs font-medium bg-destructive/20 hover:bg-destructive/30">
+            {t("notifications.retry")}
+          </button>
+        </div>
+      )}
+
+      {!loading && !error && notifications.length === 0 && (
+        <p className="py-6 text-sm text-muted-foreground">{t("notifications.empty")}</p>
+      )}
+
+      {!loading && !error && notifications.length > 0 && (
+        <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto">
+          {notifications.map((n) => (
+            <div
+              key={n.id}
+              className="rounded-xl border border-border bg-secondary/30 p-4 flex flex-col gap-2"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-semibold text-foreground line-clamp-1">{n.title}</span>
+                <span
+                  className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                    n.type === "warning"
+                      ? "bg-amber-500/20 text-amber-600 dark:text-amber-400"
+                      : n.type === "announcement"
+                        ? "bg-violet-500/20 text-violet-600 dark:text-violet-400"
+                        : "bg-primary/20 text-primary"
+                  }`}
+                >
+                  {typeLabel(n.type)}
+                </span>
               </div>
-              <ToggleSwitch checked={false} onChange={() => {}} disabled />
+              {n.content && (
+                <p className="text-xs text-muted-foreground line-clamp-3">{n.content}</p>
+              )}
+              <p className="text-[10px] text-muted-foreground">{formatDate(n.created_at)}</p>
             </div>
           ))}
         </div>
-      </div>
-
-      {/* Save Button */}
-      <div className="flex justify-end">
-        <button className="rounded-lg bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors">
-          Save Notification Settings
-        </button>
-      </div>
+      )}
     </div>
   )
 }
@@ -563,6 +665,22 @@ function ApiKeysTab({
   userId: number | null
 }) {
   const t = useT()
+  const [apiKeysHelpUrl, setApiKeysHelpUrl] = useState<string>("#")
+
+  useEffect(() => {
+    const fetchHelpUrl = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/public/api-keys-help-url`)
+        if (res.ok) {
+          const data = await res.json()
+          setApiKeysHelpUrl(data.url || "#")
+        }
+      } catch {
+        // Keep default "#"
+      }
+    }
+    fetchHelpUrl()
+  }, [])
   const router = useRouter()
   const pathname = usePathname()
   const [bfxKey, setBfxKey] = useState("")
@@ -657,8 +775,11 @@ function ApiKeysTab({
           const d = data.detail
           const errMsg = typeof d === "string" ? d : Array.isArray(d) ? (d[0]?.msg ?? JSON.stringify(d)) : (data.message ?? "Invalid Keys")
           if (res.status === 401) {
-            throw new Error("Session expired. Please log out and log in again, then try saving your API keys.")
+            const errorMsg = "Session expired. Please log out and log in again, then try saving your API keys."
+            toast.error("API Keys Save Failed", { description: errorMsg })
+            throw new Error(errorMsg)
           }
+          toast.error("API Keys Save Failed", { description: String(errMsg) })
           throw new Error(String(errMsg))
         }
         setBalance(data.balance ?? null)
@@ -668,10 +789,10 @@ function ApiKeysTab({
         setGeminiKey("")
         setHasKeys(true)
         setKeyPreview("••••••••")
-        toast.success("Connection Successful", {
+        toast.success("API Keys Saved Successfully", {
           description: data.balance?.total_usd_all != null
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
-            : undefined,
+            : "Your API keys have been saved and verified.",
         })
         // Auto-start bot after connecting API keys so Terminal shows output
         if (userId != null) {
@@ -715,6 +836,7 @@ function ApiKeysTab({
         if (!res.ok) {
           const d = data.detail
           const errMsg = typeof d === "string" ? d : Array.isArray(d) ? (d[0]?.msg ?? JSON.stringify(d)) : (data.message ?? "Invalid Keys")
+          toast.error("API Keys Save Failed", { description: String(errMsg) })
           throw new Error(String(errMsg))
         }
         setBalance(data.balance ?? null)
@@ -724,10 +846,10 @@ function ApiKeysTab({
         setGeminiKey("")
         setHasKeys(true)
         setKeyPreview("••••••••")
-        toast.success("Connection Successful", {
+        toast.success("API Keys Saved Successfully", {
           description: data.balance?.total_usd_all != null
             ? `Bitfinex balance: $${Number(data.balance.total_usd_all).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
-            : undefined,
+            : "Your API keys have been saved and verified.",
         })
         // Auto-start bot after connecting API keys (dev path) so Terminal shows output
         try {
@@ -763,7 +885,10 @@ function ApiKeysTab({
       const isNetworkError = rawMsg === "Failed to fetch" || rawMsg.includes("NetworkError")
       const errMsg = isNetworkError ? t("dashboard.apiUnreachable") : rawMsg
       setMessage({ type: "error", text: errMsg })
-      toast.error(isNetworkError ? "Unable to connect" : "Connection failed", { description: errMsg })
+      // Only show error toast if not already shown above (to avoid duplicate notifications)
+      if (!rawMsg.includes("Session expired") && !rawMsg.includes("Invalid Keys")) {
+        toast.error(isNetworkError ? "Unable to connect" : "API Keys Save Failed", { description: errMsg })
+      }
       setTimeout(clearMessage, 6000)
     } finally {
       setLoading(false)
@@ -970,14 +1095,24 @@ function ApiKeysTab({
             Read-only access {"·"} Your funds stay secure
           </span>
         </div>
-        <a href="#" className="text-xs font-medium text-primary hover:text-primary transition-colors">
+        <a 
+          href={apiKeysHelpUrl} 
+          target={apiKeysHelpUrl.startsWith("http") ? "_blank" : undefined}
+          rel={apiKeysHelpUrl.startsWith("http") ? "noopener noreferrer" : undefined}
+          className="text-xs font-medium text-primary hover:text-primary transition-colors"
+        >
           {"Need help? \u2192"}
         </a>
       </div>
 
-      {/* Update API Keys (Image 3) */}
+      {/* Update API Keys (Image 3): allow insert when no keys; disable modify when has keys + lock window */}
       <div className="flex flex-col gap-4">
         <h4 className="text-sm font-semibold text-foreground">{hasKeys ? t("settings.updateApiKeys") : "Add API Keys"}</h4>
+        {hasKeys && apiKeyModificationLocked && (
+          <p className="text-xs text-amber-600 dark:text-amber-400">
+            API key changes disabled during daily fee calculation (09:55–10:35 UTC). You can add a new key if you have none.
+          </p>
+        )}
         <div>
           <label className="text-sm font-semibold text-foreground">API Key</label>
           <input
@@ -985,7 +1120,8 @@ function ApiKeysTab({
             value={bfxKey}
             onChange={(e) => setBfxKey(e.target.value)}
             placeholder="Enter your Bitfinex API Key"
-            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
+            disabled={hasKeys === true && apiKeyModificationLocked}
+            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50 disabled:opacity-60 disabled:cursor-not-allowed"
           />
         </div>
         <div>
@@ -996,7 +1132,8 @@ function ApiKeysTab({
               value={bfxSecret}
               onChange={(e) => setBfxSecret(e.target.value)}
               placeholder="Enter your Bitfinex API Secret"
-              className="w-full rounded-lg border border-border bg-secondary px-3 py-2.5 pr-10 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
+              disabled={hasKeys === true && apiKeyModificationLocked}
+              className="w-full rounded-lg border border-border bg-secondary px-3 py-2.5 pr-10 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50 disabled:opacity-60 disabled:cursor-not-allowed"
             />
             <button
               onClick={() => setShowSecret(!showSecret)}
@@ -1014,7 +1151,8 @@ function ApiKeysTab({
             value={geminiKey}
             onChange={(e) => setGeminiKey(e.target.value)}
             placeholder="Optional: for AI features"
-            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
+            disabled={hasKeys === true && apiKeyModificationLocked}
+            className="mt-1.5 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50 disabled:opacity-60 disabled:cursor-not-allowed"
           />
         </div>
       </div>
@@ -1103,11 +1241,11 @@ function ApiKeysTab({
         </a>
       </div>
 
-      {/* Save Button */}
+      {/* Save Button: disabled when loading, or when user has keys and lock window is active */}
       <div className="flex justify-end">
         <button
           onClick={handleSave}
-          disabled={loading}
+          disabled={loading || (hasKeys === true && apiKeyModificationLocked)}
           className="rounded-lg bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
         >
           {loading ? "Saving…" : "Save API Keys"}
@@ -1128,7 +1266,7 @@ type DeductionHistoryEntry = {
   account_switch_note: string | null
 }
 
-function TokenActivityTab({ refetchTokenBalance }: { refetchTokenBalance: () => Promise<void> }) {
+function TokenActivityTab() {
   const t = useT()
   const userId = useCurrentUserId()
   const id = userId ?? 0
@@ -1140,7 +1278,11 @@ function TokenActivityTab({ refetchTokenBalance }: { refetchTokenBalance: () => 
 
   const fetchTokenActivity = async () => {
     const token = await getBackendToken()
-    if (!token) return
+    if (!token) {
+      setAddLoading(false)
+      setDeductionLoading(false)
+      return
+    }
     setAddLoading(true)
     setDeductionLoading(true)
     try {
@@ -1166,7 +1308,6 @@ function TokenActivityTab({ refetchTokenBalance }: { refetchTokenBalance: () => 
       } else {
         setDeductionLog([])
       }
-      await refetchTokenBalance()
     } finally {
       setAddLoading(false)
       setDeductionLoading(false)

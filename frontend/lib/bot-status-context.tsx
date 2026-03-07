@@ -1,11 +1,12 @@
 "use client"
 
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react"
+import { useSession, signIn } from "next-auth/react"
 import { getBackendToken } from "@/lib/auth"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useBotStats, useDashboardData } from "@/lib/dashboard-data-context"
 
-const API_BACKEND = "/api-backend"
+import { API_BASE as API_BACKEND } from "@/lib/api-config"
 const BOT_STATUS_POLL_MS = 90000
 /** Cooldown (seconds) after Start or Stop before either can be clicked again. */
 const BOT_ACTION_COOLDOWN_SEC = 10
@@ -14,35 +15,54 @@ const INSUFFICIENT_TOKENS_MESSAGE = "Please add tokens to run the bot. A minimum
 
 type BotStatusContextValue = {
   botActive: boolean | null
+  /** Raw bot_status string from backend: "running" | "starting" | "stopping" | "stopped" */
+  botStatus: string
   setBotActive: (v: boolean | null) => void
   loading: boolean
-  /** True when refetching in background (cached data shown but status may change) */
   isRevalidating: boolean
   error: string | null
   setError: (v: string | null) => void
-  /** True when Start returned 400 with INSUFFICIENT_TOKENS; show message + button to Subscription tab */
   insufficientTokens: boolean
   isStarting: boolean
   isStopping: boolean
-  /** Seconds remaining in the 10s cooldown after Start/Stop (0 = no cooldown) */
   actionCooldownSec: number
   refreshBotStatus: () => Promise<void>
   handleStart: () => Promise<void>
   handleStop: () => Promise<void>
-  /** Callback to switch to Subscription tab (e.g. setActivePage("subscription")) */
   onUpgradeClick?: () => void
+  /** Whether the user is signed in (NextAuth session or dev token) */
+  isLoggedIn: boolean
+  /** Whether the user has connected Bitfinex API keys */
+  hasApiKeys: boolean
+  /** When true, show the "connect API keys" popup */
+  showApiKeysPopup: boolean
+  setShowApiKeysPopup: (v: boolean) => void
+  /** Navigate settings callback (set by parent) */
+  onSettingsClick?: () => void
 }
 
 const BotStatusContext = createContext<BotStatusContextValue | null>(null)
 
-type BotStatusProviderProps = { children: React.ReactNode; onUpgradeClick?: () => void }
+type BotStatusProviderProps = { children: React.ReactNode; onUpgradeClick?: () => void; onSettingsClick?: () => void }
 
-export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProviderProps) {
+export function BotStatusProvider({ children, onUpgradeClick, onSettingsClick }: BotStatusProviderProps) {
+  const { status: sessionStatus } = useSession()
+  const hasDevToken = typeof window !== "undefined" && !!sessionStorage.getItem("bifinexbot_dev_backend_token")
+  const isLoggedIn = sessionStatus === "authenticated" || hasDevToken
+
   const userId = useCurrentUserId()
   const id = userId ?? 0
   const botStats = useBotStats(id)
   const { getWallets, getLendingStats } = useDashboardData()
-  const botActive = botStats.data?.active ?? null
+  const rawBotStatus = (botStats.data?.bot_status ?? "").toString().toLowerCase()
+  const botActive =
+    rawBotStatus === "running" || rawBotStatus === "starting"
+      ? true
+      : rawBotStatus === "stopped"
+        ? false
+        : (botStats.data?.active ?? null)
+  const botStatus = rawBotStatus || "stopped"
+  const hasApiKeys = botStats.data?.has_api_keys ?? false
   const [insufficientTokens, setInsufficientTokens] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
   const startInProgressRef = useRef(false)
@@ -50,6 +70,7 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
   const stopInProgressRef = useRef(false)
   const [actionCooldownSec, setActionCooldownSec] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [showApiKeysPopup, setShowApiKeysPopup] = useState(false)
   const loading = botStats.loading
   const isRevalidating = botStats.isRevalidating ?? false
 
@@ -91,6 +112,14 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
   }, [actionCooldownSec])
 
   const handleStart = useCallback(async () => {
+    if (!isLoggedIn) {
+      void signIn("google", { callbackUrl: "/dashboard" })
+      return
+    }
+    if (!hasApiKeys) {
+      setShowApiKeysPopup(true)
+      return
+    }
     if (userId == null || actionCooldownSec > 0) return
     if (startInProgressRef.current) return
     startInProgressRef.current = true
@@ -134,7 +163,7 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
       startInProgressRef.current = false
       setIsStarting(false)
     }
-  }, [userId, refreshBotStatus, actionCooldownSec, getWallets, getLendingStats, id])
+  }, [userId, refreshBotStatus, actionCooldownSec, getWallets, getLendingStats, id, isLoggedIn, hasApiKeys])
 
   const handleStop = useCallback(async () => {
     if (userId == null || actionCooldownSec > 0) return
@@ -191,6 +220,7 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
 
   const value: BotStatusContextValue = {
     botActive,
+    botStatus,
     setBotActive: () => { void refreshBotStatus() },
     loading,
     isRevalidating,
@@ -204,6 +234,11 @@ export function BotStatusProvider({ children, onUpgradeClick }: BotStatusProvide
     handleStart,
     handleStop,
     onUpgradeClick,
+    isLoggedIn,
+    hasApiKeys,
+    showApiKeysPopup,
+    setShowApiKeysPopup,
+    onSettingsClick,
   }
 
   return <BotStatusContext.Provider value={value}>{children}</BotStatusContext.Provider>

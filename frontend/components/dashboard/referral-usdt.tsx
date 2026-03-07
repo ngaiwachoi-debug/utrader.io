@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { toast } from "sonner"
 import { Copy, Wallet, UserPlus, Send, Loader2, RefreshCw, Users, History } from "lucide-react"
 import { getBackendToken } from "@/lib/auth"
@@ -43,11 +43,15 @@ export function ReferralUsdt() {
   const [tab, setTab] = useState<"usdt" | "referral">("usdt")
   const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
+  const lastCooldownSecRef = useRef(0)
 
   useEffect(() => {
     const interval = setInterval(() => {
       const remaining = Math.max(0, Math.ceil((refreshCooldownUntil - Date.now()) / 1000))
-      setRefreshCooldownSec(remaining)
+      if (remaining !== lastCooldownSecRef.current) {
+        lastCooldownSecRef.current = remaining
+        setRefreshCooldownSec(remaining)
+      }
     }, 1000)
     return () => clearInterval(interval)
   }, [refreshCooldownUntil])

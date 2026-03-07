@@ -17,7 +17,14 @@ if not DATABASE_URL:
         "DATABASE_URL is missing. Set it in .env (e.g. postgresql://user:password@host/dbname?sslmode=require)."
     )
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=int(os.getenv("DB_POOL_SIZE", "20")),
+    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "40")),
+    pool_pre_ping=os.getenv("DB_POOL_PRE_PING", "false").lower() in ("1", "true", "yes"),
+    pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "300")),
+    pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

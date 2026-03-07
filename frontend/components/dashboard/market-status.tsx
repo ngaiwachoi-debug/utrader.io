@@ -1,10 +1,10 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { useT } from "@/lib/i18n"
 import { BarChart3, TrendingUp, DollarSign, PieChart, Activity, BookOpen } from "lucide-react"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+import { API_BASE } from "@/lib/api-config"
 
 type FundingSymbolOption = { value: string; label: string }
 
@@ -42,7 +42,7 @@ export function MarketStatus() {
   const [ledgerLoading, setLedgerLoading] = useState(false)
   const [ledgerError, setLedgerError] = useState<string | null>(null)
 
-  const fetchLedger = async (symbol: string) => {
+  const fetchLedger = useCallback(async (symbol: string) => {
     try {
       setLedgerLoading(true)
       setLedgerError(null)
@@ -66,7 +66,7 @@ export function MarketStatus() {
     } finally {
       setLedgerLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     fetch(`${API_BASE}/api/funding-symbols`)
@@ -80,7 +80,7 @@ export function MarketStatus() {
 
   useEffect(() => {
     fetchLedger(ledgerSymbol)
-  }, [ledgerSymbol])
+  }, [ledgerSymbol, fetchLedger])
 
   return (
     <div className="flex flex-col gap-6">

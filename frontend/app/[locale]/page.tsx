@@ -8,7 +8,7 @@ import { useT } from "@/lib/i18n"
 import { setDevBackendToken } from "@/lib/auth"
 import { TrendingUp, Zap, Shield, BarChart3 } from "lucide-react"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+import { API_BASE } from "@/lib/api-config"
 const PENDING_REFERRAL_KEY = "pending_referral_code"
 
 export default function LandingPage() {

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   DollarSign,
   RefreshCw,
@@ -97,10 +97,14 @@ function RefreshButtonWithCooldown({
   t: (key: string, opts?: { n?: number }) => string
 }) {
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
+  const lastCooldownSecRef = useRef(0)
   useEffect(() => {
     const interval = setInterval(() => {
       const remaining = Math.max(0, Math.ceil((refreshCooldownUntil - Date.now()) / 1000))
-      setRefreshCooldownSec(remaining)
+      if (remaining !== lastCooldownSecRef.current) {
+        lastCooldownSecRef.current = remaining
+        setRefreshCooldownSec(remaining)
+      }
     }, 1000)
     return () => clearInterval(interval)
   }, [refreshCooldownUntil])

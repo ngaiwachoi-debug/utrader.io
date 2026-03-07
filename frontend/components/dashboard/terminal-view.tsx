@@ -4,6 +4,7 @@ import { useEffect, useState, useRef } from "react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useBotStatus } from "@/lib/bot-status-context"
+import { useUserStatus } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
 import { Terminal } from "lucide-react"
 import { BotStatusBar } from "@/components/dashboard/bot-status-bar"
@@ -22,7 +23,7 @@ type TerminalSummary = {
   status?: string
 } | null
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+import { API_BASE } from "@/lib/api-config"
 
 /** Tier-based terminal poll intervals (ms): Trial/Free 4h, Pro 5m, AI Ultra 30m, Whales 10m. */
 const TERMINAL_POLL_BY_TIER_MS: Record<string, number> = {
@@ -43,28 +44,15 @@ export function TerminalView() {
   const t = useT()
   const userId = useCurrentUserId()
   const botCtx = useBotStatus()
+  const id = userId ?? 0
+  const userStatus = useUserStatus(id)
+  const planTierRaw = (userStatus.data?.plan_tier ?? "trial").toString().trim().toLowerCase()
+  const planTier = planTierRaw === "ai ultra" ? "ai_ultra" : planTierRaw.replace(/\s+/g, "_")
   const [logLines, setLogLines] = useState<string[]>([])
   const [summary, setSummary] = useState<TerminalSummary>(null)
-  const [planTier, setPlanTier] = useState<string>("trial")
   const [pollIntervalMs, setPollIntervalMs] = useState(FIRST_5_MIN_POLL_MS)
   const botStartedAt = useRef<number>(0)
   const preRef = useRef<HTMLPreElement>(null)
-
-  // Fetch user-status for plan_tier when tab mounts
-  useEffect(() => {
-    if (userId == null) return
-    const token = getBackendToken()
-    token.then((tkn) => {
-      const headers: HeadersInit = tkn ? { Authorization: `Bearer ${tkn}` } : {}
-      return fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers })
-    }).then((res) => (res.ok ? res.json() : { plan_tier: "trial" }))
-      .then((data) => {
-        const raw = (data.plan_tier ?? "trial").toString().trim().toLowerCase()
-        const tier = raw === "ai ultra" ? "ai_ultra" : raw.replace(/\s+/g, "_")
-        setPlanTier(tier)
-      })
-      .catch(() => setPlanTier("trial"))
-  }, [userId])
 
   // When we first see bot starting/running, record time; use 10s poll for first 5 min from then, then tier-based
   useEffect(() => {
@@ -82,7 +70,9 @@ export function TerminalView() {
       setSummary(null)
       return
     }
+    let interval: ReturnType<typeof setInterval> | null = null
     const fetchLogs = async () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return
       const token = await getBackendToken()
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
       fetch(`${API_BASE}/terminal-logs/${userId}`, { credentials: "include", headers })
@@ -96,9 +86,25 @@ export function TerminalView() {
           setSummary(null)
         })
     }
-    fetchLogs()
-    const interval = setInterval(fetchLogs, pollIntervalMs)
-    return () => clearInterval(interval)
+    const startPolling = () => {
+      if (interval) clearInterval(interval)
+      fetchLogs()
+      interval = setInterval(fetchLogs, pollIntervalMs)
+    }
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        startPolling()
+      } else if (interval) {
+        clearInterval(interval)
+        interval = null
+      }
+    }
+    startPolling()
+    document.addEventListener("visibilitychange", handleVisibility)
+    return () => {
+      if (interval) clearInterval(interval)
+      document.removeEventListener("visibilitychange", handleVisibility)
+    }
   }, [userId, pollIntervalMs])
 
   // Auto-scroll to bottom when new logs load

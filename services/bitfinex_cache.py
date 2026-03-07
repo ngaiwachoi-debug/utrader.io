@@ -10,17 +10,18 @@ Bitfinex: 10–90 requests/min per endpoint; IP blocked 60s on ERR_RATE_LIMIT.
 - Response headers indicate source (live vs cache) and when cache expires.
 """
 import asyncio
+import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
-# Bitfinex: up to ~90 req/min per endpoint; use conservative per-user limits
-# Min interval between fresh calls per (user_id, endpoint). Increased for dashboard fold + repeat visits.
-CACHE_TTL_WALLETS_SEC = 90   # wallets + credits: 90s
-CACHE_TTL_LENDING_SEC = 120  # funding trades + tickers: 120s
-RATE_LIMIT_COOLDOWN_SEC = 60  # when Bitfinex returns ERR_RATE_LIMIT, don't call again for 60s
+CACHE_TTL_WALLETS_SEC = int(os.getenv("BFX_CACHE_TTL_WALLETS", "90"))
+CACHE_TTL_LENDING_SEC = int(os.getenv("BFX_CACHE_TTL_LENDING", "120"))
+RATE_LIMIT_COOLDOWN_SEC = int(os.getenv("BFX_RATE_LIMIT_COOLDOWN", "60"))
 
-# Cap in-memory entries so 1000+ users don't grow unbounded (evict oldest when over limit).
 MAX_CACHE_ENTRIES = 5000
+
+BFX_CONCURRENCY_LIMIT = int(os.getenv("BFX_CONCURRENCY_LIMIT", "10"))
+_bfx_semaphore = asyncio.Semaphore(BFX_CONCURRENCY_LIMIT)
 
 _cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
 _lock = asyncio.Lock()
@@ -139,3 +140,8 @@ def is_rate_limit_error(err: Optional[str]) -> bool:
     if not err:
         return False
     return "ERR_RATE_LIMIT" in err or "rate limit" in err.lower()
+
+
+def bfx_semaphore():
+    """Acquire global Bitfinex concurrency semaphore to avoid rate-limiting at scale."""
+    return _bfx_semaphore

@@ -97,6 +97,19 @@ const translations: Record<string, TranslationEntry> = {
   "settings.tokenActivitySubtitle": { en: "Subscription, pay-as-you-go, and deductions (newest first).", zh: "訂閱、隨用隨付與扣減記錄（由新到舊）。" },
   "settings.noDeductionHistory": { en: "No deduction history yet.", zh: "尚無扣減記錄。" },
 
+  // Notifications (header popover + settings tab)
+  "notifications.viewAll": { en: "View all", zh: "查看全部" },
+  "notifications.empty": { en: "No notifications yet", zh: "尚無通知" },
+  "notifications.title": { en: "Notifications", zh: "通知" },
+  "notifications.emptyHint": { en: "Announcements and alerts will appear here.", zh: "公告與提醒將顯示於此。" },
+  "notifications.loading": { en: "Loading notifications…", zh: "載入通知中…" },
+  "notifications.retry": { en: "Retry", zh: "重試" },
+  "notifications.refresh": { en: "Refresh", zh: "重新整理" },
+  "notifications.type.info": { en: "Info", zh: "資訊" },
+  "notifications.type.warning": { en: "Warning", zh: "警告" },
+  "notifications.type.announcement": { en: "Announcement", zh: "公告" },
+  "notifications.error": { en: "Could not load notifications.", zh: "無法載入通知。" },
+
   // Login / Landing
   "login.signIn": { en: "Sign in", zh: "登入", ko: "로그인", ru: "Войти", de: "Anmelden" },
   "login.signInWithGoogle": { en: "Sign in with Google", zh: "使用 Google 登入", ko: "Google로 로그인", ru: "Войти через Google", de: "Mit Google anmelden" },
@@ -274,9 +287,21 @@ const translations: Record<string, TranslationEntry> = {
   "subscription.subscribeWhales": { en: "Subscribe to Whales AI", zh: "訂閱 Whales AI" },
   "subscription.comparePlans": { en: "Compare plans", zh: "方案比較" },
   "subscription.featureColumn": { en: "Feature", zh: "功能" },
+  "payment.successTitle": { en: "Payment successful", zh: "付款成功" },
+  "payment.successDescription": { en: "Your plan or tokens are now active. Your balance has been updated.", zh: "您的方案或代幣已生效，餘額已更新。" },
+  "payment.successToast": { en: "Payment successful. Your plan or tokens are active.", zh: "付款成功，方案或代幣已生效。" },
+  "payment.notCompletedTitle": { en: "Payment not completed", zh: "付款未完成" },
+  "payment.notCompletedDescription": { en: "You left before completing payment. You were not charged.", zh: "您尚未完成付款即離開，未產生扣款。" },
+  "payment.notCompletedToast": { en: "Payment not completed. You were not charged.", zh: "付款未完成，未產生扣款。" },
+  "payment.notCompletedMarketing": { en: "Upgrade when you're ready to get more tokens and premium features.", zh: "準備好時可升級以獲得更多代幣與進階功能。" },
+  "payment.completePurchase": { en: "Complete purchase", zh: "完成購買" },
+  "payment.unsuccessfulTitle": { en: "Payment unsuccessful", zh: "付款失敗" },
+  "payment.unsuccessfulDescription": { en: "Please try again or use a different payment method.", zh: "請重試或使用其他付款方式。" },
   "subscription.featureRebalance": { en: "Rebalance interval", zh: "再平衡間隔" },
   "subscription.featureTokenCredit": { en: "Token credit", zh: "代幣額度" },
   "Common.user": { en: "User", zh: "用戶" },
+  "Common.ok": { en: "OK", zh: "確定" },
+  "Common.close": { en: "Close", zh: "關閉" },
 
   // Live Status
   "liveStatus.title": { en: "Live Status", zh: "即時狀態", ko: "실시간 상태", ru: "Статус в реальном времени", de: "Live-Status" },

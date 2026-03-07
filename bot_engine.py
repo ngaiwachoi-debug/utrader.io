@@ -73,7 +73,11 @@ class WallStreet_Omni_FullEngine:
         self.symbol = f"f{currency}"
         self.spot_price = spot_price 
         
-        self.MIN_ORDER_AMT = 150.0 / self.spot_price if self.spot_price > 0 else 0
+        # Bitfinex enforces "minimum is 150.0 dollar or equivalent". For stablecoins
+        # (UST/USDT) that can trade at a slight discount to USD, use a higher base amount
+        # to avoid "incorrect amount" rejections. USD is exactly 1:1 so less margin needed.
+        _min_base = 152.0 if currency.upper() in ("UST", "USDT", "USDt") else 150.50
+        self.MIN_ORDER_AMT = _min_base / self.spot_price if self.spot_price > 0 else 0
         self.SWEEP_AMT = 500.0 / self.spot_price if self.spot_price > 0 else 0
         
         # Dashboard State Tracking
@@ -94,7 +98,9 @@ class WallStreet_Omni_FullEngine:
         self.rest_url = "https://api.bitfinex.com/v2"
         self.ws_url = "wss://api-pub.bitfinex.com/ws/2"
         self.current_frr = 0.0
-        self.chase_discount = 1.0  
+        self.chase_discount = 1.0
+        self._frr_history: list[float] = []
+        self._FRR_HISTORY_MAX = 60
 
         # Predator Matrix Tranches
         self.tranche_senior = 0.50
@@ -200,14 +206,16 @@ class WallStreet_Omni_FullEngine:
                 return (None, False)
 
         async def _run():
-            result, is_10114 = await _do_request()
-            if result is not None:
-                return result
-            if is_10114:
-                self._rebase_nonce_for_10114()
-                await asyncio.sleep(1.5)
-                result, _ = await _do_request()
-                return result
+            max_nonce_retries = 3
+            for attempt in range(1 + max_nonce_retries):
+                result, is_10114 = await _do_request()
+                if result is not None:
+                    return result
+                if is_10114 and attempt < max_nonce_retries:
+                    self._rebase_nonce_for_10114()
+                    await asyncio.sleep(1.0 + attempt * 0.5)
+                    continue
+                return None
             return None
 
         if self._bfx_request_lock is not None:
@@ -248,6 +256,9 @@ class WallStreet_Omni_FullEngine:
                         data = json.loads(msg)
                         if isinstance(data, list) and data[1] != "hb" and len(data[1]) == 16:
                             self.current_frr = float(data[1][0])
+                            self._frr_history.append(self.current_frr)
+                            if len(self._frr_history) > self._FRR_HISTORY_MAX:
+                                self._frr_history = self._frr_history[-self._FRR_HISTORY_MAX:]
             except Exception:
                 await asyncio.sleep(5) 
 
@@ -350,11 +361,14 @@ class WallStreet_Omni_FullEngine:
         """Calculates and submits the 50/30/20 Predator Matrix grid."""
         if full_rebuild:
             wapr, util, loaned = await self.check_portfolio_status()
-            insight = await self.get_ai_insight(wapr, util, loaned)
-            self._log(f"\n[{self._now()}] [User {self.user_id}] 📈 Strategy: {insight}")
+            ai_task = asyncio.ensure_future(self.get_ai_insight(wapr, util, loaned))
             await self._api_request("/auth/w/funding/offer/cancel/all", {"currency": self.wallet_currency})
-            await asyncio.sleep(2)
-            await asyncio.sleep(0.5)  # Let Bitfinex update w[4] before we fetch (reduces 10001 on stale available)
+            await asyncio.sleep(1)
+            try:
+                insight = await asyncio.wait_for(ai_task, timeout=3)
+            except (asyncio.TimeoutError, Exception):
+                insight = f"AI Offline."
+            self._log(f"\n[{self._now()}] [User {self.user_id}] 📈 Strategy: {insight}")
 
         # Same as check script: /auth/r/wallets → w[0]=TYPE, w[1]=CURRENCY, w[2]=BALANCE, w[4]=AVAILABLE_BALANCE
         wallets = await self._api_request("/auth/r/wallets", {})
@@ -383,7 +397,8 @@ class WallStreet_Omni_FullEngine:
             return
         self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Available = {available:,.4f} (w[4]={raw_available:,.4f}, 99% margin)")
 
-        # Strategy B: only place when current rate >= 24h rolling median (gate off if STRATEGY_B_GATE_ENABLED=0)
+        # Strategy B+F: only place when current rate >= 24h rolling median AND showing upward momentum
+        # Momentum filter: current rate above short-term average of recent ticks (backtest: +2.3% APY)
         if _strategy_b_gate_enabled() and self.redis_pool:
             try:
                 snapshot = await get_oracle_snapshot(self.redis_pool)
@@ -392,6 +407,11 @@ class WallStreet_Omni_FullEngine:
                 if median_val is not None and self.current_frr < median_val:
                     self._log(f"[{self._now()}] [User {self.user_id}] Strategy B: {self.symbol} rate {self.current_frr:.6f} below 24h median {median_val:.6f}; skipping this cycle.")
                     return
+                if len(self._frr_history) >= 10:
+                    sma = sum(self._frr_history[-30:]) / len(self._frr_history[-30:])
+                    if self.current_frr < sma and not full_rebuild:
+                        self._log(f"[{self._now()}] [User {self.user_id}] Momentum: {self.symbol} rate {self.current_frr:.6f} < SMA {sma:.6f}; waiting for uptick.")
+                        return
             except Exception as e:
                 self._log(f"[{self._now()}] [User {self.user_id}] Strategy B oracle check error: {e}; placing anyway.")
 
@@ -450,12 +470,18 @@ class WallStreet_Omni_FullEngine:
                 ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": f"{order_amt:.4f}", "rate": str(round(r, 8)), "period": 60, "flags": 64, "label": "TAIL TRAP"})
                 running_balance -= order_amt
 
+        consecutive_fails = 0
         for op in ops:
             lbl = op.pop("label")
             resp = await self._api_request("/auth/w/funding/offer/submit", op)
             if resp is None:
+                consecutive_fails += 1
                 self._log(f"   └─ [{self.wallet_currency}] SUBMIT FAILED | {lbl} | amount={op.get('amount')} (check Bitfinex API response)")
+                if consecutive_fails >= 3:
+                    self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Stopping order submission after {consecutive_fails} consecutive failures.")
+                    break
             else:
+                consecutive_fails = 0
                 self._log(f"   └─ [{self.wallet_currency}] TICKET ISSUED | {lbl:<10} | {float(op['amount']):>10,.4f} | {float(op['rate'])*365*100:>6.2f}% APR | {op.get('period', 0)}d")
             await asyncio.sleep(0.15)
 
@@ -465,20 +491,32 @@ class WallStreet_Omni_FullEngine:
         await self.fetch_instant_snapshot()
         await self.deploy_matrix(full_rebuild=True)
         heartbeat = 0
+        consecutive_loop_errors = 0
         try:
             while True:
-                for _ in range(3):
-                    await asyncio.sleep(60)
-                    await self.check_portfolio_status() # Heartbeat + Redis Broadcast
-                heartbeat += 3
-                if await self.cancel_stuck_senior_orders():
-                    await self.deploy_matrix(full_rebuild=False)
-                    continue
-                if heartbeat % 12 == 0:
-                    await self.deploy_matrix(full_rebuild=True)
-                else:
-                    # Top-up: place orders with any current available (e.g. w[4]) so idle funds get deployed within ~3 min
-                    await self.deploy_matrix(full_rebuild=False)
+                try:
+                    for _ in range(3):
+                        await asyncio.sleep(60)
+                        await self.check_portfolio_status()
+                    heartbeat += 3
+                    if await self.cancel_stuck_senior_orders():
+                        await self.deploy_matrix(full_rebuild=False)
+                        consecutive_loop_errors = 0
+                        continue
+                    if heartbeat % 12 == 0:
+                        await self.deploy_matrix(full_rebuild=True)
+                    else:
+                        await self.deploy_matrix(full_rebuild=False)
+                    consecutive_loop_errors = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    consecutive_loop_errors += 1
+                    self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Loop error ({consecutive_loop_errors}): {type(e).__name__}: {e}")
+                    if consecutive_loop_errors >= 5:
+                        self._log(f"[{self._now()}] [User {self.user_id}] [{self.wallet_currency}] Too many consecutive errors; exiting engine.")
+                        return
+                    await asyncio.sleep(30)
         except asyncio.CancelledError:
             await self._api_request("/auth/w/funding/offer/cancel/all", {"currency": self.wallet_currency})
             raise
@@ -494,26 +532,97 @@ class PortfolioManager:
         self._nonce_lock = threading.Lock()
         self._bfx_request_lock = asyncio.Lock()
 
-    async def _api_request(self, path: str, body: dict = None):
+    async def _rebase_nonce_for_10114(self) -> int:
+        """Re-base nonce above current time for PortfolioManager. Returns the rebased nonce value."""
+        # Use a much larger buffer (30 seconds) to ensure nonce is always valid
+        now_us = int(time.time() * 1000000) + 30000000  # 30 seconds buffer
         if self.redis_pool:
-            nonce = await get_next_nonce(self.redis_pool, self.api_key)
-        else:
-            self._nonce = max(self._nonce + 1, int(time.time() * 1000000))
-            nonce = str(self._nonce)
-        body_str = json.dumps(body or {}) if body else "{}"
-        headers = {"bfx-nonce": nonce, "bfx-apikey": self.api_key, "Content-Type": "application/json",
-                   "bfx-signature": hmac.new(self.api_secret.encode(), f"/api/v2{path}{nonce}{body_str}".encode(), hashlib.sha384).hexdigest()}
-        async with aiohttp.ClientSession() as s:
-            async with s.post(f"https://api.bitfinex.com/v2{path}", headers=headers, json=body) as r:
-                return await r.json() if r.status == 200 else None
+            try:
+                from services.bitfinex_nonce import nonce_key
+                key = nonce_key(self.api_key)
+                await self.redis_pool.set(key, str(now_us), ex=86400)
+                log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] Rebased Redis nonce {key} to {now_us}"
+                print(log_msg)
+                if self.log_lines is not None:
+                    self.log_lines.append(log_msg)
+            except Exception as e:
+                log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] Failed to rebase Redis nonce: {e}"
+                print(log_msg)
+                if self.log_lines is not None:
+                    self.log_lines.append(log_msg)
+        self._nonce = now_us
+        self._shared_nonce[0] = now_us
+        return now_us
+
+    async def _api_request(self, path: str, body: dict = None, use_rebased_nonce: int | None = None):
+        rebased_nonce_ref = [use_rebased_nonce]  # Use list for mutable closure
+        async def _do_request() -> tuple[dict | list | None, bool]:
+            if rebased_nonce_ref[0] is not None:
+                # Use the rebased nonce directly for retry
+                nonce = str(rebased_nonce_ref[0])
+            elif self.redis_pool:
+                nonce = await get_next_nonce(self.redis_pool, self.api_key)
+            else:
+                self._nonce = max(self._nonce + 1, int(time.time() * 1000000))
+                nonce = str(self._nonce)
+            body_str = json.dumps(body or {}) if body else "{}"
+            headers = {"bfx-nonce": nonce, "bfx-apikey": self.api_key, "Content-Type": "application/json",
+                       "bfx-signature": hmac.new(self.api_secret.encode(), f"/api/v2{path}{nonce}{body_str}".encode(), hashlib.sha384).hexdigest()}
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(f"https://api.bitfinex.com/v2{path}", headers=headers, json=body, timeout=10) as r:
+                        if r.status != 200:
+                            body_text = await r.text()
+                            log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] API {path} → HTTP {r.status} | {body_text[:200]}"
+                            print(log_msg)
+                            if self.log_lines is not None:
+                                self.log_lines.append(log_msg)
+                            is_nonce = WallStreet_Omni_FullEngine._is_nonce_error(r.status, body_text)
+                            return (None, is_nonce)
+                        out = await r.json()
+                        if isinstance(out, list) and len(out) > 0 and out[0] == "error":
+                            log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] API {path} → error response: {out}"
+                            print(log_msg)
+                            if self.log_lines is not None:
+                                self.log_lines.append(log_msg)
+                            is_nonce = WallStreet_Omni_FullEngine._is_nonce_error(200, out)
+                            return (None, is_nonce)
+                        return (out, False)
+            except Exception as e:
+                log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] API Error ({path}): {e}"
+                print(log_msg)
+                if self.log_lines is not None:
+                    self.log_lines.append(log_msg)
+                return (None, False)
+        
+        async def _run():
+            max_nonce_retries = 3
+            for attempt in range(1 + max_nonce_retries):
+                result, is_10114 = await _do_request()
+                if result is not None:
+                    return result
+                if is_10114 and attempt < max_nonce_retries:
+                    log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] Nonce error (attempt {attempt+1}/{max_nonce_retries}), rebasing..."
+                    print(log_msg)
+                    if self.log_lines is not None:
+                        self.log_lines.append(log_msg)
+                    rebased_nonce_us = await self._rebase_nonce_for_10114()
+                    rebased_nonce_ref[0] = rebased_nonce_us
+                    await asyncio.sleep(1.0 + attempt * 0.5)
+                    continue
+                return None
+            return None
+        
+        async with self._bfx_request_lock:
+            return await _run()
 
     async def scan_and_launch(self):
         msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] [SCANNER] Initializing..."
         print(msg)
         if self.log_lines is not None:
             self.log_lines.append(msg)
-        async with self._bfx_request_lock:
-            wallets = await self._api_request("/auth/r/wallets", {})
+        # _api_request already handles the lock internally, don't double-lock
+        wallets = await self._api_request("/auth/r/wallets", {})
         # Sync shared_nonce so engines (when not using Redis) continue from same counter
         if not self.redis_pool:
             self._shared_nonce[0] = self._nonce
@@ -544,7 +653,7 @@ class PortfolioManager:
         print(msg2)
         if self.log_lines is not None:
             self.log_lines.append(msg2)
-        engines = []
+        engine_coros = []
         shared_nonce_ref = (self._shared_nonce, self._nonce_lock)
         for w in funding:
             engine = WallStreet_Omni_FullEngine(
@@ -552,9 +661,16 @@ class PortfolioManager:
                 self.redis_pool, self.log_lines, shared_nonce_ref=shared_nonce_ref,
                 bfx_request_lock=self._bfx_request_lock,
             )
-            engines.append(engine.run_loop())
-        if engines:
-            await asyncio.gather(*engines)
+            engine_coros.append(engine.run_loop())
+        if engine_coros:
+            results = await asyncio.gather(*engine_coros, return_exceptions=True)
+            for i, r in enumerate(results):
+                if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                    curr = funding[i][1] if i < len(funding) else "?"
+                    err = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] [{curr}] Engine exited with error: {type(r).__name__}: {r}"
+                    print(err)
+                    if self.log_lines is not None:
+                        self.log_lines.append(err)
 
 
 def _load_iqm_baselines() -> dict:

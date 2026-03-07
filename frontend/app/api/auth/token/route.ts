@@ -1,5 +1,5 @@
 import { getToken } from "next-auth/jwt"
-import { NextResponse } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
 import { SignJWT } from "jose"
 
 const encoder = new TextEncoder()
@@ -8,7 +8,7 @@ const encoder = new TextEncoder()
  * Returns a backend-compatible JWT signed with NEXTAUTH_SECRET (sub, email).
  * Frontend sends this as Authorization: Bearer <token> to the FastAPI backend.
  */
-export async function GET(request: Request) {
+export async function GET(request: NextRequest) {
   const rawSecret = process.env.NEXTAUTH_SECRET
   const secret = typeof rawSecret === "string" ? rawSecret.trim() : ""
   if (!secret) {
@@ -18,7 +18,7 @@ export async function GET(request: Request) {
     )
   }
   const token = await getToken({
-    req: request as unknown as { headers: Headers; url?: string },
+    req: request,
     secret,
   })
   if (!token?.email) {

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   Wallet,
   DollarSign,
@@ -70,11 +70,15 @@ export function LiveStatus() {
   const [refreshCooldownUntil, setRefreshCooldownUntil] = useState(0)
   const [refreshCooldownSec, setRefreshCooldownSec] = useState(0)
   const [ledgerPage, setLedgerPage] = useState(1)
+  const lastCooldownSecRef = useRef(0)
 
   useEffect(() => {
     const interval = setInterval(() => {
       const remaining = Math.max(0, Math.ceil((refreshCooldownUntil - Date.now()) / 1000))
-      setRefreshCooldownSec(remaining)
+      if (remaining !== lastCooldownSecRef.current) {
+        lastCooldownSecRef.current = remaining
+        setRefreshCooldownSec(remaining)
+      }
     }, 1000)
     return () => clearInterval(interval)
   }, [refreshCooldownUntil])
@@ -83,6 +87,17 @@ export function LiveStatus() {
     const len = wallets.data?.credits_detail?.length ?? 0
     if (len > 0) setLedgerPage(1)
   }, [wallets.data?.credits_detail?.length])
+
+  // When Live Status tab is shown, ensure we have data: refetch once after a short delay so we don't rely only on
+  // initial prefetch (which may still be in progress or may have failed).
+  useEffect(() => {
+    if (userId == null) return
+    const t = setTimeout(() => {
+      if (!wallets.data) void wallets.refetch()
+      if (!botStats.data) void botStats.refetch()
+    }, 600)
+    return () => clearTimeout(t)
+  }, [userId])
 
   const handleRefresh = () => {
     if (userId == null) return
@@ -160,6 +175,11 @@ export function LiveStatus() {
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             {walletError ?? (displayWalletSummary ? t("liveStatus.totalUsdValue") : loading ? t("liveStatus.loading") : "—")}
+            {walletError === "Data incomplete" && (
+              <span className="block mt-1 text-amber-600 dark:text-amber-400">
+                Wallet totals ($) come from Bitfinex; snapshot failed (Redis/nonce or rate limit). Token amount and other pages use the app DB and load separately. Use <strong>Refresh</strong> above to retry.
+              </span>
+            )}
             {!loading && !walletError && (displayTotalUsd ?? 0) === 0 && (
               <span className="block mt-1 text-amber-600 dark:text-amber-400">
                 No data: Connect Bitfinex API keys with wallets/read permission, or the API may be rate limited. Total USD is from Bitfinex funding wallets only.
@@ -243,7 +263,7 @@ export function LiveStatus() {
               }}
             />
             <div
-              className="h-full bg-amber-500/80 transition-all"
+              className="h-full bg-amber-600 dark:bg-amber-500/80 transition-all"
               style={{
                 width: `${!displayWalletSummary ? 0 : (() => {
                   const offers = displayWalletSummary.total_offers_usd ?? 0
@@ -269,7 +289,7 @@ export function LiveStatus() {
               {t("liveStatus.earning")}
             </span>
             <span className="flex items-center gap-1.5">
-              <span className="h-2 w-4 rounded-full bg-amber-500/80" />
+              <span className="h-2 w-4 rounded-full bg-amber-600 dark:bg-amber-500/80" />
               {t("liveStatus.inOrderBook")}
             </span>
             <span className="flex items-center gap-1.5">
@@ -370,7 +390,7 @@ export function LiveStatus() {
                         title={`Amount lent: $${lent.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
                       />
                       <div
-                        className="h-full bg-amber-500/80 transition-all"
+                        className="h-full bg-amber-600 dark:bg-amber-500/80 transition-all"
                         style={{ width: `${Math.min(100, pct(offers))}%` }}
                         title={`Pending: $${offers.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
                       />
@@ -386,7 +406,7 @@ export function LiveStatus() {
                         {t("liveStatus.earning")}: ${lent.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </span>
                       <span className="flex items-center gap-1.5">
-                        <span className="h-1.5 w-3 rounded-full bg-amber-500/80" />
+                        <span className="h-1.5 w-3 rounded-full bg-amber-600 dark:bg-amber-500/80" />
                         {t("liveStatus.inOrderBook")}: ${offers.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </span>
                       <span className="flex items-center gap-1.5">

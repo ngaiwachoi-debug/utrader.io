@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 
+from services.bitfinex_nonce import get_next_nonce_sync
+
 
 BASE_URL = "https://api.bitfinex.com"
 TICKERS_URL = "https://api.bitfinex.com/v2/tickers"
@@ -76,7 +78,7 @@ def _post_sync(api_key: str, api_secret: str, endpoint: str, payload: Optional[D
     Uses requests.post(..., data=json_body) so Bitfinex receives the same bytes we signed.
     """
     payload = payload if payload is not None else {}
-    nonce = str(int(time.time() * 1000000))
+    nonce = get_next_nonce_sync(api_key)
     json_body = json.dumps(payload, separators=(",", ":"))
     signature_payload = f"/api/{endpoint}{nonce}{json_body}"
     signature = hmac.new(

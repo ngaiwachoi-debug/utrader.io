@@ -74,11 +74,10 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
         const id = data.id != null ? Number(data.id) : null
         setUserId(id)
       } else {
-        // Fallback: when /api/me fails (e.g. backend auth/DB issue) but we have a token, use 2 so dashboard can load
-        setUserId(2)
+        setUserId(null)
       }
     } catch {
-      setUserId(2)
+      setUserId(null)
     } finally {
       setIsLoading(false)
     }

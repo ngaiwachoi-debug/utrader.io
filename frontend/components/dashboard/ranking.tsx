@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react"
 import { Trophy, ChevronLeft, ChevronRight, DollarSign, TrendingUp, Zap, Crown, Shield } from "lucide-react"
 
-const API_BACKEND = "/api-backend"
+import { API_BASE as API_BACKEND } from "@/lib/api-config"
 
 type RankingRow = {
   rank: number

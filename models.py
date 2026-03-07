@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Boolean, Column, Date, Integer, String, Float, DateTime, ForeignKey, Text
+from sqlalchemy import BigInteger, Boolean, Column, Date, Index, Integer, String, Float, DateTime, ForeignKey, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -28,10 +28,8 @@ class User(Base):
     # Lifecycle status – used by the kill switch
     status = Column(String, default="active")  # active / expired
 
-    # Bot process state (updated by API on start/stop and by worker on run/exit)
-    bot_status = Column(String, default="stopped")  # stopped | running | starting
-    # Desired state (Plan C): running | stopped; worker reconciles to this
-    bot_desired_state = Column(String(20), default="stopped")  # running | stopped
+    bot_status = Column(String, default="stopped", index=True)
+    bot_desired_state = Column(String(20), default="stopped", index=True)
 
     # Monthly API key deletion count for abuse detection (persisted; {"YYYY-MM": count})
     key_deletions = Column(Text, default="{}", nullable=True)  # JSON: {"2026-02": 2}
@@ -245,7 +243,7 @@ class AdminNotification(Base):
     title = Column(String(255), nullable=False)
     content = Column(Text, nullable=True)
     type = Column(String(32), default="info")  # info | warning | announcement
-    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # null = all users
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

@@ -1,9 +1,10 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { useSearchParams, useRouter, usePathname } from "next/navigation"
 import { useSession } from "next-auth/react"
-import { DollarSign, Activity, Settings, CreditCard } from "lucide-react"
+import { DollarSign, Activity, Settings, CreditCard, Trophy } from "lucide-react"
+import { toast } from "sonner"
 import { Sidebar } from "@/components/dashboard/sidebar"
 import { Header } from "@/components/dashboard/header"
 import { ProfitCenter } from "@/components/dashboard/profit-center"
@@ -16,6 +17,15 @@ import { Ranking } from "@/components/dashboard/ranking"
 import { TerminalView } from "@/components/dashboard/terminal-view"
 import { SettingsPage } from "@/components/dashboard/settings"
 import { MobileMenuDrawer } from "@/components/dashboard/mobile-menu-drawer"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Button } from "@/components/ui/button"
 import { useT } from "@/lib/i18n"
 import { DateRangeProvider } from "@/lib/date-range-context"
 import { CurrentUserProvider, useCurrentUserId } from "@/lib/current-user-context"
@@ -65,35 +75,71 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
   const [activePage, setActivePage] = useState("profit-center")
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [paymentReturnStatus, setPaymentReturnStatus] = useState<"success" | "cancel" | null>(null)
+  const paymentProcessedRef = useRef(false)
+  const prefetchedUserIdRef = useRef<number | null>(null)
 
   useEffect(() => {
-    if (userId != null) prefetch(userId)
+    if (userId != null && prefetchedUserIdRef.current !== userId) {
+      prefetchedUserIdRef.current = userId
+      prefetch(userId)
+    }
   }, [userId, prefetch])
 
   useEffect(() => {
-    if (searchParams?.get("page") === "subscription") setActivePage("subscription")
+    const page = searchParams?.get("page")
+    if (page === "subscription") setActivePage("subscription")
+    if (page === "settings") setActivePage("settings")
   }, [searchParams])
 
   useEffect(() => {
     const sub = searchParams?.get("subscription")
     const tokens = searchParams?.get("tokens")
     const isSuccess = sub === "success" || tokens === "success"
-    if (!isSuccess || userId == null) return
-    getUserStatus(id).refetch()
-    getWallets(id).refetch()
-    getTokenBalance(id).refetch()
-    const next = new URLSearchParams(searchParams?.toString() ?? "")
-    next.delete("subscription")
-    next.delete("tokens")
-    const q = next.toString()
-    router.replace(pathname + (q ? `?${q}` : ""))
-  }, [searchParams?.get("subscription"), searchParams?.get("tokens"), userId, pathname, id, getUserStatus, getWallets, getTokenBalance, router])
+    const isCancel = sub === "cancel"
+    
+    if (!isSuccess && !isCancel) {
+      paymentProcessedRef.current = false
+      return
+    }
+
+    if (paymentProcessedRef.current) return
+    paymentProcessedRef.current = true
+
+    const clearUrl = () => {
+      const next = new URLSearchParams(searchParams?.toString() ?? "")
+      next.delete("subscription")
+      next.delete("tokens")
+      const q = next.toString()
+      router.replace(pathname + (q ? `?${q}` : ""))
+    }
+
+    if (isSuccess && userId != null) {
+      ;(async () => {
+        await Promise.all([
+          getUserStatus(id).refetch(),
+          getWallets(id).refetch(),
+          getTokenBalance(id).refetch(),
+        ])
+        toast.success(t("payment.successToast"))
+        setPaymentReturnStatus("success")
+        clearUrl()
+      })()
+      return
+    }
+
+    if (isCancel) {
+      toast.info(t("payment.notCompletedToast"))
+      setPaymentReturnStatus("cancel")
+      clearUrl()
+    }
+  }, [searchParams?.get("subscription"), searchParams?.get("tokens"), userId, pathname, id, getUserStatus, getWallets, getTokenBalance, router, searchParams, t])
 
   const handleUpgrade = () => setActivePage("subscription")
 
   return (
     <div className="min-h-screen bg-background" suppressHydrationWarning>
-      <BotStatusProvider onUpgradeClick={handleUpgrade}>
+      <BotStatusProvider onUpgradeClick={handleUpgrade} onSettingsClick={() => setActivePage("settings")}>
         <Sidebar
           activePage={activePage}
           onPageChange={setActivePage}
@@ -132,6 +178,43 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
         </div>
 
         <MobileNav activePage={activePage} onPageChange={setActivePage} t={t} />
+
+        <Dialog open={paymentReturnStatus === "success"} onOpenChange={(open) => !open && setPaymentReturnStatus(null)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{t("payment.successTitle")}</DialogTitle>
+              <DialogDescription>{t("payment.successDescription")}</DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button onClick={() => setPaymentReturnStatus(null)}>{t("Common.ok")}</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={paymentReturnStatus === "cancel"} onOpenChange={(open) => !open && setPaymentReturnStatus(null)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{t("payment.notCompletedTitle")}</DialogTitle>
+              <DialogDescription>
+                {t("payment.notCompletedDescription")}
+                <span className="mt-2 block text-foreground">{t("payment.notCompletedMarketing")}</span>
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setPaymentReturnStatus(null)}>
+                {t("Common.close")}
+              </Button>
+              <Button
+                onClick={() => {
+                  setPaymentReturnStatus(null)
+                  setActivePage("subscription")
+                }}
+              >
+                {t("payment.completePurchase")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </BotStatusProvider>
     </div>
   )
@@ -148,6 +231,7 @@ function MobileNav({
 }) {
   const items = [
     { id: "profit-center", labelKey: "nav.profit", Icon: DollarSign },
+    { id: "leaderboard", labelKey: "sidebar.leaderboard", Icon: Trophy },
     { id: "live-status", labelKey: "nav.live", Icon: Activity },
     { id: "subscription", labelKey: "sidebar.subscription", Icon: CreditCard },
     { id: "settings", labelKey: "nav.settings", Icon: Settings },

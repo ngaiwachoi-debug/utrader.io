@@ -1,14 +1,14 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState } from "react"
 import { Crown, Users, Zap, Check, Loader2, ChevronDown, ChevronUp, Coins, ArrowDownCircle } from "lucide-react"
 import { useT } from "@/lib/i18n"
 import { useCurrentUserId } from "@/lib/current-user-context"
-import { useDeductionMultiplier, useDashboardData } from "@/lib/dashboard-data-context"
+import { useDeductionMultiplier, useDashboardData, useUserStatus, useTokenBalance } from "@/lib/dashboard-data-context"
 import { getBackendToken } from "@/lib/auth"
 import { calculateTotalBudget, calculateUsagePercentage } from "@/lib/calculateTokenUsage"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+import { API_BASE } from "@/lib/api-config"
 const SHOW_DEV_BILLING = process.env.NEXT_PUBLIC_SHOW_DEV_BILLING === "true"
 
 type Plan = "pro" | "ai_ultra" | "whales"
@@ -26,11 +26,7 @@ const WHALES_TOKENS = 40000
 const PRESET_USD = [10, 25, 50]
 const TOKENS_PER_USD = 100
 
-type TokenBalanceState = {
-  tokens_remaining: number
-  total_tokens_added: number
-  total_tokens_deducted: number
-}
+type TokenBalanceState = { tokens_remaining: number; total_tokens_added: number; total_tokens_deducted: number }
 
 export function Subscription() {
   const t = useT()
@@ -38,80 +34,28 @@ export function Subscription() {
   const deductionMultiplier = useDeductionMultiplier()
   const { getUserStatus, getWallets, getTokenBalance } = useDashboardData()
   const id = userId ?? 0
+
+  const userStatus = useUserStatus(id)
+  const planTier = (userStatus.data?.plan_tier || "trial").toLowerCase()
+
+  const { data: tokenBalanceCtx, refetch: refetchTokenBalance } = useTokenBalance(id)
+  const tokenBalance: TokenBalanceState | null = tokenBalanceCtx
+    ? {
+        tokens_remaining: tokenBalanceCtx.tokens_remaining,
+        total_tokens_added: tokenBalanceCtx.total_tokens_added,
+        total_tokens_deducted: tokenBalanceCtx.total_tokens_deducted,
+      }
+    : null
+  const tokenBalanceLoading = userId != null && tokenBalanceCtx == null
+  const tokenBalanceError: string | null = null
+
   const [loading, setLoading] = useState<string | null>(null)
-  const [planTier, setPlanTier] = useState<string>("trial")
-  const [tokenBalance, setTokenBalance] = useState<TokenBalanceState | null>(null)
-  const [tokenBalanceLoading, setTokenBalanceLoading] = useState(true)
-  const [tokenBalanceError, setTokenBalanceError] = useState<string | null>(null)
   const [interval, setInterval] = useState<Interval>("monthly")
   const [addTokensUsd, setAddTokensUsd] = useState<string>("")
   const [loadingTokens, setLoadingTokens] = useState(false)
   const [depositMessage, setDepositMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [bypassPayment, setBypassPayment] = useState(false)
   const [faqOpen, setFaqOpen] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (userId == null) return
-    let cancelled = false
-    const run = async () => {
-      try {
-        const token = await getBackendToken()
-        const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-        const res = await fetch(`${API_BASE}/user-status/${userId}`, { credentials: "include", headers })
-        if (cancelled || !res.ok) return
-        const data = await res.json()
-        setPlanTier((data.plan_tier || "trial").toLowerCase())
-      } catch {
-        /* ignore */
-      }
-    }
-    run()
-    return () => { cancelled = true }
-  }, [userId])
-
-  useEffect(() => {
-    if (userId == null) {
-      setTokenBalance(null)
-      setTokenBalanceLoading(false)
-      setTokenBalanceError(null)
-      return
-    }
-    let cancelled = false
-    const fetchTokenBalance = async () => {
-      const token = await getBackendToken()
-      if (!token) {
-        if (!cancelled) setTokenBalanceLoading(false)
-        return
-      }
-      try {
-        const res = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, {
-          credentials: "include",
-          headers: { Authorization: `Bearer ${token}` },
-        })
-        if (cancelled) return
-        if (res.ok) {
-          const data = await res.json()
-          if (!cancelled) {
-            setTokenBalance({
-              tokens_remaining: Number(data.tokens_remaining) ?? 0,
-              total_tokens_added: Number(data.total_tokens_added) ?? 0,
-              total_tokens_deducted: Number(data.total_tokens_deducted) ?? 0,
-            })
-            setTokenBalanceError(null)
-          }
-        } else {
-          if (!cancelled) setTokenBalanceError(t("settings.tokenDataContactSupport"))
-        }
-      } catch {
-        if (!cancelled) setTokenBalanceError(t("settings.tokenUsageFailed"))
-      } finally {
-        if (!cancelled) setTokenBalanceLoading(false)
-      }
-    }
-    setTokenBalanceLoading(true)
-    fetchTokenBalance()
-    return () => { cancelled = true }
-  }, [userId])
 
   const handleSubscribe = async (plan: Plan, planInterval: Interval) => {
     const { getBackendToken } = await import("@/lib/auth")
@@ -134,12 +78,6 @@ export function Subscription() {
         if (res.ok && data.status === "success") {
           setDepositMessage({ type: "success", text: data.message ?? `${data.tokens_awarded} tokens added.` })
           if (userId != null) {
-            const balanceRes = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, { credentials: "include", headers: { Authorization: `Bearer ${token}` } })
-            if (balanceRes.ok) {
-              const bal = await balanceRes.json()
-              setTokenBalance({ tokens_remaining: Number(bal.tokens_remaining) ?? 0, total_tokens_added: Number(bal.total_tokens_added) ?? 0, total_tokens_deducted: Number(bal.total_tokens_deducted) ?? 0 })
-              setTokenBalanceError(null)
-            }
             getUserStatus(id).refetch()
             getWallets(id).refetch()
             getTokenBalance(id).refetch()
@@ -226,19 +164,6 @@ export function Subscription() {
         })
         setAddTokensUsd("")
         if (userId != null) {
-          const balanceRes = await fetch(`${API_BASE}/api/v1/users/me/token-balance`, {
-            credentials: "include",
-            headers: { Authorization: `Bearer ${token}` },
-          })
-          if (balanceRes.ok) {
-            const bal = await balanceRes.json()
-            setTokenBalance({
-              tokens_remaining: Number(bal.tokens_remaining) ?? 0,
-              total_tokens_added: Number(bal.total_tokens_added) ?? 0,
-              total_tokens_deducted: Number(bal.total_tokens_deducted) ?? 0,
-            })
-            setTokenBalanceError(null)
-          }
           getUserStatus(id).refetch()
           getWallets(id).refetch()
           getTokenBalance(id).refetch()

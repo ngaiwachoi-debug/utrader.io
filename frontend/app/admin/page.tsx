@@ -66,7 +66,7 @@ type DeductionEntry = {
 
 type Health = { redis: string; db: string }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
+import { API_BASE } from "@/lib/api-config"
 
 const LOCALE_REGEX = /^\/(en|zh|ko|ru|de|pt|fil|id|ja)(\/|$)/
 function getLocaleFromPath(path: string | null): string {
@@ -146,6 +146,7 @@ function AdminSettingsFormInline({ settings, loading, backendToken, onSave }: { 
         const v5 = local.referral_system_enabled; if (v5 !== undefined && v5 !== "") body.referral_system_enabled = v5 === "true"
         const v6 = local.withdrawal_enabled; if (v6 !== undefined && v6 !== "") body.withdrawal_enabled = v6 === "true"
         const v7 = local.maintenance_mode; if (v7 !== undefined && v7 !== "") body.maintenance_mode = v7 === "true"
+        const v8 = local.api_keys_help_url; if (v8 !== undefined && v8 !== "") body.api_keys_help_url = String(v8).trim()
         const res = await fetch(`${API_BASE}/admin/settings/update`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${backendToken}` }, body: JSON.stringify(body) })
         if (res.ok) { onSave(); toast.success("Settings saved") } else toast.error("Save failed")
       }}>Save</Button>

@@ -9,6 +9,7 @@ const DEV_BACKEND_TOKEN_KEY = "bifinexbot_dev_backend_token"
 let cachedBackendToken: string | null = null
 let cacheExpiry = 0
 const CACHE_MS = 5 * 60 * 1000 // 5 min
+let inFlightTokenPromise: Promise<string | null> | null = null
 
 /** Get a JWT to send to the FastAPI backend (from NextAuth session or dev token). */
 export async function getBackendToken(): Promise<string | null> {
@@ -22,6 +23,14 @@ export async function getBackendToken(): Promise<string | null> {
   if (cachedBackendToken && Date.now() < cacheExpiry) {
     return cachedBackendToken
   }
+  if (inFlightTokenPromise) return inFlightTokenPromise
+  inFlightTokenPromise = _fetchBackendToken().finally(() => {
+    inFlightTokenPromise = null
+  })
+  return inFlightTokenPromise
+}
+
+async function _fetchBackendToken(): Promise<string | null> {
   try {
     const res = await fetch("/api/auth/token", { credentials: "include" })
     if (!res.ok) return null

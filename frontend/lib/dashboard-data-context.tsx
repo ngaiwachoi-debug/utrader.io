@@ -33,8 +33,8 @@ export type WalletSummary = {
   offers_detail?: CreditDetail[]
 }
 
-export type BotStatsData = { active: boolean; total_loaned: number }
-export type UserStatusData = { tokens_remaining: number | null; plan_tier: string | null }
+export type BotStatsData = { active: boolean; total_loaned: number; bot_status: string; has_api_keys: boolean }
+export type UserStatusData = { tokens_remaining: number | null; plan_tier: string | null; pro_expiry: string | null; created_at: string | null }
 
 export type TokenBalanceData = {
   tokens_remaining: number
@@ -305,11 +305,13 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
       if (res.ok) {
         const raw = await res.json().catch(() => ({}))
         const data = normalizeWalletSummary(raw)
+        const incomplete = res.headers.get("X-Data-Incomplete") === "true"
+        const errorMessage = incomplete ? "Data incomplete" : null
         updateState((prev) => ({
           ...prev,
           wallets: {
             ...prev.wallets,
-            [userId]: { data, fetchedAt: Date.now(), error: null, source, rateLimited, errorMessage: null },
+            [userId]: { data, fetchedAt: Date.now(), error: errorMessage, source, rateLimited, errorMessage },
           },
         }))
         saveToStorage(`${STORAGE_PREFIX}:${userId}:wallets`, { data, fetchedAt: Date.now(), source })
@@ -349,12 +351,14 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
         const data = await res.json().catch(() => ({}))
         const active = Boolean(data.active)
         const total_loaned = parseFloat(String(data.total_loaned ?? "0").replace(/,/g, ""))
+        const bot_status = typeof data.bot_status === "string" ? data.bot_status : "stopped"
+        const has_api_keys = Boolean(data.has_api_keys)
         updateState((prev) => ({
           ...prev,
           botStats: {
             ...prev.botStats,
             [userId]: {
-              data: { active, total_loaned: Number.isFinite(total_loaned) ? total_loaned : 0 },
+              data: { active, total_loaned: Number.isFinite(total_loaned) ? total_loaned : 0, bot_status, has_api_keys },
               fetchedAt: Date.now(),
               error: null,
               source: "live",
@@ -394,12 +398,14 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
         const data = await res.json().catch(() => ({}))
         const tokens_remaining = typeof data.tokens_remaining === "number" ? data.tokens_remaining : null
         const plan_tier = typeof data.plan_tier === "string" ? data.plan_tier : null
+        const pro_expiry = typeof data.pro_expiry === "string" ? data.pro_expiry : null
+        const created_at = typeof data.created_at === "string" ? data.created_at : null
         updateState((prev) => ({
           ...prev,
           userStatus: {
             ...prev.userStatus,
             [userId]: {
-              data: { tokens_remaining, plan_tier },
+              data: { tokens_remaining, plan_tier, pro_expiry, created_at },
               fetchedAt: Date.now(),
               error: null,
               source: "live",
@@ -599,23 +605,54 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     async (userId: number): Promise<boolean> => {
       const token = await getBackendToken()
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-      const res = await fetch(`${API_BACKEND}/api/dashboard-fold`, { credentials: "include", headers })
-      if (!res.ok) return false
+      
+      let res: Response | null = null
+      let attempt = 0
+      const maxAttempts = 3
+      const delays = [1000, 2000]
+
+      while (attempt < maxAttempts) {
+        try {
+          res = await fetch(`${API_BACKEND}/api/dashboard-fold`, { credentials: "include", headers })
+          if (res.ok || (res.status !== 503 && res.status !== 502 && res.status !== 504)) {
+            break
+          }
+        } catch (e) {
+          // Network error
+        }
+        attempt++
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, delays[attempt - 1] || 2000))
+        }
+      }
+
+      if (!res || !res.ok) return false
+      const backendUserIdHeader = res.headers.get("X-Authenticated-User-Id")
+      const backendUserId = backendUserIdHeader != null ? Number(backendUserIdHeader) : null
+      if (backendUserId != null && Number.isFinite(backendUserId) && backendUserId !== userId) {
+        if (typeof window !== "undefined") {
+          console.warn("[dashboard-fold] User id mismatch: frontend requested", userId, "backend returned data for", backendUserId)
+        }
+      }
       const raw = await res.json().catch(() => ({}))
       const now = Date.now()
       const walletsData = normalizeWalletSummary(raw.wallets ?? {})
       const botStatsRaw = raw.botStats ?? {}
-      const botStatsData = {
+      const botStatsData: BotStatsData = {
         active: Boolean(botStatsRaw.active),
         total_loaned: (() => {
           const v = parseFloat(String(botStatsRaw.total_loaned ?? "0").replace(/,/g, ""))
           return Number.isFinite(v) ? v : 0
         })(),
+        bot_status: typeof botStatsRaw.bot_status === "string" ? botStatsRaw.bot_status : "stopped",
+        has_api_keys: Boolean(botStatsRaw.has_api_keys),
       }
       const userStatusRaw = raw.userStatus ?? {}
       const userStatusData = {
         tokens_remaining: typeof userStatusRaw.tokens_remaining === "number" ? userStatusRaw.tokens_remaining : null,
         plan_tier: typeof userStatusRaw.plan_tier === "string" ? userStatusRaw.plan_tier : null,
+        pro_expiry: typeof userStatusRaw.pro_expiry === "string" ? userStatusRaw.pro_expiry : null,
+        created_at: typeof userStatusRaw.created_at === "string" ? userStatusRaw.created_at : null,
       }
       const lendingData = normalizeLendingStats((raw.lending ?? {}) as Record<string, unknown>)
       const mult = typeof (raw as Record<string, unknown>).deduction_multiplier === "number"
@@ -629,12 +666,13 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
             total_tokens_deducted: Number(tb.total_tokens_deducted ?? 0),
           }
         : null
+      const walletErrorMsg = (raw.wallets as Record<string, unknown> | undefined)?.message === "No data yet" ? "Data incomplete" : null
       updateState((prev) => ({
         ...prev,
         deductionMultiplier: mult,
         wallets: {
           ...prev.wallets,
-          [userId]: { data: walletsData, fetchedAt: now, error: null, source: "live", rateLimited: false, errorMessage: null },
+          [userId]: { data: walletsData, fetchedAt: now, error: walletErrorMsg, source: "live", rateLimited: false, errorMessage: walletErrorMsg },
         },
         botStats: {
           ...prev.botStats,
@@ -850,9 +888,40 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     [state.referralData, state.version, getReferralDataEntry, needReferralDataFetch]
   )
 
+  const hydratedRef = useRef<Partial<Record<number, true>>>({})
+
   const prefetch = useCallback(
     (userId: number) => {
       if (inFlightFold.current[userId]) return
+
+      if (!hydratedRef.current[userId] && typeof window !== "undefined") {
+        hydratedRef.current[userId] = true
+        const cachedWallets = loadFromStorage<{ data: WalletSummary; fetchedAt: number; source: "live" | "cache" }>(
+          `${STORAGE_PREFIX}:${userId}:wallets`
+        )
+        const cachedLending = loadFromStorage<{ data: LendingStatsData; fetchedAt: number; source: "live" | "cache" }>(
+          `${STORAGE_PREFIX}:${userId}:lendingStats`
+        )
+        if (cachedWallets?.data || cachedLending?.data) {
+          updateState((prev) => {
+            const next = { ...prev }
+            if (cachedWallets?.data && !prev.wallets[userId]?.data) {
+              next.wallets = {
+                ...prev.wallets,
+                [userId]: { data: cachedWallets.data, fetchedAt: cachedWallets.fetchedAt, error: null, source: cachedWallets.source ?? "cache", rateLimited: false, errorMessage: null },
+              }
+            }
+            if (cachedLending?.data && !prev.lendingStats[userId]?.data) {
+              next.lendingStats = {
+                ...prev.lendingStats,
+                [userId]: { data: cachedLending.data, fetchedAt: cachedLending.fetchedAt, error: null, source: cachedLending.source ?? "cache", rateLimited: false },
+              }
+            }
+            return next
+          })
+        }
+      }
+
       const foldPromise = (async () => {
         const ok = await fetchDashboardFold(userId)
         delete inFlightFold.current[userId]
@@ -864,9 +933,8 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
         }
       })()
       inFlightFold.current[userId] = foldPromise
-      // Referral data is fetched on demand via ensureReferralData when user opens Referral or Settings tab.
     },
-    [fetchDashboardFold, fetchWallets, fetchBotStats, fetchUserStatus, fetchLendingStats]
+    [fetchDashboardFold, fetchWallets, fetchBotStats, fetchUserStatus, fetchLendingStats, updateState]
   )
 
   const ensureReferralData = useCallback(

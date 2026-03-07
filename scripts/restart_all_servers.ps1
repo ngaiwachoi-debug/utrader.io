@@ -37,16 +37,16 @@ Start-Sleep -Seconds 2
 
 # 5) Start backend, worker, frontend, and Stripe webhook in this terminal (Cursor) as background jobs
 Write-Host "Starting backend, worker, frontend, and Stripe webhook..."
-$jobBackend  = Start-Job -ScriptBlock { param($r) Set-Location $r; python -m uvicorn main:app --host 127.0.0.1 --port 8000 } -ArgumentList $root
-$jobWorker   = Start-Job -ScriptBlock { param($r) Set-Location $r; python scripts/run_worker.py } -ArgumentList $root
-$jobFrontend = Start-Job -ScriptBlock { param($r) Set-Location (Join-Path $r "frontend"); npm run dev } -ArgumentList $root
-$jobStripe   = Start-Job -ScriptBlock { stripe listen --forward-to http://127.0.0.1:8000/webhook/stripe }
+$jobBackend  = Start-Job -ScriptBlock { param($r) Set-Location $r; python -m uvicorn main:app --host 127.0.0.1 --port 8000 2>&1 } -ArgumentList $root
+$jobWorker   = Start-Job -ScriptBlock { param($r) Set-Location $r; python scripts/run_worker.py 2>&1 } -ArgumentList $root
+$jobFrontend = Start-Job -ScriptBlock { param($r) Set-Location (Join-Path $r "frontend"); npm run dev 2>&1 } -ArgumentList $root
+$jobStripe   = Start-Job -ScriptBlock { stripe listen --forward-to http://127.0.0.1:8000/webhook/stripe 2>&1 }
 
 Write-Host "Backend: http://127.0.0.1:8000  |  Frontend: http://localhost:3000  |  Stripe: forwarding to /webhook/stripe"
-Write-Host "Streaming output (Ctrl+C to stop script; jobs may keep running).`n"
+Write-Host "Streaming output. Ctrl+C stops this script only; backend, worker, frontend, and Stripe keep running.`n"
 try {
     Receive-Job -Wait -Id $jobBackend.Id, $jobWorker.Id, $jobFrontend.Id, $jobStripe.Id
 } finally {
-    Get-Job | Where-Object { $_.Id -in @($jobBackend.Id, $jobWorker.Id, $jobFrontend.Id, $jobStripe.Id) } | Stop-Job -ErrorAction SilentlyContinue
-    Get-Job | Where-Object { $_.Id -in @($jobBackend.Id, $jobWorker.Id, $jobFrontend.Id, $jobStripe.Id) } | Remove-Job -Force -ErrorAction SilentlyContinue
+    # Do NOT Stop-Job/Remove-Job here: when script exits (timeout, Ctrl+C, terminal close), leave jobs running.
+    Write-Host "`nScript exiting. Backend, worker, frontend, and Stripe jobs are still running."
 }

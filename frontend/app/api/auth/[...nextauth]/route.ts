@@ -3,7 +3,8 @@ import GoogleProvider from "next-auth/providers/google"
 import { UpstashRedisAdapter } from "@auth/upstash-redis-adapter"
 import { Redis } from "@upstash/redis"
 
-const redisUrl = process.env.UPSTASH_REDIS_REST_URL ?? process.env.REDIS_URL
+const envUrl = process.env.UPSTASH_REDIS_REST_URL ?? process.env.REDIS_URL
+const redisUrl = envUrl?.startsWith("http") ? envUrl : undefined
 const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN
 const redis =
   redisUrl && redisToken
