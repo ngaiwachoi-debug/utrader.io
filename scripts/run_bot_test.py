@@ -14,8 +14,11 @@ import sys
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BFX_KEY = os.getenv("BFX_KEY", "4b7e10b7478dbd2de2b8a402cf155e0dfd47685292f")
-BFX_SECRET = os.getenv("BFX_SECRET", "3be479ee822ee34054d5587861bf3f3c2f14f33ecf3")
+BFX_KEY = os.getenv("BFX_KEY", "")
+BFX_SECRET = os.getenv("BFX_SECRET", "")
+if not BFX_KEY or not BFX_SECRET:
+    print("ERROR: Set BFX_KEY and BFX_SECRET env vars before running this test.")
+    exit(1)
 GEMINI_KEY = os.getenv("GEMINI_KEY", "")
 
 

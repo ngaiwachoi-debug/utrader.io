@@ -14,8 +14,11 @@ import jwt
 
 API_BASE = "http://127.0.0.1:8000"
 USER_ID = 2
-API_KEY = "96d1aea643c91ba4a7260702692e6e31d65bb69486f"
-API_SECRET = "e5f04a8af4f1a553b9f0cffaafd51f80b2cff9998c1"
+API_KEY = os.getenv("TEST_BFX_KEY", "")
+API_SECRET = os.getenv("TEST_BFX_SECRET", "")
+if not API_KEY or not API_SECRET:
+    print("ERROR: Set TEST_BFX_KEY and TEST_BFX_SECRET env vars.")
+    sys.exit(1)
 
 secret = os.getenv("NEXTAUTH_SECRET")
 db = None

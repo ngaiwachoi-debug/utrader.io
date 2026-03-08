@@ -2,9 +2,9 @@
 
 **Why 401 happens:** The frontend signs the JWT with one secret; the backend verifies it with another. If they differ (or the backend has no secret), verification fails and the backend returns 401. Use the **same** `NEXTAUTH_SECRET` in both places.
 
-**Exact secret (must match in both root `.env` and `frontend/.env.local`):**
+**The same secret must appear in both root `.env` and `frontend/.env.local`.**
 ```env
-NEXTAUTH_SECRET="xqaJwgwFBGjekuoik674vN375pHj9EzHSpV9UAgoezk="
+NEXTAUTH_SECRET="<your-secret-here>"
 ```
 
 ---
@@ -25,7 +25,7 @@ This checks that root `.env` exists and contains `NEXTAUTH_SECRET`, then creates
 ### Option B: Manual – use root `.env` secret in the frontend
 
 1. Open the **root** `.env` (project root, same folder as `main.py`).
-2. Copy the line: `NEXTAUTH_SECRET="xqaJwgwFBGjekuoik674vN375pHj9EzHSpV9UAgoezk="`.
+2. Copy the `NEXTAUTH_SECRET="..."` line (whatever value is in your root `.env`).
 3. Create or edit **frontend/.env.local** and paste that line. Save.
 
 ### Option C: Generate a new secret and set it in both places
@@ -62,7 +62,7 @@ Copy the output (e.g. `K7x9mP2...`). Then:
 
 - **Check root .env (PowerShell):**  
   `Get-Content c:\Users\choiw\Desktop\bifinex\buildnew\.env | Select-String NEXTAUTH_SECRET`  
-  Should show a line containing `NEXTAUTH_SECRET="xqaJwgwFBGjekuoik674vN375pHj9EzHSpV9UAgoezk="`.
+  Should show a line containing `NEXTAUTH_SECRET="<your-secret>"` (the value from your .env).
 - **Backend:** Start uvicorn from the **project root** so `load_dotenv()` (in `main.py`) loads root `.env`. Run `pip install -r requirements.txt` (includes `python-dotenv`), then from root: `python -m uvicorn main:app --host 127.0.0.1 --port 8000`.
 - **Frontend:** Next.js loads `frontend/.env.local` when you run `npm run dev` from the frontend folder. After running the sync script or manually creating `.env.local`, restart the frontend and use the console snippet below to confirm 200.
 
@@ -125,10 +125,10 @@ const token=(await(await fetch('/api/auth/token',{credentials:'include'})).json(
 | **Secret not loaded** | Run `scripts\validate_nextauth_secret.ps1` from project root to sync the exact secret to `frontend/.env.local`. Backend: start uvicorn from **project root**. Restart both. |
 | **Proxy** | Request URL for "2" must be `http://localhost:3000/api-backend/user-status/2`. Backend on `127.0.0.1:8000`. |
 | **JWT expired** | Log out and log in again (or use “Dev: Login as …” if you use that) to get a new token. Then rerun the console snippet. |
-| **Frontend .env.local missing** | Create `frontend/.env.local` with: `NEXTAUTH_SECRET="xqaJwgwFBGjekuoik674vN375pHj9EzHSpV9UAgoezk="`. Restart frontend. |
+| **Frontend .env.local missing** | Create `frontend/.env.local` with the same `NEXTAUTH_SECRET` from root `.env`. Restart frontend. |
 | **Backend debug logs** | If `debug-1b4a77.log` exists: `secretLoaded: true` and `decodeOk: true` = success; `decodeOk: false` + `errorMsg` = secret mismatch. |
 | **401 not from this backend** | In Network tab, open the 401 response → **Headers**. If **X-Backend-Log: 1b4a77** is missing, the response is from Next.js or an old backend. Stop all uvicorn processes, start only from project root: `cd c:\Users\choiw\Desktop\bifinex\buildnew` then `python -m uvicorn main:app --host 127.0.0.1 --port 8000`. |
 | **401 with "column users.key_deletions does not exist"** | JWT is valid; the DB is missing a column. From project root run: `python migrations/run_reconciliation_key_deletions_migration.py`. Then restart the backend and try again. |
-| **Quotes / spaces** | Use `NEXTAUTH_SECRET="xqaJwgwFBGjekuoik674vN375pHj9EzHSpV9UAgoezk="` with no spaces around `=`. |
+| **Quotes / spaces** | Use `NEXTAUTH_SECRET="<your-secret>"` with no spaces around `=`. |
 
 After any change to `.env` or `.env.local`, **restart both** the backend and the frontend.

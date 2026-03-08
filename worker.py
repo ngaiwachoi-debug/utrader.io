@@ -12,6 +12,8 @@ from sqlalchemy.orm import joinedload
 from database import SessionLocal
 import models
 from bot_engine import PortfolioManager
+from services.bfx_websocket import BfxWebSocketState
+from services.bfx_rate_limiter import ws_conn_acquire
 from dotenv import load_dotenv
 
 # Load .env from project root (same as database.py) so worker always uses same DB/Redis
@@ -85,6 +87,7 @@ async def run_bot_task(ctx, user_id: int):
     lock_key = None
     lock_val = None
     lock_renew_task = None
+    ws_state: BfxWebSocketState | None = None
     try:
         user = db.query(models.User).options(joinedload(models.User.vault)).filter(models.User.id == user_id).first()
         if not user or not user.vault:
@@ -206,6 +209,33 @@ async def run_bot_task(ctx, user_id: int):
                 print(f"[WARN] Failed to create dedicated nonce pool: {e}. Falling back to queue redis.")
                 nonce_pool = ctx.get("redis")
 
+        # Establish authenticated WebSocket connection for real-time state
+        ws_state: BfxWebSocketState | None = None
+        try:
+            await ws_conn_acquire()
+            ws_state = BfxWebSocketState(
+                user_id=user_id,
+                api_key=keys["bfx_key"],
+                api_secret=keys["bfx_secret"],
+                redis_pool=nonce_pool,
+                log_fn=lambda m: (print(m), log_lines.append(m) if log_lines is not None else None),
+            )
+            await ws_state.connect()
+            ws_ready = await ws_state.wait_ready(timeout=25.0)
+            if ws_ready:
+                await _term(redis, user_id, "WebSocket connected — real-time data active.")
+            else:
+                await _term(redis, user_id, "WebSocket connection slow — starting with REST fallback.")
+        except Exception as ws_err:
+            print(f"[WARN] User {user_id} WS connect failed: {ws_err}. Continuing with REST only.")
+            await _term(redis, user_id, f"WebSocket unavailable ({type(ws_err).__name__}). Using REST fallback.")
+            if ws_state:
+                try:
+                    await ws_state.close()
+                except Exception:
+                    pass
+            ws_state = None
+
         manager = PortfolioManager(
             user_id=user_id,
             api_key=keys["bfx_key"],
@@ -213,6 +243,7 @@ async def run_bot_task(ctx, user_id: int):
             gemini_key=keys.get("gemini_key", ""),
             redis_pool=nonce_pool,
             log_lines=log_lines,
+            ws_state=ws_state,
         )
 
         async def flush_terminal_logs():
@@ -296,6 +327,15 @@ async def run_bot_task(ctx, user_id: int):
                     await asyncio.sleep(5 * engine_restart_count)  # back-off: 5s, 10s, 15s
 
                     try:
+                        # Reconnect WS if it dropped during the crash
+                        if ws_state and not ws_state.is_ready:
+                            try:
+                                await ws_state.close()
+                                await ws_conn_acquire()
+                                await ws_state.connect()
+                                await ws_state.wait_ready(timeout=15.0)
+                            except Exception:
+                                pass
                         manager = PortfolioManager(
                             user_id=user_id,
                             api_key=keys["bfx_key"],
@@ -303,6 +343,7 @@ async def run_bot_task(ctx, user_id: int):
                             gemini_key=keys.get("gemini_key", ""),
                             redis_pool=nonce_pool,
                             log_lines=log_lines,
+                            ws_state=ws_state,
                         )
                         engine_task = asyncio.create_task(manager.scan_and_launch())
                         await _term(redis, user_id, f"Engine restarted successfully (attempt {engine_restart_count}).")
@@ -443,6 +484,12 @@ async def run_bot_task(ctx, user_id: int):
             except Exception:
                 pass
             print(f"[WARN] Worker finally: could not set bot_status=stopped for user {user_id}: {e}")
+        # Close WebSocket connection
+        try:
+            if ws_state is not None:
+                await ws_state.close()
+        except Exception:
+            pass
         try:
             if db is not None:
                 db.close()

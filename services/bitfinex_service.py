@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 import requests
 
 from services.bitfinex_nonce import get_next_nonce_sync
+from services.bfx_rate_limiter import bfx_acquire_sync
 
 
 BASE_URL = "https://api.bitfinex.com"
@@ -23,6 +24,7 @@ CONF_URL = "https://api-pub.bitfinex.com/v2/conf"
 
 def _get_currency_list_sync() -> Tuple[Optional[list], Optional[str]]:
     """Public GET conf/pub:list:currency. Returns (list of currency codes e.g. ['USD','BTC'], error)."""
+    bfx_acquire_sync()
     url = f"{CONF_URL}/pub:list:currency"
     try:
         response = requests.get(url, timeout=15)
@@ -41,6 +43,7 @@ def _get_currency_list_sync() -> Tuple[Optional[list], Optional[str]]:
 
 def _get_funding_stats_sync(symbol: str = "fUSD", limit: int = 24) -> Tuple[Optional[list], Optional[str]]:
     """Public GET funding/stats/{symbol}/hist. Returns (list of rows, error). No auth."""
+    bfx_acquire_sync()
     url = f"{FUNDING_STATS_URL}/{symbol}/hist?limit={limit}"
     try:
         response = requests.get(url, timeout=15)
@@ -58,6 +61,7 @@ def _get_tickers_sync(symbols: list[str]) -> Tuple[Optional[list], Optional[str]
     """Public GET v2/tickers?symbols=... Returns (list of ticker arrays, error)."""
     if not symbols:
         return [], None
+    bfx_acquire_sync()
     symbols_str = ",".join(symbols)
     url = f"{TICKERS_URL}?symbols={symbols_str}"
     try:
@@ -78,6 +82,7 @@ def _post_sync(api_key: str, api_secret: str, endpoint: str, payload: Optional[D
     Uses requests.post(..., data=json_body) so Bitfinex receives the same bytes we signed.
     """
     payload = payload if payload is not None else {}
+    bfx_acquire_sync()
     nonce = get_next_nonce_sync(api_key)
     json_body = json.dumps(payload, separators=(",", ":"))
     signature_payload = f"/api/{endpoint}{nonce}{json_body}"
@@ -96,6 +101,9 @@ def _post_sync(api_key: str, api_secret: str, endpoint: str, payload: Optional[D
     try:
         response = requests.post(url, headers=headers, data=json_body, timeout=30)
         raw = response.text
+        if response.status_code == 429 or (raw and "ERR_RATE_LIMIT" in raw):
+            time.sleep(60)
+            return None, "ERR_RATE_LIMIT"
         if response.status_code != 200:
             return None, raw or f"HTTP {response.status_code}"
         try:

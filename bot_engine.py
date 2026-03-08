@@ -24,6 +24,8 @@ from google import genai
 from services.shared_oracle import get_oracle_snapshot
 from services.ai_injector import AI_ContextInjector
 from services.bitfinex_nonce import get_next_nonce
+from services.bfx_rate_limiter import bfx_acquire
+from services.bfx_websocket import BfxWebSocketState
 
 # Institutional baselines (lag = minutes until lending rate typically spikes after BTC volume surge)
 IQM_BASELINES_PATH = Path(__file__).resolve().parent / "data" / "iqm_baselines.json"
@@ -57,17 +59,16 @@ class WallStreet_Omni_FullEngine:
     Autonomous Crypto Lending Engine. 
     Manages funding book deployments and broadcasts live stats to Redis.
     """
-    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, currency: str, spot_price: float, redis_pool=None, log_lines: list | None = None, shared_nonce_ref=None, bfx_request_lock=None):
+    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, currency: str, spot_price: float, redis_pool=None, log_lines: list | None = None, shared_nonce_ref=None, bfx_request_lock=None, ws_state: BfxWebSocketState | None = None):
         self.user_id = user_id
         self.api_key = api_key
         self.api_secret = api_secret
         self.gemini_key = gemini_key
-        self.redis_pool = redis_pool # 🟢 Injected Redis pool for Dashboard
-        self.log_lines = log_lines  # optional list to capture lines for Whales terminal
-        # shared_nonce_ref: (mutable_list, threading.Lock) so multiple engines (USD/UST) share one nonce per API key
+        self.redis_pool = redis_pool
+        self.log_lines = log_lines
         self._shared_nonce_ref = shared_nonce_ref
-        # bfx_request_lock: asyncio.Lock to serialize Bitfinex API requests per key (avoid 10114 nonce: small)
         self._bfx_request_lock = bfx_request_lock
+        self._ws_state = ws_state
         self._nonce = int(time.time() * 1000000)
         self.wallet_currency = currency
         self.symbol = f"f{currency}"
@@ -179,6 +180,7 @@ class WallStreet_Omni_FullEngine:
 
     async def _api_request(self, path: str, body: dict = None) -> dict | list | None:
         async def _do_request() -> tuple[dict | list | None, bool]:
+            await bfx_acquire()
             nonce = await get_next_nonce(self.redis_pool, self.api_key) if self.redis_pool else self.get_nonce()
             headers = {
                 "bfx-nonce": nonce,
@@ -192,11 +194,19 @@ class WallStreet_Omni_FullEngine:
                         if resp.status != 200:
                             body_text = await resp.text()
                             self._log(f"[User {self.user_id}] API {path} → HTTP {resp.status} | {body_text[:200]}")
+                            if resp.status == 429 or "ERR_RATE_LIMIT" in body_text:
+                                self._log(f"[User {self.user_id}] Rate limited on {path}; backing off 60s")
+                                await asyncio.sleep(60)
+                                return (None, False)
                             is_nonce = self._is_nonce_error(resp.status, body_text)
                             return (None, is_nonce)
                         out = await resp.json()
-                        # Bitfinex can return ["error", code, "message"] with 200
                         if isinstance(out, list) and len(out) > 0 and out[0] == "error":
+                            err_msg = str(out[2]) if len(out) > 2 else str(out)
+                            if "ERR_RATE_LIMIT" in err_msg or "rate limit" in err_msg.lower():
+                                self._log(f"[User {self.user_id}] Rate limited on {path}; backing off 60s")
+                                await asyncio.sleep(60)
+                                return (None, False)
                             self._log(f"[User {self.user_id}] API {path} → error response: {out}")
                             is_nonce = self._is_nonce_error(200, out)
                             return (None, is_nonce)
@@ -275,8 +285,18 @@ class WallStreet_Omni_FullEngine:
         return False
 
     async def cancel_stuck_senior_orders(self) -> bool:
-        """Cancels 2-day orders open for > 7 minutes."""
-        offers = await self._api_request(f"/auth/r/funding/offers/{self.symbol}", {})
+        """Cancels 2-day orders open for > 7 minutes.
+
+        Reads offers from WS state when available; cancels via WS input
+        message with REST fallback.
+        """
+        use_ws = self._ws_state is not None and self._ws_state.is_ready
+
+        if use_ws:
+            offers = self._ws_state.get_funding_offers(self.symbol)
+        else:
+            offers = await self._api_request(f"/auth/r/funding/offers/{self.symbol}", {})
+
         if not offers or (isinstance(offers, list) and len(offers) > 0 and offers[0] == 'error'): 
             return False
         now_ms = int(time.time() * 1000)
@@ -287,7 +307,12 @@ class WallStreet_Omni_FullEngine:
                 mts_updated = next((v for v in off if isinstance(v, (int, float)) and v > 1500000000000), now_ms)
                 age_mins = abs(now_ms - mts_updated) / 60000.0
                 if age_mins >= 7.0:
-                    await self._api_request("/auth/w/funding/offer/cancel", {"id": offer_id})
+                    if use_ws:
+                        result = await self._ws_state.cancel_offer(offer_id)
+                        if result is None:
+                            await self._api_request("/auth/w/funding/offer/cancel", {"id": offer_id})
+                    else:
+                        await self._api_request("/auth/w/funding/offer/cancel", {"id": offer_id})
                     canceled_any = True
             except Exception: continue 
         if canceled_any:
@@ -307,9 +332,18 @@ class WallStreet_Omni_FullEngine:
         return 0.0
 
     async def check_portfolio_status(self) -> tuple[float, float, float]:
-        """Calculates current WAROC, balance, and loaned amounts."""
-        credits = await self._api_request(f"/auth/r/funding/credits/{self.symbol}", {})
-        wallets = await self._api_request("/auth/r/wallets", {})
+        """Calculates current WAROC, balance, and loaned amounts.
+
+        Reads from WebSocket state when available; falls back to REST.
+        """
+        use_ws = self._ws_state is not None and self._ws_state.is_ready
+
+        if use_ws:
+            wallets = self._ws_state.get_wallets()
+            credits = self._ws_state.get_funding_credits(self.symbol)
+        else:
+            credits = await self._api_request(f"/auth/r/funding/credits/{self.symbol}", {})
+            wallets = await self._api_request("/auth/r/wallets", {})
 
         self.total_balance = 0.0
         if wallets and isinstance(wallets, list) and (len(wallets) == 0 or wallets[0] != "error"):
@@ -324,7 +358,7 @@ class WallStreet_Omni_FullEngine:
 
         self.total_loaned = 0.0
         weighted_rate_sum = 0.0
-        if credits and isinstance(credits, list) and credits[0] != 'error':
+        if credits and isinstance(credits, list) and (len(credits) == 0 or credits[0] != 'error'):
             for c in credits:
                 try:
                     amount, rate = float(c[5]), float(c[11])
@@ -335,12 +369,11 @@ class WallStreet_Omni_FullEngine:
         self.waroc = (weighted_rate_sum / self.total_loaned) if self.total_loaned > 0 else 0.0
         utilization = (self.total_loaned / self.total_balance) if self.total_balance > 0 else 0.0
 
-        # 🟢 Log: when lent, show WAROC + loaned; when idle, show balance + friendly message (throttled)
         if self.total_loaned > 0:
             self._log(f"[{self._now()}] [User {self.user_id}] 📊 [{self.wallet_currency}] WAROC: {self.waroc*365*100:>5.2f}% APR | Loaned: {self.total_loaned:,.2f}")
         else:
             now_ts = time.time()
-            if now_ts - self._last_idle_log_time >= 300:  # at most once every 5 min per currency
+            if now_ts - self._last_idle_log_time >= 300:
                 self._last_idle_log_time = now_ts
                 self._log(f"[{self._now()}] [User {self.user_id}] 📊 [{self.wallet_currency}] Idle | Balance: {self.total_balance:,.2f} | No active loans (offers may be pending)")
         await self.broadcast_status()
@@ -370,8 +403,8 @@ class WallStreet_Omni_FullEngine:
                 insight = f"AI Offline."
             self._log(f"\n[{self._now()}] [User {self.user_id}] 📈 Strategy: {insight}")
 
-        # Same as check script: /auth/r/wallets → w[0]=TYPE, w[1]=CURRENCY, w[2]=BALANCE, w[4]=AVAILABLE_BALANCE
-        wallets = await self._api_request("/auth/r/wallets", {})
+        use_ws = self._ws_state is not None and self._ws_state.is_ready
+        wallets = self._ws_state.get_wallets() if use_ws else await self._api_request("/auth/r/wallets", {})
         if not wallets or (isinstance(wallets, list) and len(wallets) > 0 and wallets[0] == "error"):
             self._log(f"[User {self.user_id}] deploy_matrix: no wallets (API failed or error response); skipping.")
             return
@@ -470,10 +503,17 @@ class WallStreet_Omni_FullEngine:
                 ops.append({"type": "LIMIT", "symbol": self.symbol, "amount": f"{order_amt:.4f}", "rate": str(round(r, 8)), "period": 60, "flags": 64, "label": "TAIL TRAP"})
                 running_balance -= order_amt
 
+        use_ws_write = self._ws_state is not None and self._ws_state.is_ready
         consecutive_fails = 0
         for op in ops:
             lbl = op.pop("label")
-            resp = await self._api_request("/auth/w/funding/offer/submit", op)
+            resp = None
+            if use_ws_write:
+                resp = await self._ws_state.submit_offer(op)
+                if resp is None:
+                    resp = await self._api_request("/auth/w/funding/offer/submit", op)
+            else:
+                resp = await self._api_request("/auth/w/funding/offer/submit", op)
             if resp is None:
                 consecutive_fails += 1
                 self._log(f"   └─ [{self.wallet_currency}] SUBMIT FAILED | {lbl} | amount={op.get('amount')} (check Bitfinex API response)")
@@ -523,10 +563,11 @@ class WallStreet_Omni_FullEngine:
 
 class PortfolioManager:
     """Orchestrates multiple asset engines for a user. Uses a shared nonce and a single asyncio lock per key so only one Bitfinex request is in flight at a time (avoids 10114 nonce: small)."""
-    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, redis_pool=None, log_lines: list | None = None):
+    def __init__(self, user_id: int, api_key: str, api_secret: str, gemini_key: str, redis_pool=None, log_lines: list | None = None, ws_state: BfxWebSocketState | None = None):
         self.user_id, self.api_key, self.api_secret, self.gemini_key = user_id, api_key, api_secret, gemini_key
         self.redis_pool = redis_pool
         self.log_lines = log_lines
+        self._ws_state = ws_state
         self._nonce = int(time.time() * 1000000)
         self._shared_nonce = [self._nonce]
         self._nonce_lock = threading.Lock()
@@ -621,9 +662,18 @@ class PortfolioManager:
         print(msg)
         if self.log_lines is not None:
             self.log_lines.append(msg)
-        # _api_request already handles the lock internally, don't double-lock
-        wallets = await self._api_request("/auth/r/wallets", {})
-        # Sync shared_nonce so engines (when not using Redis) continue from same counter
+
+        # Use WS state for the initial wallet read when available
+        use_ws = self._ws_state is not None and self._ws_state.is_ready
+        if use_ws:
+            wallets = self._ws_state.get_wallets()
+            _ws_msg = f"[{datetime.now().strftime('%H:%M:%S')}] [User {self.user_id}] [SCANNER] Using WebSocket state for wallet data."
+            print(_ws_msg)
+            if self.log_lines is not None:
+                self.log_lines.append(_ws_msg)
+        else:
+            wallets = await self._api_request("/auth/r/wallets", {})
+
         if not self.redis_pool:
             self._shared_nonce[0] = self._nonce
         if not wallets or (isinstance(wallets, list) and len(wallets) > 0 and wallets[0] == "error"):
@@ -660,6 +710,7 @@ class PortfolioManager:
                 self.user_id, self.api_key, self.api_secret, self.gemini_key, w[1], 1.0,
                 self.redis_pool, self.log_lines, shared_nonce_ref=shared_nonce_ref,
                 bfx_request_lock=self._bfx_request_lock,
+                ws_state=self._ws_state,
             )
             engine_coros.append(engine.run_loop())
         if engine_coros:

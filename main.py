@@ -40,7 +40,8 @@ from google.auth.transport import requests as google_requests
 import database
 import models
 import security
-from utils.logging import generate_trace_id, get_trace_id, set_trace_id
+from utils.logging import generate_trace_id, get_trace_id, set_trace_id, configure_logging
+configure_logging()
 from services.bitfinex_service import BitfinexManager, hash_bitfinex_id
 from services import bitfinex_cache  # Short TTL (90s/120s); call invalidate() after mutations so next request is live.
 from services.daily_token_deduction import run_daily_token_deduction, run_deduction_for_user_for_date
@@ -53,7 +54,8 @@ DAILY_API_FETCH_UTC_HOUR = 10
 DAILY_API_FETCH_UTC_MINUTE = 0
 DAILY_API_RETRY_UTC_HOUR = 10
 DAILY_API_RETRY_UTC_MINUTE = 10
-DELAY_BETWEEN_USERS_SEC = 3.0
+DELAY_BETWEEN_USERS_SEC = 0.5
+FETCH_CONCURRENCY = 3  # max concurrent Bitfinex API fetches; kept low because IP-level rate limit is shared with running bots
 # Ledger data is "incomplete" if latest entry is newer than this (Bitfinex may still be finalizing).
 LEDGER_FRESHNESS_MINUTES = 20
 
@@ -177,6 +179,11 @@ _RESPONSE_CACHE_TTLS = {
     "dashboard-fold": 15.0,
     "token-add-history": 30.0,
     "deduction-history": 60.0,
+    "wallets": 15.0,
+    "token-balance": 15.0,
+    "referral-info": 30.0,
+    "referral-bundle": 30.0,
+    "referral-reward-history": 30.0,
     "admin-users": 15.0,
     "admin-settings": 60.0,
     "admin-health": 30.0,
@@ -305,40 +312,44 @@ async def _run_09_00_ledger_cache_scheduler() -> None:
             logger.warning("09:00 ledger cache: Redis unavailable: %s", e)
             continue
         today_utc = datetime.utcnow().date()
-        for i, uid in enumerate(user_ids):
-            if i > 0:
+        _cache_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def _cache_one_user_09_00(uid: int) -> None:
+            async with _cache_sem:
                 await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
-            db = database.SessionLocal()
-            try:
-                user = db.query(models.User).filter(models.User.id == uid).first()
-                vault = db.query(models.APIVault).filter(models.APIVault.user_id == uid).first()
-                if not user or not vault:
-                    continue
-                email = getattr(user, "email", None) or ""
+                db_c = database.SessionLocal()
                 try:
-                    keys = vault.get_keys()
-                    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
-                    ledger_currencies = await _get_ledger_currencies_for_user(mgr)
-                    if not ledger_currencies:
-                        ledger_currencies = list(LEDGER_FUNDING_CURRENCIES)
-                    entries, _, fetch_err = await _fetch_all_margin_funding_entries(mgr, currencies=ledger_currencies)
-                    if fetch_err and not entries:
-                        logger.warning("09:00 UTC: Invalid API key for %s – alert sent", email)
+                    user = db_c.query(models.User).filter(models.User.id == uid).first()
+                    vault = db_c.query(models.APIVault).filter(models.APIVault.user_id == uid).first()
+                    if not user or not vault:
+                        return
+                    email = getattr(user, "email", None) or ""
+                    try:
+                        keys = vault.get_keys()
+                        mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+                        ledger_currencies = await _get_ledger_currencies_for_user(mgr)
+                        if not ledger_currencies:
+                            ledger_currencies = list(LEDGER_FUNDING_CURRENCIES)
+                        entries, _, fetch_err = await _fetch_all_margin_funding_entries(mgr, currencies=ledger_currencies)
+                        if fetch_err and not entries:
+                            logger.warning("09:00 UTC: Invalid API key for %s – alert sent", email)
+                            await _alert_admins_deduction_failure(
+                                f"User {email} (ID: {uid}): Bitfinex API key invalid. Update by 10:00 UTC to avoid fee processing with cached data."
+                            )
+                            return
+                        start_ms = int(vault.created_at.timestamp() * 1000) if getattr(vault, "created_at", None) else None
+                        ok = await ledger_cache_svc.set_ledger_cache(redis, uid, today_utc, entries or [], start_ms=start_ms)
+                        if ok:
+                            logger.info("09:00 UTC: Cached ledger data for %s (API key valid)", email)
+                    except Exception as e:
+                        logger.warning("09:00 UTC: Cache failed for user_id=%s: %s", uid, e)
                         await _alert_admins_deduction_failure(
-                            f"User {email} (ID: {uid}): Bitfinex API key invalid. Update by 10:00 UTC to avoid fee processing with cached data."
+                            f"User {email or uid} (ID: {uid}): Ledger cache failed – {e!s}"
                         )
-                        continue
-                    start_ms = int(vault.created_at.timestamp() * 1000) if getattr(vault, "created_at", None) else None
-                    ok = await ledger_cache_svc.set_ledger_cache(redis, uid, today_utc, entries or [], start_ms=start_ms)
-                    if ok:
-                        logger.info("09:00 UTC: Cached ledger data for %s (API key valid)", email)
-                except Exception as e:
-                    logger.warning("09:00 UTC: Cache failed for user_id=%s: %s", uid, e)
-                    await _alert_admins_deduction_failure(
-                        f"User {email or uid} (ID: {uid}): Ledger cache failed – {e!s}"
-                    )
-            finally:
-                db.close()
+                finally:
+                    db_c.close()
+
+        await asyncio.gather(*[_cache_one_user_09_00(uid) for uid in user_ids], return_exceptions=True)
 
 
 async def _run_daily_gross_profit_scheduler() -> None:
@@ -376,63 +387,71 @@ async def _run_daily_gross_profit_scheduler() -> None:
             continue
         print(f"[scheduler] 10:00 UTC API fetch: {len(user_ids)} user(s)")
         incomplete_after_10_00: List[int] = []
-        for i, uid in enumerate(user_ids):
-            if i > 0:
+        _fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def _fetch_one_user_10_00(uid: int) -> None:
+            async with _fetch_sem:
                 await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
-            db = database.SessionLocal()
-            try:
-                success, data_incomplete, err = await _daily_10_00_fetch_and_save(uid, db)
-                if success:
-                    snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
-                    if snap:
-                        cache_data = {
-                            "gross_profit": float(snap.gross_profit_usd or 0),
-                            "bitfinex_fee": float(snap.bitfinex_fee_usd or 0),
-                            "net_profit": float(snap.net_profit_usd or 0),
-                        }
-                        await bitfinex_cache.set_cached(uid, bitfinex_cache.KEY_LENDING, cache_data)
-                    user_obj = db.query(models.User).filter(models.User.id == uid).first()
-                    logger.info(
-                        "daily_10_00_fetch user_id=%s email=%s gross_profit_usd=%s data_complete=1",
-                        uid, getattr(user_obj, "email", None), getattr(snap, "gross_profit_usd", None),
-                    )
-                elif data_incomplete:
-                    incomplete_after_10_00.append(uid)
-                    logger.warning("daily_10_00_fetch user_id=%s data_incomplete (latest entry < %s mins)", uid, LEDGER_FRESHNESS_MINUTES)
-                else:
-                    if err:
-                        await _record_api_failure("daily_10_00_fetch", uid, err)
-            finally:
-                db.close()
+                db_f = database.SessionLocal()
+                try:
+                    success, data_incomplete, err = await _daily_10_00_fetch_and_save(uid, db_f)
+                    if success:
+                        snap = db_f.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                        if snap:
+                            cache_data = {
+                                "gross_profit": float(snap.gross_profit_usd or 0),
+                                "bitfinex_fee": float(snap.bitfinex_fee_usd or 0),
+                                "net_profit": float(snap.net_profit_usd or 0),
+                            }
+                            await bitfinex_cache.set_cached(uid, bitfinex_cache.KEY_LENDING, cache_data)
+                        user_obj = db_f.query(models.User).filter(models.User.id == uid).first()
+                        logger.info(
+                            "daily_10_00_fetch user_id=%s email=%s gross_profit_usd=%s data_complete=1",
+                            uid, getattr(user_obj, "email", None), getattr(snap, "gross_profit_usd", None),
+                        )
+                    elif data_incomplete:
+                        incomplete_after_10_00.append(uid)
+                        logger.warning("daily_10_00_fetch user_id=%s data_incomplete (latest entry < %s mins)", uid, LEDGER_FRESHNESS_MINUTES)
+                    else:
+                        if err:
+                            await _record_api_failure("daily_10_00_fetch", uid, err)
+                finally:
+                    db_f.close()
+
+        await asyncio.gather(*[_fetch_one_user_10_00(uid) for uid in user_ids], return_exceptions=True)
         if incomplete_after_10_00:
             wait_retry = _get_next_utc_wait_sec(DAILY_API_RETRY_UTC_HOUR, DAILY_API_RETRY_UTC_MINUTE)
             if wait_retry > 0 and wait_retry < 3600:
                 await asyncio.sleep(wait_retry)
             print(f"[scheduler] 10:10 UTC retry: {len(incomplete_after_10_00)} user(s)")
             still_incomplete: List[int] = []
-            for i, uid in enumerate(incomplete_after_10_00):
-                if i > 0:
+            _retry_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+            async def _retry_one_user_10_10(uid: int) -> None:
+                async with _retry_sem:
                     await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
-                db = database.SessionLocal()
-                try:
-                    success, data_incomplete, _ = await _daily_10_00_fetch_and_save(uid, db)
-                    if success:
-                        snap = db.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
-                        if snap:
-                            await bitfinex_cache.set_cached(
-                                uid,
-                                bitfinex_cache.KEY_LENDING,
-                                {
-                                    "gross_profit": float(snap.gross_profit_usd or 0),
-                                    "bitfinex_fee": float(snap.bitfinex_fee_usd or 0),
-                                    "net_profit": float(snap.net_profit_usd or 0),
-                                },
-                            )
-                        logger.info("daily_10_10_retry user_id=%s success", uid)
-                    elif data_incomplete:
-                        still_incomplete.append(uid)
-                finally:
-                    db.close()
+                    db_r = database.SessionLocal()
+                    try:
+                        success, data_incomplete, _ = await _daily_10_00_fetch_and_save(uid, db_r)
+                        if success:
+                            snap = db_r.query(models.UserProfitSnapshot).filter(models.UserProfitSnapshot.user_id == uid).first()
+                            if snap:
+                                await bitfinex_cache.set_cached(
+                                    uid,
+                                    bitfinex_cache.KEY_LENDING,
+                                    {
+                                        "gross_profit": float(snap.gross_profit_usd or 0),
+                                        "bitfinex_fee": float(snap.bitfinex_fee_usd or 0),
+                                        "net_profit": float(snap.net_profit_usd or 0),
+                                    },
+                                )
+                            logger.info("daily_10_10_retry user_id=%s success", uid)
+                        elif data_incomplete:
+                            still_incomplete.append(uid)
+                    finally:
+                        db_r.close()
+
+            await asyncio.gather(*[_retry_one_user_10_10(uid) for uid in incomplete_after_10_00], return_exceptions=True)
             for uid in still_incomplete:
                 db = database.SessionLocal()
                 try:
@@ -760,16 +779,20 @@ async def _run_daily_token_deduction_scheduler() -> None:
                                 need_fetch.append(uid)
                     if need_fetch:
                         logger.info("trace_id=%s | 10:30 UTC final fetch for %s user(s) with snapshot not for today", get_trace_id(), len(need_fetch))
-                        for i, uid in enumerate(need_fetch):
-                            if i > 0:
+                        _final_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+                        async def _final_fetch_one(uid: int) -> None:
+                            async with _final_sem:
                                 await asyncio.sleep(DELAY_BETWEEN_USERS_SEC)
-                            db_u = database.SessionLocal()
-                            try:
-                                success, _, _ = await _daily_10_00_fetch_and_save(uid, db_u, accept_fresh_data=True)
-                                if success:
-                                    logger.info("trace_id=%s | 10:30 final fetch user_id=%s success", get_trace_id(), uid)
-                            finally:
-                                db_u.close()
+                                db_u = database.SessionLocal()
+                                try:
+                                    success, _, _ = await _daily_10_00_fetch_and_save(uid, db_u, accept_fresh_data=True)
+                                    if success:
+                                        logger.info("trace_id=%s | 10:30 final fetch user_id=%s success", get_trace_id(), uid)
+                                finally:
+                                    db_u.close()
+
+                        await asyncio.gather(*[_final_fetch_one(uid) for uid in need_fetch], return_exceptions=True)
                 except Exception as e:
                     logger.warning("10:30 pre-deduction final fetch: %s", e)
                 try:
@@ -1153,6 +1176,14 @@ async def lifespan(app: FastAPI):
             db.close()
     except Exception as e:
         logger.warning("Startup token_ledger ensure failed: %s", e)
+    # Production safety: warn loudly if dev endpoints are enabled
+    if os.getenv("ALLOW_DEV_CONNECT") == "1":
+        logger.warning(
+            "*** ALLOW_DEV_CONNECT=1 is set. Dev endpoints (/dev/*) are ENABLED. "
+            "Unset this variable in production! ***"
+        )
+    if os.getenv("STRIPE_WEBHOOK_DEBUG") == "1":
+        logger.warning("*** STRIPE_WEBHOOK_DEBUG=1 is set. Disable in production. ***")
     # 09:00 UTC ledger cache; 10:00 API fetch; 10:30 deduction; 11:15 catch-up; 12:00 late fee; 23:00 reconciliation
     logger.info(
         "Auto token deduction runs only at 10:30 UTC when the backend is running. "
@@ -1213,6 +1244,8 @@ _cors_origins = [
     "http://127.0.0.1:3003",
     "http://localhost:3003",
 ]
+if os.getenv("FRONTEND_ORIGIN"):
+    _cors_origins.append(os.getenv("FRONTEND_ORIGIN").strip())
 if os.getenv("CORS_ORIGINS"):
     _cors_origins.extend(o.strip() for o in os.getenv("CORS_ORIGINS").split(",") if o.strip())
 app.add_middleware(
@@ -1221,8 +1254,54 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Data-Source", "X-Source-DB", "X-DB-Snapshot-Gross"],
+    expose_headers=["X-Data-Source"],
 )
+
+
+# --- Auth rate limiter: 20 req/min per IP for auth endpoints ---
+_auth_rl: Dict[str, List[float]] = {}
+_auth_rl_lock = asyncio.Lock()
+AUTH_RL_MAX = 20
+AUTH_RL_WINDOW_SEC = 60.0
+
+
+async def _auth_rate_limit(request: Request) -> None:
+    """Raise 429 if an IP exceeds AUTH_RL_MAX auth requests per minute."""
+    ip = request.client.host if request.client else "unknown"
+    now = _time_module.monotonic()
+    async with _auth_rl_lock:
+        if ip not in _auth_rl:
+            _auth_rl[ip] = []
+        times = _auth_rl[ip]
+        cutoff = now - AUTH_RL_WINDOW_SEC
+        times[:] = [t for t in times if t > cutoff]
+        if len(times) >= AUTH_RL_MAX:
+            raise HTTPException(status_code=429, detail="Too many requests. Please wait.")
+        times.append(now)
+
+
+# --- Public health check (unauthenticated, for load balancers / k8s probes) ---
+@app.get("/health")
+async def health_check():
+    """Lightweight liveness probe. Returns 200 if the process is running."""
+    checks = {"status": "ok"}
+    try:
+        db = database.SessionLocal()
+        db.execute(text("SELECT 1"))
+        db.close()
+        checks["database"] = "ok"
+    except Exception:
+        checks["database"] = "degraded"
+    try:
+        rp = await get_redis()
+        if rp:
+            await rp.ping()
+            checks["redis"] = "ok"
+        else:
+            checks["redis"] = "degraded"
+    except Exception:
+        checks["redis"] = "degraded"
+    return checks
 
 
 # --- Redis / ARQ (migrated to NEW Upstash server; REDIS_URL in .env, rediss:// only) ---
@@ -1244,15 +1323,20 @@ def _redis_host_from_url(url: str) -> str:
 import asyncio
 _redis_pool_cache = None
 _redis_pool_lock = asyncio.Lock()
+_redis_last_healthy: float = 0.0
+_REDIS_HEALTH_CHECK_INTERVAL = 30.0
 
 async def get_redis():
     """Return a shared Redis pool (singleton). Creates the pool on first call; reuses it thereafter.
-    Includes a ping health check so stale Upstash connections are detected and recreated.
+    Includes a periodic ping health check so stale Upstash connections are detected and recreated.
     Returns None on failure."""
-    global _redis_pool_cache
+    global _redis_pool_cache, _redis_last_healthy
     if _redis_pool_cache is not None:
+        if _time_module.monotonic() - _redis_last_healthy < _REDIS_HEALTH_CHECK_INTERVAL:
+            return _redis_pool_cache
         try:
             await asyncio.wait_for(_redis_pool_cache.ping(), timeout=3)
+            _redis_last_healthy = _time_module.monotonic()
             return _redis_pool_cache
         except Exception:
             logger.warning("Redis pool health check failed; recreating pool.")
@@ -1267,6 +1351,7 @@ async def get_redis():
                 redis_url = redis_url.replace("redis://", "rediss://", 1)
             settings = RedisSettings.from_dsn(redis_url)
             _redis_pool_cache = await asyncio.wait_for(create_pool(settings), timeout=REDIS_CONNECT_TIMEOUT)
+            _redis_last_healthy = _time_module.monotonic()
             return _redis_pool_cache
         except Exception as e:
             logger.error("Failed to create Redis pool: %s", e)
@@ -2074,7 +2159,8 @@ class UserOverviewOut(BaseModel):
 
 # --- Google Auth Endpoint ---
 @app.post("/auth/google")
-def google_login(payload: GoogleAuthPayload, db: Session = Depends(database.get_db)):
+async def google_login(request: Request, payload: GoogleAuthPayload, db: Session = Depends(database.get_db)):
+    await _auth_rate_limit(request)
     try:
         idinfo = id_token.verify_oauth2_token(
             payload.id_token, google_requests.Request(), GOOGLE_CLIENT_ID
@@ -2088,6 +2174,7 @@ def google_login(payload: GoogleAuthPayload, db: Session = Depends(database.get_
 
 @app.post("/api/bootstrap-user")
 async def bootstrap_user(
+    request: Request,
     payload: BootstrapUserPayload,
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(database.get_db),
@@ -2096,6 +2183,7 @@ async def bootstrap_user(
     Ensure backend user exists right after auth (before API key save).
     Applies first-touch referral linking once.
     """
+    await _auth_rate_limit(request)
     email = _extract_email_from_bearer_token(authorization)
     user = _get_or_create_user_by_email_for_session(email, payload.referral_code, db)
     return {
@@ -2508,8 +2596,12 @@ async def get_my_token_balance_v1(
     except HTTPException:
         raise
 
+    cache_key = f"token-balance:{current_user.id}"
+    cached = _rcache_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        # Prefer legacy raw SQL so we work when ORM columns (total_tokens_added etc.) don't exist
         legacy = _get_token_balance_legacy_full(db, current_user.id)
         if legacy is not None:
             tokens_remaining = legacy["tokens_remaining"]
@@ -2517,13 +2609,15 @@ async def get_my_token_balance_v1(
             total_added = purchased
             total_deducted = max(0.0, purchased - tokens_remaining)
             logger.info("token_balance_api user_id=%s tokens_remaining=%s (legacy)", current_user.id, tokens_remaining)
-            return TokenBalanceV1Response(
+            result = TokenBalanceV1Response(
                 tokens_remaining=tokens_remaining,
                 total_tokens_added=total_added,
                 total_tokens_deducted=total_deducted,
                 last_gross_usd_used=legacy["last_gross_usd_used"],
                 updated_at=legacy["updated_at"],
             )
+            _rcache_set(cache_key, result)
+            return result
         row = db.query(models.UserTokenBalance).filter(models.UserTokenBalance.user_id == current_user.id).first()
         if not row:
             logger.warning("token_balance_api user_id=%s: token balance row not found", current_user.id)
@@ -2537,18 +2631,20 @@ async def get_my_token_balance_v1(
         if getattr(row, "updated_at", None) and row.updated_at:
             updated_at = row.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ")
         logger.info("token_balance_api user_id=%s tokens_remaining=%s", current_user.id, tokens_remaining)
-        return TokenBalanceV1Response(
+        result = TokenBalanceV1Response(
             tokens_remaining=tokens_remaining,
             total_tokens_added=total_added,
             total_tokens_deducted=total_deducted,
             last_gross_usd_used=last_gross_usd_used,
             updated_at=updated_at,
         )
+        _rcache_set(cache_key, result)
+        return result
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("token_balance_api user_id=%s error=%s", current_user.id, e)
-        raise HTTPException(status_code=500, detail=f"Internal error retrieving token balance: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal error retrieving token balance.")
 
 
 @app.get("/api/v1/users/me/token-add-history", response_model=List[TokenAddHistoryEntry])
@@ -3512,7 +3608,8 @@ async def start_bot_for_user(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Start bot failed: {type(e).__name__}: {e}")
+        logger.exception("start_bot_failed user_id=%s: %s", user_id, e)
+        raise HTTPException(status_code=500, detail="Failed to start bot. Please try again.")
 
 
 @app.post("/stop-bot/{user_id}")
@@ -3578,7 +3675,8 @@ def dev_run_daily_deduction(db: Session = Depends(database.get_db)):
     mult = _get_deduction_multiplier(db)
     log_entries, err = run_daily_token_deduction(db, deduction_multiplier=mult)
     if err:
-        raise HTTPException(status_code=500, detail=err)
+        logger.error("dev_run_daily_deduction failed: %s", err)
+        raise HTTPException(status_code=500, detail="Deduction failed. Check server logs.")
     return {"status": "success", "count": len(log_entries), "entries": log_entries}
 
 
@@ -4344,10 +4442,7 @@ async def _get_lending_stats_data(
         fallback_gross = float(row[0]) if row and row[0] is not None else None
         fallback_net = float(row[1]) if row and row[1] is not None else None
         fallback_fee = float(row[2]) if row and row[2] is not None else None
-        out["X-Debug-Fallback-Gross"] = str(fallback_gross) if fallback_gross is not None else "none"
         if source == "db":
-            out["X-Source-DB"] = "true"
-            out["X-DB-Snapshot-Gross"] = str(fallback_gross if fallback_gross is not None else "none")
             db_snap = float(fallback_gross) if fallback_gross is not None else None
             if fallback_gross is not None and fallback_gross > 0:
                 out["X-Data-Source"] = "db"
@@ -4930,10 +5025,10 @@ def get_user_status(
         raise
     except (ProgrammingError, SQLAlchemyError) as e:
         logger.exception("user_status user_id=%s database error: %s", user_id, e)
-        raise HTTPException(status_code=500, detail=f"Database error retrieving user status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error retrieving user status.")
     except Exception as e:
         logger.exception("user_status user_id=%s error: %s", user_id, e)
-        raise HTTPException(status_code=500, detail=f"Internal error retrieving user status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal error retrieving user status.")
 
 
 @app.get("/admin/users", response_model=list[AdminUserOut])
@@ -5118,7 +5213,7 @@ async def retry_api_failure(
         return {"ok": True, "user_id": user_id, "gross_profit": result.gross_profit}
     except Exception as e:
         await _record_api_failure("admin_retry", user_id, str(e))
-        raise HTTPException(status_code=502, detail=f"Retry failed: {e}")
+        raise HTTPException(status_code=502, detail="Retry failed. Check admin API failures.")
 
 
 # --- Admin: User export CSV ---
@@ -5525,7 +5620,8 @@ async def admin_deduction_trigger(
     mult = _get_deduction_multiplier(db)
     log_entries, err = run_daily_token_deduction(db, deduction_multiplier=mult)
     if err:
-        raise HTTPException(status_code=500, detail=err)
+        logger.error("admin_deduction_trigger failed: %s", err)
+        raise HTTPException(status_code=500, detail="Deduction failed. Check server logs.")
     with _deduction_logs_lock:
         for e in log_entries:
             _deduction_logs.append(e)
@@ -6037,11 +6133,15 @@ def user_referral_info(
     db: Session = Depends(database.get_db),
 ):
     """Referral code, upline info, total USDT Credit earned, referred users count, saved USDT address."""
+    ri_cache_key = f"referral-info:{current_user.id}"
+    ri_cached = _rcache_get(ri_cache_key)
+    if ri_cached is not None:
+        return ri_cached
     uc = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == current_user.id).first()
     total_earned = float(uc.total_earned or 0) if uc else 0.0
     level1 = db.query(models.User).filter(models.User.id == current_user.referred_by).first() if current_user.referred_by else None
     referred_count = db.query(models.User).filter(models.User.referred_by == current_user.id).count()
-    return {
+    ri_result = {
         "referral_code": current_user.referral_code or "",
         "referrer_id": current_user.referred_by,
         "referrer_email": level1.email if level1 else None,
@@ -6049,6 +6149,8 @@ def user_referral_info(
         "referred_users_count": referred_count,
         "usdt_withdraw_address": (current_user.usdt_withdraw_address or "").strip() or None,
     }
+    _rcache_set(ri_cache_key, ri_result)
+    return ri_result
 
 
 @app.get("/api/v1/user/referral-downline")
@@ -6064,22 +6166,31 @@ def user_referral_downline(
         .order_by(models.User.created_at.desc())
         .all()
     )
-    out = []
-    for user_id, email, created_at in referred:
-        total_from_them = (
-            db.query(func.coalesce(func.sum(models.ReferralReward.reward_l1), 0))
+    referred_ids = [uid for uid, _, _ in referred]
+    earned_map: dict = {}
+    if referred_ids:
+        earned_rows = (
+            db.query(
+                models.ReferralReward.burning_user_id,
+                func.coalesce(func.sum(models.ReferralReward.reward_l1), 0),
+            )
             .filter(
                 models.ReferralReward.level_1_id == current_user.id,
-                models.ReferralReward.burning_user_id == user_id,
+                models.ReferralReward.burning_user_id.in_(referred_ids),
             )
-            .scalar()
+            .group_by(models.ReferralReward.burning_user_id)
+            .all()
         )
-        out.append({
-            "user_id": user_id,
+        earned_map = {uid: float(amt) for uid, amt in earned_rows}
+    out = [
+        {
+            "user_id": uid,
             "email_masked": _mask_email(email),
             "created_at": created_at.isoformat() + "Z" if created_at else None,
-            "total_usdt_earned_from_them": float(total_from_them or 0),
-        })
+            "total_usdt_earned_from_them": earned_map.get(uid, 0.0),
+        }
+        for uid, email, created_at in referred
+    ]
     return out
 
 
@@ -6090,6 +6201,10 @@ def user_referral_reward_history(
     db: Session = Depends(database.get_db),
 ):
     """List reward history for current user (earned as L1/L2/L3 from downline token burns)."""
+    rrh_cache_key = f"referral-reward-history:{current_user.id}"
+    rrh_cached = _rcache_get(rrh_cache_key)
+    if rrh_cached is not None:
+        return rrh_cached
     rows = (
         db.query(models.ReferralReward, models.User)
         .join(models.User, models.User.id == models.ReferralReward.burning_user_id)
@@ -6122,6 +6237,7 @@ def user_referral_reward_history(
             "amount_usdt_credit": amount,
             "level": level,
         })
+    _rcache_set(rrh_cache_key, out)
     return out
 
 
@@ -6270,8 +6386,11 @@ def user_referral_bundle(
     referral-downline, and usdt-history. Same shapes as the individual endpoints; use when loading
     Referral & USDT tab to avoid six separate requests.
     """
+    rb_cache_key = f"referral-bundle:{current_user.id}"
+    rb_cached = _rcache_get(rb_cache_key)
+    if rb_cached is not None:
+        return rb_cached
     from sqlalchemy import func
-    # referralInfo
     uc = db.query(models.UserUsdtCredit).filter(models.UserUsdtCredit.user_id == current_user.id).first()
     total_earned = float(uc.total_earned or 0) if uc else 0.0
     level1 = db.query(models.User).filter(models.User.id == current_user.referred_by).first() if current_user.referred_by else None
@@ -6346,29 +6465,38 @@ def user_referral_bundle(
             "amount_usdt_credit": amount,
             "level": level,
         })
-    # referral-downline
+    # referral-downline (batched to avoid N+1)
     referred = (
         db.query(models.User.id, models.User.email, models.User.created_at)
         .filter(models.User.referred_by == current_user.id)
         .order_by(models.User.created_at.desc())
         .all()
     )
-    downline = []
-    for uid, email, created_at in referred:
-        total_from_them = (
-            db.query(func.coalesce(func.sum(models.ReferralReward.reward_l1), 0))
+    referred_ids = [uid for uid, _, _ in referred]
+    earned_map: dict = {}
+    if referred_ids:
+        earned_rows = (
+            db.query(
+                models.ReferralReward.burning_user_id,
+                func.coalesce(func.sum(models.ReferralReward.reward_l1), 0),
+            )
             .filter(
                 models.ReferralReward.level_1_id == current_user.id,
-                models.ReferralReward.burning_user_id == uid,
+                models.ReferralReward.burning_user_id.in_(referred_ids),
             )
-            .scalar()
+            .group_by(models.ReferralReward.burning_user_id)
+            .all()
         )
-        downline.append({
+        earned_map = {uid: float(amt) for uid, amt in earned_rows}
+    downline = [
+        {
             "user_id": uid,
             "email_masked": _mask_email(email),
             "created_at": created_at.isoformat() + "Z" if created_at else None,
-            "total_usdt_earned_from_them": float(total_from_them or 0),
-        })
+            "total_usdt_earned_from_them": earned_map.get(uid, 0.0),
+        }
+        for uid, email, created_at in referred
+    ]
     # usdt-history
     uh_rows = (
         db.query(models.UsdtHistory)
@@ -6388,7 +6516,7 @@ def user_referral_bundle(
         }
         for r in uh_rows
     ]
-    return {
+    rb_result = {
         "referralInfo": referral_info,
         "usdtCredit": usdt_credit,
         "withdrawals": withdrawals,
@@ -6396,6 +6524,8 @@ def user_referral_bundle(
         "downline": downline,
         "usdtHistory": usdt_history,
     }
+    _rcache_set(rb_cache_key, rb_result)
+    return rb_result
 
 
 # --- User: Create withdrawal request (legacy; uses body address) ---
@@ -6598,7 +6728,9 @@ def admin_get_settings(
         "bot_auto_start": "true", "referral_system_enabled": "true", "withdrawal_enabled": "true", "maintenance_mode": "false",
         "api_keys_help_url": "#",
     }
-    result = [AdminSettingOut(key=k, value=_get_setting(db, k, defaults.get(k, ""))) for k in keys]
+    all_settings = db.query(models.AdminSetting).filter(models.AdminSetting.key.in_(keys)).all()
+    settings_map = {s.key: s.value for s in all_settings if s.value}
+    result = [AdminSettingOut(key=k, value=settings_map.get(k, defaults.get(k, ""))) for k in keys]
     _rcache_set(cache_key, result)
     return result
 
@@ -7346,6 +7478,12 @@ async def wallet_summary(
     """
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized for this user.")
+
+    wcache_key = f"wallets:{user_id}"
+    wcached = _rcache_get(wcache_key)
+    if wcached is not None:
+        return wcached
+
     try:
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user:
@@ -7376,6 +7514,7 @@ async def wallet_summary(
         exp = await bitfinex_cache.cache_expires_at(user_id, bitfinex_cache.KEY_WALLETS)
         if exp is not None:
             response.headers["X-Cache-Expires-At"] = str(int(exp))
+    _rcache_set(wcache_key, data)
     return data
 
 
@@ -7632,7 +7771,7 @@ def token_deposit(
         except Exception as e:
             db.rollback()
             logger.exception("token_deposit_bypass failed: %s", e)
-            return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+            return JSONResponse(status_code=500, content={"status": "error", "message": "Token deposit failed."})
         return {
             "status": "success",
             "usd_amount": amount_float,
@@ -7681,7 +7820,8 @@ async def create_checkout_session_tokens(
         )
         return {"url": session.url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("stripe_token_checkout failed user_id=%s: %s", current_user.id, e)
+        raise HTTPException(status_code=500, detail="Payment setup failed. Please try again.")
 
 
 def _get_stripe_price_id(plan: str, interval: str) -> str:
@@ -7920,7 +8060,8 @@ async def create_checkout_session(
         )
         return {"url": session.url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("stripe_checkout_create failed for user_id=%s: %s", current_user.id, e)
+        raise HTTPException(status_code=500, detail="Failed to create checkout session. Please try again.")
 
 
 STRIPE_WEBHOOK_DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stripe_webhook_debug.log")

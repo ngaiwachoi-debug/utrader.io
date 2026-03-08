@@ -155,12 +155,14 @@ def run_daily_token_deduction(
         date_utc = _utc_today()
         skipped_already_processed = 0
         skipped_snapshot_not_today = 0
+
+        # Pre-filter eligible users to batch-fetch purchased_tokens
+        eligible: list = []
         for token_row, snap, user in rows:
             user_id = token_row.user_id
             if getattr(snap, "last_deduction_processed_date", None) == date_utc:
                 skipped_already_processed += 1
-                continue  # already processed (prevent double-charge)
-            # Date-gate: only deduct when snapshot is for today (never charge yesterday's amount for today).
+                continue
             snapshot_date = getattr(snap, "last_daily_snapshot_date", None)
             if snapshot_date is None or snapshot_date != date_utc:
                 skipped_snapshot_not_today += 1
@@ -169,7 +171,6 @@ def run_daily_token_deduction(
                     user_id, snapshot_date, date_utc,
                 )
                 continue
-            email = getattr(user, "email", None) or ""
             daily_gross = getattr(snap, "daily_gross_profit_usd", None)
             if daily_gross is None:
                 daily_gross = 0.0
@@ -177,59 +178,86 @@ def run_daily_token_deduction(
             amount_to_deduct = round(daily_gross * float(deduction_multiplier), 2)
             if amount_to_deduct <= 0:
                 continue
-
             tokens_before = round(float(token_row.tokens_remaining or 0), 2)
             new_tokens, should_deduct = apply_deduction_rule(tokens_before, amount_to_deduct)
             if not should_deduct:
                 continue
+            eligible.append((token_row, snap, user, daily_gross, amount_to_deduct, tokens_before))
 
-            tokens_deducted = amount_to_deduct
+        # Batch-fetch purchased_tokens for all eligible users (1 query instead of N)
+        purchased_map: dict = {}
+        if eligible:
+            eligible_ids = [token_row.user_id for token_row, *_ in eligible]
+            try:
+                p_rows = (
+                    db.query(models.UserTokenBalance.user_id, models.UserTokenBalance.purchased_tokens)
+                    .filter(models.UserTokenBalance.user_id.in_(eligible_ids))
+                    .all()
+                )
+                purchased_map = {uid: max(0.0, float(pt or 0)) for uid, pt in p_rows}
+            except Exception:
+                for uid in eligible_ids:
+                    purchased_map[uid] = token_ledger_svc.purchased_tokens_for_referral(db, uid)
 
-            purchased_added = token_ledger_svc.purchased_tokens_for_referral(db, user_id)
-            free_remaining = max(0.0, tokens_before - purchased_added)
-            purchased_burned = max(0.0, amount_to_deduct - free_remaining)
-            if purchased_burned > 0:
-                apply_referral_rewards(db, user_id, purchased_burned)
+        BATCH_SIZE = 50
+        for batch_start in range(0, len(eligible), BATCH_SIZE):
+            batch = eligible[batch_start:batch_start + BATCH_SIZE]
+            for token_row, snap, user, daily_gross, amount_to_deduct, tokens_before in batch:
+                user_id = token_row.user_id
+                email = getattr(user, "email", None) or ""
+                tokens_deducted = amount_to_deduct
 
-            new_tokens = token_ledger_svc.deduct_tokens(db, user_id, tokens_deducted)
-            token_row.last_gross_usd_used = daily_gross
-            token_row.updated_at = now_utc
+                purchased_added = purchased_map.get(user_id, 0.0)
+                free_remaining = max(0.0, tokens_before - purchased_added)
+                purchased_burned = max(0.0, amount_to_deduct - free_remaining)
+                if purchased_burned > 0:
+                    apply_referral_rewards(db, user_id, purchased_burned)
 
-            gross_profit_usd = float(getattr(snap, "gross_profit_usd", None) or 0)
-            total_used_tokens = int(gross_profit_usd * TOKENS_PER_USDT_GROSS) if gross_profit_usd else 0
-            account_switch_note = getattr(snap, "account_switch_note", None)
+                new_tokens = token_ledger_svc.deduct_tokens(db, user_id, tokens_deducted)
+                token_row.last_gross_usd_used = daily_gross
+                token_row.updated_at = now_utc
 
-            log_entries.append({
-                "user_id": user_id,
-                "email": email,
-                "gross_profit": daily_gross,
-                "tokens_deducted": tokens_deducted,
-                "tokens_remaining_before": tokens_before,
-                "tokens_remaining_after": round(new_tokens, 2),
-                "timestamp": now_utc.isoformat() + "Z",
-                "total_used_tokens": total_used_tokens,
-                "account_switch_note": account_switch_note,
-            })
+                gross_profit_usd = float(getattr(snap, "gross_profit_usd", None) or 0)
+                total_used_tokens = int(gross_profit_usd * TOKENS_PER_USDT_GROSS) if gross_profit_usd else 0
+                account_switch_note = getattr(snap, "account_switch_note", None)
 
-            if hasattr(models, "DeductionLog"):
-                db.add(models.DeductionLog(
-                    user_id=user_id,
-                    email=email or None,
-                    timestamp_utc=now_utc,
-                    daily_gross_profit_usd=daily_gross,
-                    tokens_deducted=tokens_deducted,
-                    total_used_tokens=float(total_used_tokens),
-                    tokens_remaining_after=round(new_tokens, 2),
-                    account_switch_note=account_switch_note,
-                ))
-            if getattr(snap, "account_switch_note", None) is not None:
-                snap.account_switch_note = None
-            if hasattr(snap, "deduction_processed"):
-                snap.deduction_processed = True
-            if hasattr(snap, "last_deduction_processed_date"):
-                snap.last_deduction_processed_date = date_utc
+                log_entries.append({
+                    "user_id": user_id,
+                    "email": email,
+                    "gross_profit": daily_gross,
+                    "tokens_deducted": tokens_deducted,
+                    "tokens_remaining_before": tokens_before,
+                    "tokens_remaining_after": round(new_tokens, 2),
+                    "timestamp": now_utc.isoformat() + "Z",
+                    "total_used_tokens": total_used_tokens,
+                    "account_switch_note": account_switch_note,
+                })
 
-        db.commit()
+                if hasattr(models, "DeductionLog"):
+                    db.add(models.DeductionLog(
+                        user_id=user_id,
+                        email=email or None,
+                        timestamp_utc=now_utc,
+                        daily_gross_profit_usd=daily_gross,
+                        tokens_deducted=tokens_deducted,
+                        total_used_tokens=float(total_used_tokens),
+                        tokens_remaining_after=round(new_tokens, 2),
+                        account_switch_note=account_switch_note,
+                    ))
+                if getattr(snap, "account_switch_note", None) is not None:
+                    snap.account_switch_note = None
+                if hasattr(snap, "deduction_processed"):
+                    snap.deduction_processed = True
+                if hasattr(snap, "last_deduction_processed_date"):
+                    snap.last_deduction_processed_date = date_utc
+
+            # Commit per batch to avoid holding a giant transaction
+            try:
+                db.commit()
+            except Exception as batch_err:
+                _log.error("run_daily_token_deduction batch commit failed at offset %d: %s", batch_start, batch_err)
+                db.rollback()
+
         if skipped_already_processed or skipped_snapshot_not_today or log_entries:
             _log.info(
                 "run_daily_token_deduction date_utc=%s skipped_already_processed=%d skipped_snapshot_not_today=%d deducted=%d",

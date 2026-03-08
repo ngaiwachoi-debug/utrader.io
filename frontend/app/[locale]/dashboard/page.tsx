@@ -98,13 +98,8 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
     const isSuccess = sub === "success" || tokens === "success"
     const isCancel = sub === "cancel"
     
-    if (!isSuccess && !isCancel) {
-      paymentProcessedRef.current = false
-      return
-    }
-
+    if (!isSuccess && !isCancel) return
     if (paymentProcessedRef.current) return
-    paymentProcessedRef.current = true
 
     const clearUrl = () => {
       const next = new URLSearchParams(searchParams?.toString() ?? "")
@@ -114,7 +109,9 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
       router.replace(pathname + (q ? `?${q}` : ""))
     }
 
-    if (isSuccess && userId != null) {
+    if (isSuccess) {
+      if (userId == null) return
+      paymentProcessedRef.current = true
       ;(async () => {
         await Promise.all([
           getUserStatus(id).refetch(),
@@ -129,6 +126,7 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
     }
 
     if (isCancel) {
+      paymentProcessedRef.current = true
       toast.info(t("payment.notCompletedToast"))
       setPaymentReturnStatus("cancel")
       clearUrl()

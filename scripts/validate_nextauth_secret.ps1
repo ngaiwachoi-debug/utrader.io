@@ -6,20 +6,23 @@ $root = $PSScriptRoot + "\.."
 $rootEnv = Join-Path $root ".env"
 $frontendEnv = Join-Path $root "frontend\.env.local"
 
-$exactSecret = "xqaJwgwFBGjekuoik674vN375pHj9EzHSpV9UAgoezk="
-$line = "NEXTAUTH_SECRET=`"$exactSecret`""
-
-# 1) Check root .env
+# 1) Check root .env and extract the secret (never hardcode it)
 if (-not (Test-Path $rootEnv)) {
     Write-Host "ERROR: Root .env not found at $rootEnv"
     exit 1
 }
 $rootContent = Get-Content $rootEnv -Raw
-if ($rootContent -notmatch 'NEXTAUTH_SECRET\s*=\s*".*"') {
-    Write-Host "WARN: Root .env has no NEXTAUTH_SECRET=... line. Add: $line"
-} else {
+if ($rootContent -match 'NEXTAUTH_SECRET\s*=\s*"([^"]+)"') {
+    $exactSecret = $Matches[1]
     Write-Host "OK: Root .env contains NEXTAUTH_SECRET"
+} elseif ($rootContent -match 'NEXTAUTH_SECRET\s*=\s*(\S+)') {
+    $exactSecret = $Matches[1]
+    Write-Host "OK: Root .env contains NEXTAUTH_SECRET (unquoted)"
+} else {
+    Write-Host "ERROR: Root .env has no NEXTAUTH_SECRET=... line. Generate one with: node -e `"console.log(require('crypto').randomBytes(32).toString('base64'))`""
+    exit 1
 }
+$line = "NEXTAUTH_SECRET=`"$exactSecret`""
 
 # 2) Create or overwrite frontend/.env.local with same secret (UTF-8 no BOM so Next.js reads it correctly)
 $frontendDir = Join-Path $root "frontend"

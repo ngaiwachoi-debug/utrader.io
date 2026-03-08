@@ -16,9 +16,12 @@ class Payload(BaseModel):
     bfx_secret: str
 
 async def test_validation():
-    api_key = "96d1aea643c91ba4a7260702692e6e31d65bb69486f"
-    api_secret = "e5f04a8af4f1a553b9f0cffaafd51f80b2cff9998c1"
-    
+    api_key = os.getenv("TEST_BFX_KEY", "")
+    api_secret = os.getenv("TEST_BFX_SECRET", "")
+    if not api_key or not api_secret:
+        print("ERROR: Set TEST_BFX_KEY and TEST_BFX_SECRET env vars.")
+        return
+
     payload = Payload(bfx_key=api_key, bfx_secret=api_secret)
     res, err = await _validate_bitfinex_keys_only(payload)
     print("res:", res)

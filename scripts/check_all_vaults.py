@@ -10,7 +10,7 @@ import models
 
 def main():
     db = SessionLocal()
-    print("DB URL:", os.getenv("DATABASE_URL")[:30] + "...")
+    print("DB: connected via DATABASE_URL")
     users = db.query(models.User).all()
     for u in users:
         print(f"User {u.id}: {u.email} - Has vault: {bool(u.vault)}")

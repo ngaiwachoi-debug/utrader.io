@@ -1,7 +1,13 @@
 node_modules/
 .next/
-.env*
+.env
+.env.local
+.env.*.local
 __pycache__/
 .deduction_test_out.txt
 debug*.log
 .cursor/debug*.log
+backups/
+*.sql.gz
+stripe_webhook_debug.log
+stop_bot_debug.log

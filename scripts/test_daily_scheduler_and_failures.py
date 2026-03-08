@@ -30,10 +30,13 @@ from database import SessionLocal
 import models
 import security
 
-# Test user and Bitfinex keys (same ledger data as choiwangai script → ~68.93)
-TEST_EMAIL = "test-scheduler@test.com"
-API_KEY = "96d1aea643c91ba4a7260702692e6e31d65bb69486f"
-API_SECRET = "e5f04a8af4f1a553b9f0cffaafd51f80b2cff9998c1"
+# Test user and Bitfinex keys — must be set via env vars (never hardcode real keys)
+TEST_EMAIL = os.getenv("TEST_BFX_EMAIL", "test-scheduler@test.com")
+API_KEY = os.getenv("TEST_BFX_KEY", "")
+API_SECRET = os.getenv("TEST_BFX_SECRET", "")
+if not API_KEY or not API_SECRET:
+    print("ERROR: Set TEST_BFX_KEY and TEST_BFX_SECRET env vars before running this test.")
+    sys.exit(1)
 REGISTRATION_DT = datetime(2026, 2, 22, 9, 30, 0)  # UTC
 EXPECTED_GROSS = 68.93  # allow small tolerance
 TOLERANCE = 0.50

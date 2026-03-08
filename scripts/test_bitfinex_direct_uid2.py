@@ -8,7 +8,7 @@ load_dotenv(dotenv_path=_env_path)
 from database import SessionLocal
 import models
 db = SessionLocal()
-print("DATABASE_URL:", os.getenv("DATABASE_URL"))
+print("DB: connected via DATABASE_URL")
 print("User 2 email:", db.query(models.User).filter(models.User.id == 2).first().email)
 print("User 2 has vault?", bool(db.query(models.User).filter(models.User.id == 2).first().vault))
 

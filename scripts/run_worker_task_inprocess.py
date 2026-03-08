@@ -28,7 +28,7 @@ async def main():
     from worker import run_bot_task, _tokens_remaining_for_user
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    print(f"Redis: {redis_url[:50]}...")
+    print("Redis: connected via REDIS_URL")
     print(f"User ID: {USER_ID}\n")
 
     settings = RedisSettings.from_dsn(redis_url)
