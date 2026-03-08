@@ -296,6 +296,7 @@ async def _run_09_00_ledger_cache_scheduler() -> None:
                 row[0]
                 for row in db.query(models.User.id)
                 .join(models.APIVault, models.User.id == models.APIVault.user_id)
+                .filter(models.User.status != "dormant")
                 .distinct()
                 .all()
             ]
@@ -375,6 +376,7 @@ async def _run_daily_gross_profit_scheduler() -> None:
                 row[0]
                 for row in db.query(models.User.id)
                 .join(models.APIVault, models.User.id == models.APIVault.user_id)
+                .filter(models.User.status != "dormant")
                 .distinct()
                 .all()
             ]
@@ -881,6 +883,7 @@ async def _run_late_fee_scheduler() -> None:
                 db.query(models.UserProfitSnapshot, models.UserTokenBalance, models.User)
                 .join(models.UserTokenBalance, models.UserProfitSnapshot.user_id == models.UserTokenBalance.user_id)
                 .join(models.User, models.User.id == models.UserTokenBalance.user_id)
+                .filter(models.User.status != "dormant")
                 .all()
             )
             for snap, token_row, user in rows:
@@ -951,6 +954,7 @@ async def _run_2300_reconciliation_scheduler() -> None:
                     .join(models.APIVault, models.APIVault.user_id == models.User.id)
                     .join(models.UserProfitSnapshot, models.UserProfitSnapshot.user_id == models.User.id)
                     .filter(snap_model.reconciliation_completed == False)
+                    .filter(models.User.status != "dormant")
                     .all()
                 )
             # Filter to users with keys_updated_at after 11:15 today
@@ -996,6 +1000,257 @@ async def _run_2300_reconciliation_scheduler() -> None:
                     await asyncio.sleep(1)
         except Exception as e:
             logger.exception("trace_id=%s | 23:00 reconciliation scheduler error: %s", get_trace_id(), e)
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Scenario A: 02:00 UTC – Stale API key cleanup (zombie accounts)
+# ---------------------------------------------------------------------------
+def _get_next_0200_utc_wait_sec() -> float:
+    now = datetime.utcnow()
+    target = now.replace(hour=2, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def _run_stale_key_cleanup_scheduler() -> None:
+    """02:00 UTC daily: wipe API keys for zombie accounts."""
+    while True:
+        wait_sec = _get_next_0200_utc_wait_sec()
+        logger.info("Next stale-key cleanup at 02:00 UTC in %.0fs", wait_sec)
+        await asyncio.sleep(wait_sec)
+        db = database.SessionLocal()
+        try:
+            invalid_days_threshold = int(_get_setting(db, "stale_key_invalid_days", "30"))
+            inactive_days_threshold = int(_get_setting(db, "stale_key_inactive_days", "90"))
+            cutoff_date = datetime.utcnow() - timedelta(days=inactive_days_threshold)
+            today_utc = datetime.utcnow().date()
+
+            # Users with invalid keys for N+ consecutive days
+            stale_invalid = (
+                db.query(models.User)
+                .join(models.APIVault, models.APIVault.user_id == models.User.id)
+                .join(models.UserProfitSnapshot, models.UserProfitSnapshot.user_id == models.User.id)
+                .filter(models.UserProfitSnapshot.invalid_key_days >= invalid_days_threshold)
+                .all()
+            )
+
+            # Users with vault but inactive for N+ days (bot stopped, no recent login or snapshot)
+            stale_inactive = (
+                db.query(models.User)
+                .join(models.APIVault, models.APIVault.user_id == models.User.id)
+                .filter(models.User.bot_status == "stopped")
+                .filter(
+                    (models.User.last_login_at.is_(None)) | (models.User.last_login_at < cutoff_date)
+                )
+                .all()
+            )
+
+            seen_ids: set = set()
+            wiped_count = 0
+            all_stale = stale_invalid + stale_inactive
+            for user in all_stale:
+                if user.id in seen_ids:
+                    continue
+                seen_ids.add(user.id)
+                vault = db.query(models.APIVault).filter(models.APIVault.user_id == user.id).first()
+                if not vault:
+                    continue
+                db.delete(vault)
+                # Reset invalid_key_days
+                snap = db.query(models.UserProfitSnapshot).filter(
+                    models.UserProfitSnapshot.user_id == user.id
+                ).first()
+                if snap and hasattr(snap, "invalid_key_days"):
+                    snap.invalid_key_days = 0
+                # Stop bot if somehow still running
+                if user.bot_status != "stopped":
+                    user.bot_status = "stopped"
+                    user.bot_desired_state = "stopped"
+                # In-app notification
+                db.add(models.AdminNotification(
+                    title="API Keys Removed",
+                    content="Your API keys were removed due to prolonged inactivity or invalid credentials. Re-add them to resume lending.",
+                    type="warning",
+                    target_user_id=user.id,
+                ))
+                wiped_count += 1
+                logger.info("stale_key_cleanup wiped vault for user_id=%s email=%s", user.id, user.email)
+
+            if wiped_count > 0:
+                db.commit()
+                _admin_audit("system", "stale_key_cleanup", {"wiped_count": wiped_count, "date": today_utc.isoformat()})
+            logger.info("stale_key_cleanup done: wiped=%d (invalid_threshold=%d, inactive_threshold=%d)", wiped_count, invalid_days_threshold, inactive_days_threshold)
+        except Exception as e:
+            logger.exception("stale_key_cleanup error: %s", e)
+            db.rollback()
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Scenario C: Sunday 03:00 UTC – Weekly data cleanup (DB bloat prevention)
+# ---------------------------------------------------------------------------
+def _get_next_sunday_0300_utc_wait_sec() -> float:
+    now = datetime.utcnow()
+    days_until_sunday = (6 - now.weekday()) % 7
+    if days_until_sunday == 0 and (now.hour > 3 or (now.hour == 3 and now.minute > 0)):
+        days_until_sunday = 7
+    target = (now + timedelta(days=days_until_sunday)).replace(hour=3, minute=0, second=0, microsecond=0)
+    return max(0, (target - now).total_seconds())
+
+
+def _run_cleanup_queries(db) -> dict:
+    """Execute cleanup queries and return counts. Does NOT commit — caller commits."""
+    deduction_log_days = int(_get_setting(db, "cleanup_deduction_log_days", "180"))
+    token_ledger_days = int(_get_setting(db, "cleanup_token_ledger_days", "365"))
+    dormant_days = int(_get_setting(db, "cleanup_dormant_days", "180"))
+    now = datetime.utcnow()
+
+    # 1. Prune old deduction logs
+    deduction_cutoff = now - timedelta(days=deduction_log_days)
+    d1 = db.execute(
+        text("DELETE FROM deduction_log WHERE created_at < :cutoff"),
+        {"cutoff": deduction_cutoff},
+    )
+    deduction_pruned = d1.rowcount
+
+    # 2. Prune old token ledger entries for zeroed-out stopped users with no vault
+    ledger_cutoff = now - timedelta(days=token_ledger_days)
+    d2 = db.execute(
+        text("""
+            DELETE FROM token_ledger WHERE id IN (
+                SELECT tl.id FROM token_ledger tl
+                JOIN user_token_balance utb ON utb.user_id = tl.user_id
+                JOIN users u ON u.id = tl.user_id
+                LEFT JOIN api_vault av ON av.user_id = tl.user_id
+                WHERE tl.created_at < :cutoff
+                  AND utb.tokens_remaining <= 0
+                  AND u.bot_status = 'stopped'
+                  AND av.user_id IS NULL
+            )
+        """),
+        {"cutoff": ledger_cutoff},
+    )
+    ledger_pruned = d2.rowcount
+
+    # 3. Prune stale profit snapshots for users with no vault and old snapshot
+    snapshot_cutoff = (now - timedelta(days=90)).date()
+    d3 = db.execute(
+        text("""
+            DELETE FROM user_profit_snapshot WHERE user_id IN (
+                SELECT ups.user_id FROM user_profit_snapshot ups
+                LEFT JOIN api_vault av ON av.user_id = ups.user_id
+                WHERE av.user_id IS NULL
+                  AND (ups.last_daily_snapshot_date IS NULL OR ups.last_daily_snapshot_date < :cutoff)
+            )
+        """),
+        {"cutoff": snapshot_cutoff},
+    )
+    snapshots_pruned = d3.rowcount
+
+    # 4. Mark dormant users
+    dormant_cutoff = now - timedelta(days=dormant_days)
+    d4 = db.execute(
+        text("""
+            UPDATE users SET status = 'dormant'
+            WHERE status = 'active'
+              AND id NOT IN (SELECT user_id FROM api_vault)
+              AND created_at < :cutoff
+              AND (last_login_at IS NULL OR last_login_at < :cutoff)
+              AND id IN (
+                  SELECT user_id FROM user_token_balance WHERE tokens_remaining <= 0
+              )
+        """),
+        {"cutoff": dormant_cutoff},
+    )
+    dormant_marked = d4.rowcount
+
+    return {
+        "deduction_logs_pruned": deduction_pruned,
+        "token_ledger_pruned": ledger_pruned,
+        "snapshots_pruned": snapshots_pruned,
+        "dormant_users_marked": dormant_marked,
+    }
+
+
+def _run_cleanup_preview(db) -> dict:
+    """Count what WOULD be cleaned up without making changes."""
+    deduction_log_days = int(_get_setting(db, "cleanup_deduction_log_days", "180"))
+    token_ledger_days = int(_get_setting(db, "cleanup_token_ledger_days", "365"))
+    dormant_days = int(_get_setting(db, "cleanup_dormant_days", "180"))
+    now = datetime.utcnow()
+
+    deduction_cutoff = now - timedelta(days=deduction_log_days)
+    ledger_cutoff = now - timedelta(days=token_ledger_days)
+    snapshot_cutoff = (now - timedelta(days=90)).date()
+    dormant_cutoff = now - timedelta(days=dormant_days)
+
+    r1 = db.execute(text("SELECT COUNT(*) FROM deduction_log WHERE created_at < :cutoff"), {"cutoff": deduction_cutoff}).scalar()
+    r2 = db.execute(text("""
+        SELECT COUNT(*) FROM token_ledger tl
+        JOIN user_token_balance utb ON utb.user_id = tl.user_id
+        JOIN users u ON u.id = tl.user_id
+        LEFT JOIN api_vault av ON av.user_id = tl.user_id
+        WHERE tl.created_at < :cutoff AND utb.tokens_remaining <= 0 AND u.bot_status = 'stopped' AND av.user_id IS NULL
+    """), {"cutoff": ledger_cutoff}).scalar()
+    r3 = db.execute(text("""
+        SELECT COUNT(*) FROM user_profit_snapshot ups
+        LEFT JOIN api_vault av ON av.user_id = ups.user_id
+        WHERE av.user_id IS NULL AND (ups.last_daily_snapshot_date IS NULL OR ups.last_daily_snapshot_date < :cutoff)
+    """), {"cutoff": snapshot_cutoff}).scalar()
+    r4 = db.execute(text("""
+        SELECT COUNT(*) FROM users u
+        WHERE u.status = 'active'
+          AND u.id NOT IN (SELECT user_id FROM api_vault)
+          AND u.created_at < :cutoff
+          AND (u.last_login_at IS NULL OR u.last_login_at < :cutoff)
+          AND u.id IN (SELECT user_id FROM user_token_balance WHERE tokens_remaining <= 0)
+    """), {"cutoff": dormant_cutoff}).scalar()
+
+    # Stale key counts
+    invalid_days_threshold = int(_get_setting(db, "stale_key_invalid_days", "30"))
+    inactive_days_threshold = int(_get_setting(db, "stale_key_inactive_days", "90"))
+    inactive_cutoff = now - timedelta(days=inactive_days_threshold)
+    r5_invalid = db.execute(text("""
+        SELECT COUNT(*) FROM api_vault av
+        JOIN user_profit_snapshot ups ON ups.user_id = av.user_id
+        WHERE ups.invalid_key_days >= :threshold
+    """), {"threshold": invalid_days_threshold}).scalar()
+    r5_inactive = db.execute(text("""
+        SELECT COUNT(*) FROM api_vault av
+        JOIN users u ON u.id = av.user_id
+        WHERE u.bot_status = 'stopped'
+          AND (u.last_login_at IS NULL OR u.last_login_at < :cutoff)
+    """), {"cutoff": inactive_cutoff}).scalar()
+
+    return {
+        "deduction_logs_to_prune": r1 or 0,
+        "token_ledger_to_prune": r2 or 0,
+        "snapshots_to_prune": r3 or 0,
+        "dormant_users_to_mark": r4 or 0,
+        "stale_keys_invalid": r5_invalid or 0,
+        "stale_keys_inactive": r5_inactive or 0,
+    }
+
+
+async def _run_weekly_data_cleanup_scheduler() -> None:
+    """Sunday 03:00 UTC: prune old logs, mark dormant users."""
+    while True:
+        wait_sec = _get_next_sunday_0300_utc_wait_sec()
+        logger.info("Next weekly data cleanup (Sunday 03:00 UTC) in %.0fs", wait_sec)
+        await asyncio.sleep(wait_sec)
+        db = database.SessionLocal()
+        try:
+            result = _run_cleanup_queries(db)
+            db.commit()
+            _admin_audit("system", "weekly_cleanup", result)
+            logger.info("weekly_cleanup done: %s", result)
+        except Exception as e:
+            logger.exception("weekly_cleanup error: %s", e)
+            db.rollback()
         finally:
             db.close()
 
@@ -1176,6 +1431,17 @@ async def lifespan(app: FastAPI):
             db.close()
     except Exception as e:
         logger.warning("Startup token_ledger ensure failed: %s", e)
+    # Ensure last_login_at column exists on users table
+    try:
+        db = database.SessionLocal()
+        try:
+            db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP"))
+            db.commit()
+            logger.info("Startup: users.last_login_at column ensured")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("Startup last_login_at ensure failed: %s", e)
     # Production safety: warn loudly if dev endpoints are enabled
     if os.getenv("ALLOW_DEV_CONNECT") == "1":
         logger.warning(
@@ -1195,37 +1461,16 @@ async def lifespan(app: FastAPI):
     catchup_task = asyncio.create_task(_run_11_15_catchup_deduction_scheduler())
     late_fee_task = asyncio.create_task(_run_late_fee_scheduler())
     reconciliation_2300_task = asyncio.create_task(_run_2300_reconciliation_scheduler())
+    stale_key_task = asyncio.create_task(_run_stale_key_cleanup_scheduler())
+    weekly_cleanup_task = asyncio.create_task(_run_weekly_data_cleanup_scheduler())
     yield
-    ledger_cache_task.cancel()
-    scheduler_task.cancel()
-    deduction_task.cancel()
-    catchup_task.cancel()
-    late_fee_task.cancel()
-    reconciliation_2300_task.cancel()
-    try:
-        await ledger_cache_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await deduction_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await catchup_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await late_fee_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await reconciliation_2300_task
-    except asyncio.CancelledError:
-        pass
+    for t in [ledger_cache_task, scheduler_task, deduction_task, catchup_task,
+              late_fee_task, reconciliation_2300_task, stale_key_task, weekly_cleanup_task]:
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="bifinexbot.com API", lifespan=lifespan)
@@ -1467,6 +1712,13 @@ def _get_or_create_user_by_email_for_session(email: str, referral_code: Optional
     user = db.query(models.User).filter(models.User.email == email).first()
     if user:
         _apply_referral_first_touch(user, referral_code, db)
+        try:
+            user.last_login_at = datetime.utcnow()
+            if getattr(user, "status", None) == "dormant":
+                user.status = "active"
+            db.commit()
+        except Exception:
+            db.rollback()
         return user
     return _create_user_by_email(email, referral_code, db)
 
@@ -2141,6 +2393,11 @@ class AdminSettingsUpdateBody(BaseModel):
     withdrawal_enabled: Optional[bool] = None
     maintenance_mode: Optional[bool] = None
     api_keys_help_url: Optional[str] = None
+    stale_key_invalid_days: Optional[int] = None
+    stale_key_inactive_days: Optional[int] = None
+    cleanup_deduction_log_days: Optional[int] = None
+    cleanup_token_ledger_days: Optional[int] = None
+    cleanup_dormant_days: Optional[int] = None
 
 
 class UserOverviewOut(BaseModel):
@@ -5677,6 +5934,28 @@ def admin_deduction_rollback(
     return {"status": "success", "user_id": user_id, "date": date, "tokens_added_back": total_add_back, "new_tokens_remaining": new_remaining}
 
 
+# --- Admin: Cleanup (Scenario A + C) ---
+@app.post("/admin/cleanup/preview")
+def admin_cleanup_preview(
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Preview what the cleanup would do without making changes."""
+    return _run_cleanup_preview(db)
+
+
+@app.post("/admin/cleanup/run")
+def admin_cleanup_run(
+    admin_user: models.User = Depends(get_admin_user),
+    db: Session = Depends(database.get_db),
+):
+    """Execute data cleanup: prune old logs, mark dormant users."""
+    result = _run_cleanup_queries(db)
+    db.commit()
+    _admin_audit(admin_user.email or "", "admin_cleanup_run", result)
+    return {"status": "success", **result}
+
+
 # --- Admin: System health ---
 @app.get("/admin/health")
 async def admin_health(_: models.User = Depends(get_admin_user)):
@@ -6770,6 +7049,16 @@ def admin_update_settings(
         updates.append(("maintenance_mode", "true" if body.maintenance_mode else "false"))
     if body.api_keys_help_url is not None:
         updates.append(("api_keys_help_url", str(body.api_keys_help_url).strip()))
+    if body.stale_key_invalid_days is not None:
+        updates.append(("stale_key_invalid_days", str(max(1, int(body.stale_key_invalid_days)))))
+    if body.stale_key_inactive_days is not None:
+        updates.append(("stale_key_inactive_days", str(max(1, int(body.stale_key_inactive_days)))))
+    if body.cleanup_deduction_log_days is not None:
+        updates.append(("cleanup_deduction_log_days", str(max(30, int(body.cleanup_deduction_log_days)))))
+    if body.cleanup_token_ledger_days is not None:
+        updates.append(("cleanup_token_ledger_days", str(max(30, int(body.cleanup_token_ledger_days)))))
+    if body.cleanup_dormant_days is not None:
+        updates.append(("cleanup_dormant_days", str(max(30, int(body.cleanup_dormant_days)))))
     for k, v in updates:
         row = db.query(models.AdminSetting).filter(models.AdminSetting.key == k).first()
         if row:

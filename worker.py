@@ -277,10 +277,12 @@ async def run_bot_task(ctx, user_id: int):
                 await flush_terminal_logs()
         asyncio.create_task(periodic_flush())
 
-        # Kill-switch loop – token balance only.
+        # Kill-switch loop – token balance + empty wallet circuit breaker.
         MAX_ENGINE_RESTARTS = 3
         engine_restart_count = 0
         loop_count = 0
+        empty_wallet_consecutive = 0  # Scenario B: count consecutive zero-balance checks
+        EMPTY_WALLET_THRESHOLD = 3    # 3 consecutive checks (~15s) before stopping
         shutdown_requested_logged = [False]  # Only log "stop requested" once per task
         try:
             while True:
@@ -367,6 +369,33 @@ async def run_bot_task(ctx, user_id: int):
                     db.commit()
                     engine_task.cancel()
                     break
+
+                # Scenario B: empty wallet circuit breaker
+                try:
+                    total_funding_usd = 0.0
+                    if ws_state and ws_state.is_ready:
+                        wallets = ws_state.get_wallets()
+                        for w in wallets:
+                            if isinstance(w, (list, tuple)) and len(w) >= 3 and w[0] == "funding":
+                                total_funding_usd += abs(float(w[2] or 0))
+                    elif hasattr(manager, '_engines') and manager._engines:
+                        total_funding_usd = 1.0  # can't check without WS; assume non-zero
+                    else:
+                        total_funding_usd = 1.0
+
+                    if total_funding_usd < 1.0:
+                        empty_wallet_consecutive += 1
+                        if empty_wallet_consecutive >= EMPTY_WALLET_THRESHOLD:
+                            await _term(redis, user_id, "Bot paused: funding wallet is empty. Deposit funds to resume.")
+                            print(f"[PAUSE] User {user_id} empty wallet for {empty_wallet_consecutive} checks. Pausing.")
+                            user.bot_status = "stopped"
+                            db.commit()
+                            engine_task.cancel()
+                            break
+                    else:
+                        empty_wallet_consecutive = 0
+                except Exception:
+                    empty_wallet_consecutive = 0
 
                 await flush_terminal_logs()
                 loop_count += 1

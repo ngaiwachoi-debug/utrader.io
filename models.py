@@ -26,10 +26,12 @@ class User(Base):
     usdt_withdraw_address = Column(String(255), nullable=True)
 
     # Lifecycle status – used by the kill switch
-    status = Column(String, default="active")  # active / expired
+    status = Column(String, default="active")  # active / expired / dormant
 
     bot_status = Column(String, default="stopped", index=True)
     bot_desired_state = Column(String(20), default="stopped", index=True)
+
+    last_login_at = Column(DateTime, nullable=True)  # updated on each bootstrap-user / Google login
 
     # Monthly API key deletion count for abuse detection (persisted; {"YYYY-MM": count})
     key_deletions = Column(Text, default="{}", nullable=True)  # JSON: {"2026-02": 2}

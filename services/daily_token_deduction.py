@@ -147,6 +147,7 @@ def run_daily_token_deduction(
                 models.UserTokenBalance.user_id == models.UserProfitSnapshot.user_id,
             )
             .join(models.User, models.User.id == models.UserTokenBalance.user_id)
+            .filter(models.User.status != "dormant")
         )
         if user_ids is not None:
             q = q.filter(models.UserTokenBalance.user_id.in_(user_ids))
@@ -221,6 +222,21 @@ def run_daily_token_deduction(
                 total_used_tokens = int(gross_profit_usd * TOKENS_PER_USDT_GROSS) if gross_profit_usd else 0
                 account_switch_note = getattr(snap, "account_switch_note", None)
 
+                # If tokens hit 0 or below, immediately stop the bot
+                bot_stopped_by_deduction = False
+                if round(new_tokens, 2) <= 0:
+                    try:
+                        user.bot_status = "stopped"
+                        if hasattr(user, "bot_desired_state"):
+                            user.bot_desired_state = "stopped"
+                        bot_stopped_by_deduction = True
+                        _log.info(
+                            "run_daily_token_deduction user_id=%s tokens_remaining=%.2f (<=0) — bot_status set to stopped",
+                            user_id, new_tokens,
+                        )
+                    except Exception:
+                        pass
+
                 log_entries.append({
                     "user_id": user_id,
                     "email": email,
@@ -231,6 +247,7 @@ def run_daily_token_deduction(
                     "timestamp": now_utc.isoformat() + "Z",
                     "total_used_tokens": total_used_tokens,
                     "account_switch_note": account_switch_note,
+                    "bot_stopped": bot_stopped_by_deduction,
                 })
 
                 if hasattr(models, "DeductionLog"):
