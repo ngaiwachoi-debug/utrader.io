@@ -3,92 +3,153 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* Binance-style light theme: white main, light grey sidebar/cards, gold accent */
+/* ── Binance-inspired dark crypto theme ── */
+/* Primary: Binance Yellow #F0B90B | Background: deep charcoal #0B0E11 */
 :root {
-  --background: #ffffff;
-  --foreground: #333333;
-  --card: #f8f8f8;
-  --card-foreground: #333333;
-  --popover: #ffffff;
-  --popover-foreground: #333333;
-  --primary: #f0b90b;
-  --primary-foreground: #1e2329;
-  --secondary: #f0f0f0;
-  --secondary-foreground: #333333;
-  --muted: #f0f0f0;
-  --muted-foreground: #888888;
-  --accent: #f0b90b;
-  --accent-foreground: #1e2329;
-  --destructive: #ea4b4b;
+  --background: #0B0E11;
+  --foreground: #EAECEF;
+  --card: #1E2026;
+  --card-foreground: #EAECEF;
+  --popover: #1E2026;
+  --popover-foreground: #EAECEF;
+  --primary: #F0B90B;
+  --primary-foreground: #0B0E11;
+  --secondary: #2B2F36;
+  --secondary-foreground: #EAECEF;
+  --muted: #2B2F36;
+  --muted-foreground: #848E9C;
+  --accent: #F0B90B;
+  --accent-foreground: #0B0E11;
+  --destructive: #F6465D;
   --destructive-foreground: #fff;
-  --border: #eaecef;
-  --input: #eaecef;
-  --ring: #f0b90b;
-  --chart-1: #0ecb81;
-  --chart-2: #f0b90b;
-  --chart-3: #229ed9;
-  --chart-4: #8b5cf6;
-  --chart-5: #ea4b4b;
-  --radius: 0.625rem;
-  --sidebar: #f8f8f8;
-  --sidebar-foreground: #333333;
-  --sidebar-primary: #f0b90b;
-  --sidebar-primary-foreground: #1e2329;
-  --sidebar-accent: #f0b90b;
-  --sidebar-accent-foreground: #1e2329;
-  --sidebar-border: #eaecef;
-  --sidebar-ring: #f0b90b;
-  --emerald: #0ecb81;
-  --emerald-light: #3fd999;
-  --emerald-dark: #0a9e6a;
-  --surface: #f8f8f8;
-  --surface-light: #ffffff;
+  --border: #2B2F36;
+  --input: #2B2F36;
+  --ring: #F0B90B;
+  --chart-1: #0ECB81;
+  --chart-2: #F0B90B;
+  --chart-3: #3B82F6;
+  --chart-4: #F6465D;
+  --chart-5: #A855F7;
+  --radius: 0.75rem;
+  --sidebar: #161A1E;
+  --sidebar-foreground: #EAECEF;
+  --sidebar-primary: #F0B90B;
+  --sidebar-primary-foreground: #0B0E11;
+  --sidebar-accent: #F0B90B;
+  --sidebar-accent-foreground: #0B0E11;
+  --sidebar-border: #2B2F36;
+  --sidebar-ring: #F0B90B;
+  --emerald: #0ECB81;
+  --emerald-light: #49E0A1;
+  --emerald-dark: #09A566;
+  --surface: #1E2026;
+  --surface-light: #2B2F36;
+  --gold: #F0B90B;
+  --gold-dim: #E8820C;
+  --red: #F6465D;
+  --green: #0ECB81;
 }
 
-/* Dark theme: image style – #1C1E20 background, #FCD535 yellow for primary/CTAs, green for PnL */
-.dark {
-  --background: #1c1e20;
-  --foreground: #eaecef;
-  --card: #2c3034;
-  --card-foreground: #eaecef;
-  --popover: #2c3034;
-  --popover-foreground: #eaecef;
-  --primary: #fcd535;
-  --primary-foreground: #1e2329;
-  --secondary: #2c3034;
-  --secondary-foreground: #eaecef;
-  --muted: #2c3034;
-  --muted-foreground: #848e9c;
-  --accent: #fcd535;
-  --accent-foreground: #1e2329;
-  --destructive: #ef4444;
+/* Light mode – Professional Binance-inspired light theme */
+.light {
+  --background: #FFFFFF;
+  --foreground: #0B0E11;
+  --card: #FAFAFA;
+  --card-foreground: #0B0E11;
+  --popover: #FFFFFF;
+  --popover-foreground: #0B0E11;
+  --primary: #F0B90B;
+  --primary-foreground: #0B0E11;
+  --secondary: #F5F5F5;
+  --secondary-foreground: #0B0E11;
+  --muted: #F0F0F0;
+  --muted-foreground: #5E6673;
+  --accent: #F0B90B;
+  --accent-foreground: #0B0E11;
+  --destructive: #F6465D;
   --destructive-foreground: #fff;
-  --border: #2c3034;
-  --input: #2c3034;
-  --ring: #fcd535;
-  --chart-1: #22c55e;
-  --chart-2: #fcd535;
-  --chart-3: #229ed9;
-  --chart-4: #8b5cf6;
-  --chart-5: #ef4444;
-  --sidebar: #1c1e20;
-  --sidebar-foreground: #eaecef;
-  --sidebar-primary: #fcd535;
-  --sidebar-primary-foreground: #1e2329;
-  --sidebar-accent: #fcd535;
-  --sidebar-accent-foreground: #1e2329;
-  --sidebar-border: #2c3034;
-  --sidebar-ring: #fcd535;
-  --emerald: #22c55e;
-  --emerald-light: #4ade80;
-  --emerald-dark: #16a34a;
-  --surface: #2c3034;
-  --surface-light: #363e4a;
+  --border: #E6E8EA;
+  --input: #E6E8EA;
+  --ring: #F0B90B;
+  --chart-1: #0ECB81;
+  --chart-2: #F0B90B;
+  --chart-3: #3B82F6;
+  --chart-4: #F6465D;
+  --chart-5: #A855F7;
+  --radius: 0.75rem;
+  --sidebar: #FAFAFA;
+  --sidebar-foreground: #0B0E11;
+  --sidebar-primary: #F0B90B;
+  --sidebar-primary-foreground: #0B0E11;
+  --sidebar-accent: #F0B90B;
+  --sidebar-accent-foreground: #0B0E11;
+  --sidebar-border: #E6E8EA;
+  --sidebar-ring: #F0B90B;
+  --emerald: #0ECB81;
+  --emerald-light: #49E0A1;
+  --emerald-dark: #09A566;
+  --surface: #FAFAFA;
+  --surface-light: #FFFFFF;
+  --gold: #F0B90B;
+  --gold-dim: #E8820C;
+  --red: #F6465D;
+  --green: #0ECB81;
+  color-scheme: light;
+}
+
+/* Default to dark (crypto apps are dark-first) */
+:root {
+  color-scheme: dark;
+}
+
+/* .dark = same as :root (dark is already default) */
+.dark {
+  --background: #0B0E11;
+  --foreground: #EAECEF;
+  --card: #1E2026;
+  --card-foreground: #EAECEF;
+  --popover: #1E2026;
+  --popover-foreground: #EAECEF;
+  --primary: #F0B90B;
+  --primary-foreground: #0B0E11;
+  --secondary: #2B2F36;
+  --secondary-foreground: #EAECEF;
+  --muted: #2B2F36;
+  --muted-foreground: #848E9C;
+  --accent: #F0B90B;
+  --accent-foreground: #0B0E11;
+  --destructive: #F6465D;
+  --destructive-foreground: #fff;
+  --border: #2B2F36;
+  --input: #2B2F36;
+  --ring: #F0B90B;
+  --sidebar: #161A1E;
+  --sidebar-foreground: #EAECEF;
+  --sidebar-primary: #F0B90B;
+  --sidebar-primary-foreground: #0B0E11;
+  --sidebar-accent: #F0B90B;
+  --sidebar-accent-foreground: #0B0E11;
+  --sidebar-border: #2B2F36;
+  --sidebar-ring: #F0B90B;
+  --emerald: #0ECB81;
+  --emerald-light: #49E0A1;
+  --emerald-dark: #09A566;
+  --surface: #1E2026;
+  --surface-light: #2B2F36;
+  --gold: #F0B90B;
+  --gold-dim: #E8820C;
+  --red: #F6465D;
+  --green: #0ECB81;
+  color-scheme: dark;
 }
 
 @theme inline {
   --font-sans: 'Inter', 'Geist', 'Geist Fallback', sans-serif;
   --font-mono: 'Geist Mono', 'Geist Mono Fallback', monospace;
+  --color-gold: var(--gold);
+  --color-gold-dim: var(--gold-dim);
+  --color-red: var(--red);
+  --color-green: var(--green);
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -140,3 +201,202 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ── Binance-style crypto utility classes ── */
+
+/* Glassmorphism card */
+.glass-card {
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  background: rgba(30, 32, 38, 0.7);
+  border: 1px solid rgba(240, 185, 11, 0.12);
+}
+
+/* Hero mesh – Binance dark with gold radial glow */
+.hero-mesh {
+  background:
+    radial-gradient(ellipse 80% 55% at 50% -5%, rgba(240, 185, 11, 0.10) 0%, transparent 65%),
+    radial-gradient(ellipse 50% 40% at 85% 65%, rgba(14, 203, 129, 0.06) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 35% at 15% 80%, rgba(240, 185, 11, 0.04) 0%, transparent 55%);
+}
+
+/* Stat shimmer – gold */
+.stat-shimmer {
+  background: linear-gradient(90deg, #F0B90B, #FFD84D, #D4A017, #F0B90B);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 4s linear infinite;
+}
+
+/* Gradient border card – gold accent */
+.gradient-border {
+  position: relative;
+}
+.gradient-border::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, rgba(240, 185, 11, 0.5), rgba(240, 185, 11, 0.15), rgba(14, 203, 129, 0.2));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* Sidebar active item – Binance gold left bar */
+.nav-active-glow {
+  background: rgba(240, 185, 11, 0.08);
+  border-left: 2px solid #F0B90B;
+  border-radius: 0 8px 8px 0;
+}
+
+/* Binance-style stat card - adapts to theme */
+.stat-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  transition: border-color 0.2s;
+}
+.stat-card:hover {
+  border-color: rgba(240, 185, 11, 0.35);
+}
+
+/* Light theme adjustments */
+.light .stat-card {
+  background: #FAFAFA;
+  border: 1px solid #E6E8EA;
+}
+
+/* Ticker-style live badge - adapts to theme */
+.live-badge {
+  background: rgba(14, 203, 129, 0.15);
+  border: 1px solid rgba(14, 203, 129, 0.3);
+  color: #0ECB81;
+}
+
+.light .live-badge {
+  background: rgba(14, 203, 129, 0.1);
+  border: 1px solid rgba(14, 203, 129, 0.25);
+}
+
+/* Yellow highlight badge - adapts to theme */
+.yellow-badge {
+  background: rgba(240, 185, 11, 0.12);
+  border: 1px solid rgba(240, 185, 11, 0.25);
+  color: #F0B90B;
+}
+
+.light .yellow-badge {
+  background: rgba(240, 185, 11, 0.08);
+  border: 1px solid rgba(240, 185, 11, 0.2);
+  color: #D4A017;
+}
+
+/* Logo: remove solid background so only the mark shows (white/light areas blend away) */
+.light .logo-no-bg {
+  mix-blend-mode: multiply;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+
+@keyframes scroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+/* Landing: scroll-triggered and entrance animations */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes hero-badge {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.65s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.5s ease-out forwards;
+}
+
+.animate-scale-in {
+  animation: scale-in 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-hero-badge {
+  animation: hero-badge 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+/* Initial state for scroll-triggered elements */
+.landing-animate-init {
+  opacity: 0;
+  transform: translateY(20px);
+}
+
+.landing-animate-init.landing-animate-visible {
+  animation: fade-in-up 0.7s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+/* Stagger: children start hidden and animate when parent gets landing-animate-visible */
+.landing-stagger > * {
+  opacity: 0;
+  transform: translateY(20px);
+}
+
+.landing-stagger.landing-animate-visible > * {
+  animation: fade-in-up 0.6s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.landing-stagger > *:nth-child(1) { animation-delay: 0ms; }
+.landing-stagger > *:nth-child(2) { animation-delay: 80ms; }
+.landing-stagger > *:nth-child(3) { animation-delay: 160ms; }
+.landing-stagger > *:nth-child(4) { animation-delay: 240ms; }
+.landing-stagger > *:nth-child(5) { animation-delay: 320ms; }
+.landing-stagger > *:nth-child(6) { animation-delay: 400ms; }
+.landing-stagger > *:nth-child(7) { animation-delay: 480ms; }
+.landing-stagger > *:nth-child(8) { animation-delay: 560ms; }
+.landing-stagger > *:nth-child(9) { animation-delay: 640ms; }

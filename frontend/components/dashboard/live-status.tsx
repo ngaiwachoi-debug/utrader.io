@@ -176,12 +176,12 @@ export function LiveStatus() {
           <p className="mt-1 text-xs text-muted-foreground">
             {walletError ?? (displayWalletSummary ? t("liveStatus.totalUsdValue") : loading ? t("liveStatus.loading") : "—")}
             {walletError === "Data incomplete" && (
-              <span className="block mt-1 text-amber-600 dark:text-amber-400">
+              <span className="block mt-1 text-primary">
                 Wallet totals ($) come from Bitfinex; snapshot failed (Redis/nonce or rate limit). Token amount and other pages use the app DB and load separately. Use <strong>Refresh</strong> above to retry.
               </span>
             )}
             {!loading && !walletError && (displayTotalUsd ?? 0) === 0 && (
-              <span className="block mt-1 text-amber-600 dark:text-amber-400">
+              <span className="block mt-1 text-primary">
                 No data: Connect Bitfinex API keys with wallets/read permission, or the API may be rate limited. Total USD is from Bitfinex funding wallets only.
               </span>
             )}
@@ -189,7 +189,7 @@ export function LiveStatus() {
               <span className="ml-1 text-muted-foreground"> · {t("liveStatus.dataCached")}</span>
             )}
             {walletRateLimited && (
-              <span className="ml-1 text-amber-600 dark:text-amber-400" title={t("liveStatus.rateLimited")}> · ⚠ {t("liveStatus.rateLimited")}</span>
+              <span className="ml-1 text-primary" title={t("liveStatus.rateLimited")}> · ⚠ {t("liveStatus.rateLimited")}</span>
             )}
           </p>
         </div>
@@ -218,7 +218,7 @@ export function LiveStatus() {
           <p className="mt-1 text-xs text-muted-foreground">
             {botActive ? "Bot is actively deploying lending capital." : "Bot is currently idle."}
             {!loading && (displayTotalLent ?? 0) === 0 && (
-              <span className="block mt-1 text-amber-600 dark:text-amber-400">
+              <span className="block mt-1 text-primary">
                 No data: Same as Assets — Bitfinex keys and wallets/read required.
               </span>
             )}
@@ -263,7 +263,7 @@ export function LiveStatus() {
               }}
             />
             <div
-              className="h-full bg-amber-600 dark:bg-amber-500/80 transition-all"
+              className="h-full bg-gold-dim transition-all"
               style={{
                 width: `${!displayWalletSummary ? 0 : (() => {
                   const offers = displayWalletSummary.total_offers_usd ?? 0
@@ -289,7 +289,7 @@ export function LiveStatus() {
               {t("liveStatus.earning")}
             </span>
             <span className="flex items-center gap-1.5">
-              <span className="h-2 w-4 rounded-full bg-amber-600 dark:bg-amber-500/80" />
+              <span className="h-2 w-4 rounded-full bg-gold-dim" />
               {t("liveStatus.inOrderBook")}
             </span>
             <span className="flex items-center gap-1.5">
@@ -314,15 +314,15 @@ export function LiveStatus() {
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">{t("liveStatus.returnGenerating")}</p>
           </div>
-          <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+          <div className="rounded-xl border border-primary/30 bg-primary/5 p-4">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-muted-foreground">{t("liveStatus.pendingDeployment")}</span>
-              <Clock className="h-4 w-4 text-amber-500" />
+              <Clock className="h-4 w-4 text-primary" />
             </div>
             <p className="mt-2 text-xl font-bold text-foreground">
               {!displayWalletSummary ? (loading ? "…" : "—") : `$${(displayWalletSummary.total_offers_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
             </p>
-            <p className="text-xs text-amber-500">
+            <p className="text-xs text-primary">
               {displayWalletSummary?.total_usd_all && displayWalletSummary.total_usd_all > 0
                 ? `${(((displayWalletSummary.total_offers_usd ?? 0) / displayWalletSummary.total_usd_all) * 100).toFixed(1)}%`
                 : displayWalletSummary ? "0.0%" : "—"}
@@ -390,7 +390,7 @@ export function LiveStatus() {
                         title={`Amount lent: $${lent.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
                       />
                       <div
-                        className="h-full bg-amber-600 dark:bg-amber-500/80 transition-all"
+                        className="h-full bg-gold-dim transition-all"
                         style={{ width: `${Math.min(100, pct(offers))}%` }}
                         title={`Pending: $${offers.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
                       />
@@ -426,7 +426,7 @@ export function LiveStatus() {
       {displayWalletSummary && (
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="flex items-center gap-2 mb-4">
-          <TrendingUp className="h-5 w-5 text-amber-500" />
+          <TrendingUp className="h-5 w-5 text-primary" />
           <h3 className="text-sm font-semibold text-foreground">{t("liveStatus.performance")}</h3>
         </div>
         <p className="text-xs text-muted-foreground mb-4">{t("liveStatus.keyMetrics")}</p>

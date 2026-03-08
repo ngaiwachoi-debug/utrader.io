@@ -21,8 +21,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useWallets, useUserStatus } from "@/lib/dashboard-data-context"
 import { InstallAppButton } from "@/components/dashboard/install-app-button"
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api-backend"
+import { API_BASE } from "@/lib/api-config"
 
 type NotificationEntry = { id: number; title: string; content?: string | null; type: string; created_at: string }
 
@@ -125,12 +124,12 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
             {walletsLoading ? <><Spinner className="h-3.5 w-3.5 shrink-0" /><span className="text-muted-foreground">Loading…</span></> : (
               <>
                 {tokenLow && (
-                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 animate-pulse" aria-hidden />
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-primary animate-pulse" aria-hidden />
                 )}
-                <Coins className={`h-3.5 w-3.5 shrink-0 ${tokenLow ? "text-amber-500 animate-pulse" : "text-primary"}`} />
-                <span className={tokenLow ? "text-amber-600 dark:text-amber-400 font-semibold" : ""}>{displayTokens}</span>
+                <Coins className={`h-3.5 w-3.5 shrink-0 ${tokenLow ? "text-primary animate-pulse" : "text-primary"}`} />
+                <span className={tokenLow ? "text-primary font-semibold" : ""}>{displayTokens}</span>
                 {tokenLow && (
-                  <span className="text-[10px] text-amber-600 dark:text-amber-400 font-medium" title={t("header.tokenLowRefill")}>
+                  <span className="text-[10px] text-primary font-medium" title={t("header.tokenLowRefill")}>
                     {t("header.tokenLowRefill")}
                   </span>
                 )}
@@ -140,7 +139,7 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
               <span className="ml-1 text-[10px] text-muted-foreground">({t("header.dataCached")})</span>
             )}
             {walletRateLimited && (
-              <span className="ml-1 text-[10px] text-amber-600 dark:text-amber-400" title={t("header.rateLimited")}>⚠</span>
+              <span className="ml-1 text-[10px] text-primary" title={t("header.rateLimited")}>⚠</span>
             )}
           </span>
 

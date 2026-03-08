@@ -994,32 +994,48 @@ export function useWallets(userId: number) {
 
 export function useBotStats(userId: number) {
   const { getBotStats, prefetch } = useDashboardData()
+  const prefetchedRef = useRef<number | null>(null)
   useEffect(() => {
-    if (userId != null && userId > 0) prefetch(userId)
+    if (userId != null && userId > 0 && prefetchedRef.current !== userId) {
+      prefetchedRef.current = userId
+      prefetch(userId)
+    }
   }, [userId, prefetch])
   return getBotStats(userId)
 }
 
 export function useUserStatus(userId: number) {
   const { getUserStatus, prefetch } = useDashboardData()
+  const prefetchedRef = useRef<number | null>(null)
   useEffect(() => {
-    if (userId != null && userId > 0) prefetch(userId)
+    if (userId != null && userId > 0 && prefetchedRef.current !== userId) {
+      prefetchedRef.current = userId
+      prefetch(userId)
+    }
   }, [userId, prefetch])
   return getUserStatus(userId)
 }
 
 export function useLendingStats(userId: number) {
   const { getLendingStats, prefetch } = useDashboardData()
+  const prefetchedRef = useRef<number | null>(null)
   useEffect(() => {
-    if (userId != null && userId > 0) prefetch(userId)
+    if (userId != null && userId > 0 && prefetchedRef.current !== userId) {
+      prefetchedRef.current = userId
+      prefetch(userId)
+    }
   }, [userId, prefetch])
   return getLendingStats(userId)
 }
 
 export function useReferralData(userId: number) {
   const { getReferralData, ensureReferralData } = useDashboardData()
+  const ensuredRef = useRef<number | null>(null)
   useEffect(() => {
-    if (userId != null && userId > 0) ensureReferralData(userId)
+    if (userId != null && userId > 0 && ensuredRef.current !== userId) {
+      ensuredRef.current = userId
+      ensureReferralData(userId)
+    }
   }, [userId, ensureReferralData])
   return getReferralData(userId)
 }
@@ -1031,8 +1047,12 @@ export function useDeductionMultiplier(): number {
 
 export function useTokenBalance(userId: number) {
   const { getTokenBalance, prefetch } = useDashboardData()
+  const prefetchedRef = useRef<number | null>(null)
   useEffect(() => {
-    if (userId != null && userId > 0) prefetch(userId)
+    if (userId != null && userId > 0 && prefetchedRef.current !== userId) {
+      prefetchedRef.current = userId
+      prefetch(userId)
+    }
   }, [userId, prefetch])
   return getTokenBalance(userId)
 }

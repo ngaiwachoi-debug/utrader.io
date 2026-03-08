@@ -64,13 +64,13 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
         </div>
         <div className="flex flex-col items-end gap-2">
           {error && (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive" data-testid="bot-status-error">
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-sm text-destructive" data-testid="bot-status-error">
               <span>{error}</span>
               {insufficientTokens && onUpgradeClick && (
                 <button
                   type="button"
                   onClick={() => { setError(null); onUpgradeClick() }}
-                  className="rounded-md bg-primary px-2.5 py-1 text-xs font-semibold text-primary-foreground hover:bg-primary/90"
+                  className="rounded-md bg-primary px-2.5 py-1 text-xs font-semibold text-primary-foreground hover:opacity-90 transition-opacity"
                 >
                   {t("sidebar.subscription")}
                 </button>
@@ -80,8 +80,12 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
           <div className="flex flex-wrap items-center gap-3">
             {/* Status badge */}
             <div
-              className={`flex items-center gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs font-medium ${
-                statusLoading || statusUnknown ? "text-muted-foreground" : botActive ? "text-primary" : "text-destructive"
+              className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium ${
+                statusLoading || statusUnknown
+                  ? "border-border bg-card text-muted-foreground"
+                  : botActive
+                    ? "live-badge"
+                    : "border-border bg-card text-muted-foreground"
               }`}
               data-testid="bot-status-badge"
             >
@@ -90,12 +94,12 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
                   statusLoading || statusUnknown
                     ? "bg-muted-foreground"
                     : isStartingState
-                      ? "bg-amber-500 animate-pulse"
+                      ? "bg-primary animate-pulse"
                       : isStoppingState
-                        ? "bg-amber-500 animate-pulse"
+                        ? "bg-primary animate-pulse"
                         : botActive
-                          ? "bg-primary"
-                          : "bg-destructive"
+                          ? "bg-emerald"
+                          : "bg-muted-foreground"
                 }`}
                 aria-hidden
               />
@@ -126,13 +130,13 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
                 {t("liveStatus.refresh")}
               </button>
 
-              {/* Start Bot: shown when bot is inactive (not starting/stopping/running) */}
+              {/* Start Bot */}
               {isInactive && !statusLoading && !statusUnknown && (
                 <button
                   onClick={handleStart}
                   disabled={isStartingState}
                   title={!isLoggedIn ? "Sign in to start the bot" : !hasApiKeys ? "Connect your Bitfinex API keys first" : t("liveStatus.startBotTitle")}
-                  className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60 disabled:cursor-not-allowed transition-opacity"
                   data-testid="bot-start-button"
                 >
                   <Play className="h-3.5 w-3.5 shrink-0" />
@@ -140,24 +144,24 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
                 </button>
               )}
 
-              {/* Starting state: disabled spinner button */}
+              {/* Starting state */}
               {isStartingState && !statusLoading && (
                 <button
                   disabled
-                  className="flex items-center gap-2 rounded-lg bg-primary/70 px-4 py-2 text-xs font-semibold text-primary-foreground opacity-80 cursor-not-allowed transition-colors"
+                  className="flex items-center gap-2 rounded-lg bg-primary/60 px-4 py-2 text-xs font-semibold text-primary-foreground opacity-80 cursor-not-allowed"
                 >
                   <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
                   {t("liveStatus.starting")}
                 </button>
               )}
 
-              {/* Stop Bot: shown only when bot is active (running) */}
+              {/* Stop Bot */}
               {isActive && !statusLoading && (
                 <button
                   onClick={handleStop}
                   disabled={isStoppingState}
                   title={t("liveStatus.stopBotTitle")}
-                  className="flex items-center gap-2 rounded-lg bg-destructive px-4 py-2 text-xs font-semibold text-destructive-foreground hover:bg-destructive/90 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-2 text-xs font-semibold text-destructive hover:bg-destructive/20 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
                   data-testid="bot-stop-button"
                 >
                   <Square className="h-3.5 w-3.5 shrink-0" />
@@ -165,11 +169,11 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
                 </button>
               )}
 
-              {/* Stopping state: disabled spinner button */}
+              {/* Stopping state */}
               {isStoppingState && !statusLoading && (
                 <button
                   disabled
-                  className="flex items-center gap-2 rounded-lg bg-destructive/70 px-4 py-2 text-xs font-semibold text-destructive-foreground opacity-80 cursor-not-allowed transition-colors"
+                  className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-4 py-2 text-xs font-semibold text-destructive opacity-70 cursor-not-allowed"
                 >
                   <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
                   {t("liveStatus.stopping")}
@@ -183,16 +187,16 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
       {/* API Keys Popup */}
       {showApiKeysPopup && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => setShowApiKeysPopup(false)}>
-          <div className="relative mx-4 w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+          <div className="relative mx-4 w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-2xl shadow-black/50" onClick={(e) => e.stopPropagation()}>
             <button
               type="button"
               onClick={() => setShowApiKeysPopup(false)}
-              className="absolute right-3 top-3 rounded-full p-1 text-muted-foreground hover:text-foreground transition-colors"
+              className="absolute right-3 top-3 rounded-lg p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
             >
               <X className="h-4 w-4" />
             </button>
             <div className="flex flex-col items-center gap-4 text-center">
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-primary/10">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10 border border-primary/20">
                 <KeyRound className="h-6 w-6 text-primary" />
               </div>
               <h3 className="text-lg font-semibold text-foreground">Connect Your Bitfinex API</h3>
@@ -203,7 +207,7 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
                 <button
                   type="button"
                   onClick={() => setShowApiKeysPopup(false)}
-                  className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted-foreground hover:bg-muted/50 transition-colors"
+                  className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
                 >
                   Cancel
                 </button>
@@ -213,7 +217,7 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
                     setShowApiKeysPopup(false)
                     onSettingsClick?.()
                   }}
-                  className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
+                  className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:opacity-90 transition-opacity"
                 >
                   Go to Settings
                 </button>

@@ -7,8 +7,8 @@ import { getBackendToken } from "@/lib/auth"
 import { useCurrentUserId } from "@/lib/current-user-context"
 import { useReferralData } from "@/lib/dashboard-data-context"
 import { useT } from "@/lib/i18n"
+import { API_BASE } from "@/lib/api-config"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000"
 const REFRESH_COOLDOWN_SEC = 15
 
 const USDT_REASON_LABELS: Record<string, string> = {

@@ -35,8 +35,8 @@ import {
   calculateUsedTokens,
   calculateUsagePercentage,
 } from "@/lib/calculateTokenUsage"
+import { API_BASE } from "@/lib/api-config"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api-backend"
 const TOKEN_BALANCE_POLL_MS = 60_000
 
 type TokenBalanceState = {

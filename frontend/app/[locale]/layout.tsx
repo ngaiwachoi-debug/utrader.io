@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from "next"
 
 export const metadata: Metadata = {
-  title: 'bifinexbot.com - Crypto Lending Dashboard',
+  title: 'LendFinex - Crypto Lending Dashboard',
   description: 'Professional automated crypto lending platform. Maximize your lending returns with smart automation.',
   generator: 'v0.app',
   icons: {

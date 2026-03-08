@@ -1424,15 +1424,27 @@ def _cache_user_snapshot(user: models.User):
         vault = getattr(user, "vault", None)
         vault_snapshot = None
         if vault is not None:
+            _enc_key = getattr(vault, "encrypted_key", None)
+            _enc_secret = getattr(vault, "encrypted_secret", None)
+            _enc_gemini = getattr(vault, "encrypted_gemini_key", None)
+
+            def _snapshot_get_keys(_ek=_enc_key, _es=_enc_secret, _eg=_enc_gemini):
+                return {
+                    "bfx_key": security.decrypt_key(_ek),
+                    "bfx_secret": security.decrypt_key(_es),
+                    "gemini_key": security.decrypt_key(_eg) if _eg else "",
+                }
+
             vault_snapshot = type("VaultSnapshot", (), {
                 "user_id": getattr(vault, "user_id", None),
-                "encrypted_key": getattr(vault, "encrypted_key", None),
-                "encrypted_secret": getattr(vault, "encrypted_secret", None),
-                "encrypted_gemini_key": getattr(vault, "encrypted_gemini_key", None),
+                "encrypted_key": _enc_key,
+                "encrypted_secret": _enc_secret,
+                "encrypted_gemini_key": _enc_gemini,
                 "created_at": getattr(vault, "created_at", None),
                 "last_tested_at": getattr(vault, "last_tested_at", None),
                 "last_test_balance": getattr(vault, "last_test_balance", None),
                 "keys_updated_at": getattr(vault, "keys_updated_at", None),
+                "get_keys": _snapshot_get_keys,
             })()
         data = {
             "id": user.id,
@@ -3292,15 +3304,11 @@ except ImportError:
 
 
 async def _clear_arq_job_keys(redis, job_id: str) -> None:
-    """Remove ALL ARQ keys for job_id so the same id can be enqueued again.
-    Covers: job payload, result, retry counter, in-progress flag, queue membership, and abort set."""
+    """Remove ARQ keys for job_id so the same id can be enqueued again (idempotent start after stop).
+    Must also remove job_id from the abort sorted set (arq:abort), otherwise the worker sees it as aborted and logs 'aborted before start'."""
     try:
-        await redis.delete(
-            ARQ_JOB_PREFIX + job_id,
-            ARQ_RESULT_PREFIX + job_id,
-            f"arq:retry:{job_id}",
-            f"arq:in-progress:{job_id}",
-        )
+        await redis.delete(ARQ_JOB_PREFIX + job_id, ARQ_RESULT_PREFIX + job_id)
+        # Using gather to execute zrem in parallel to save round-trip latency to Upstash
         await asyncio.gather(
             redis.zrem(ARQ_QUEUE_NAME, job_id),
             redis.zrem(ARQ_ABORT_SS, job_id),

@@ -164,7 +164,7 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
             pathname={pathname}
           />
 
-          <main className="p-4 pb-20 md:pb-4 lg:p-6">
+          <main className="p-4 pb-20 pt-6 md:pb-6 md:pt-8 lg:p-8 lg:pb-8">
             {activePage === "profit-center" && <ProfitCenter onUpgradeClick={handleUpgrade} />}
             {activePage === "live-status" && <LiveStatus />}
             {activePage === "market-status" && <MarketStatus />}

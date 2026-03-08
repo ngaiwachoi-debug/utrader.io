@@ -10,11 +10,12 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  // Proxy API to backend so browser uses same origin (avoids CORS)
+  // Proxy API to backend so browser uses same origin (avoids CORS). Backend must run on BACKEND_PORT (default 8000).
   async rewrites() {
+    const port = process.env.BACKEND_PORT || "8000"
     return {
       fallback: [
-        { source: "/api-backend/:path*", destination: "http://127.0.0.1:8000/:path*" },
+        { source: "/api-backend/:path*", destination: `http://127.0.0.1:${port}/:path*` },
       ],
     };
   },

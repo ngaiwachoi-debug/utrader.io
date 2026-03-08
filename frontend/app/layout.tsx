@@ -9,7 +9,7 @@ const inter = Inter({ subsets: ["latin"], variable: "--font-inter" })
 const geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" })
 
 export const metadata: Metadata = {
-  title: "bifinexbot.com - Crypto Lending Dashboard",
+  title: "LendFinex - Crypto Lending Dashboard",
   description: "Professional automated crypto lending platform.",
   icons: {
     icon: ["/icon-light-32x32.png", "/icon.svg"],

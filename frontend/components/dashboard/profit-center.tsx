@@ -264,7 +264,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
               }}
             />
             <div
-              className="h-full bg-amber-500/80 transition-all"
+              className="h-full bg-gold-dim transition-all"
               style={{
                 width: `${(() => {
                   const total = tokenBalance?.total_tokens_added ?? 0
@@ -285,7 +285,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
               </span>
             </span>
             <span className="flex items-center gap-1.5">
-              <span className="h-2 w-4 rounded-full bg-amber-500/80" />
+              <span className="h-2 w-4 rounded-full bg-gold-dim" />
               {t("dashboard.tokensUsed")}{" "}
               <span className="font-medium tabular-nums text-foreground">
                 {tokenBalance != null
@@ -328,7 +328,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
               <span className="ml-1 text-muted-foreground"> · {t("dashboard.dataCached")}</span>
             )}
             {lendingRateLimited && (
-              <span className="ml-1 text-amber-600 dark:text-amber-400" title={t("dashboard.rateLimited")}> · ⚠</span>
+              <span className="ml-1 text-primary" title={t("dashboard.rateLimited")}> · ⚠</span>
             )}
           </p>
           {calculationBreakdown && calculationBreakdown.per_currency.length > 0 && (
