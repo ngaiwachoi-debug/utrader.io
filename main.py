@@ -3292,11 +3292,15 @@ except ImportError:
 
 
 async def _clear_arq_job_keys(redis, job_id: str) -> None:
-    """Remove ARQ keys for job_id so the same id can be enqueued again (idempotent start after stop).
-    Must also remove job_id from the abort sorted set (arq:abort), otherwise the worker sees it as aborted and logs 'aborted before start'."""
+    """Remove ALL ARQ keys for job_id so the same id can be enqueued again.
+    Covers: job payload, result, retry counter, in-progress flag, queue membership, and abort set."""
     try:
-        await redis.delete(ARQ_JOB_PREFIX + job_id, ARQ_RESULT_PREFIX + job_id)
-        # Using gather to execute zrem in parallel to save round-trip latency to Upstash
+        await redis.delete(
+            ARQ_JOB_PREFIX + job_id,
+            ARQ_RESULT_PREFIX + job_id,
+            f"arq:retry:{job_id}",
+            f"arq:in-progress:{job_id}",
+        )
         await asyncio.gather(
             redis.zrem(ARQ_QUEUE_NAME, job_id),
             redis.zrem(ARQ_ABORT_SS, job_id),

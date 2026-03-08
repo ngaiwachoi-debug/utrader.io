@@ -420,7 +420,7 @@ async def run_bot_task(ctx, user_id: int):
                     await lock_renew_task
         except Exception:
             pass
-        # Release per-user run lock so the same user can start again
+        # Release per-user run lock and clean stale ARQ metadata so the same job_id can be re-enqueued
         try:
             r = ctx.get("redis")
             if lock_acquired and r and lock_key and lock_val:
@@ -428,8 +428,14 @@ async def run_bot_task(ctx, user_id: int):
                 cur_val = current.decode() if isinstance(current, bytes) else current
                 if current is not None and cur_val == lock_val:
                     await r.delete(lock_key)
+            if r:
+                job_id = ctx.get("job_id") or f"bot_user_{user_id}"
+                await r.delete(
+                    f"arq:retry:{job_id}",
+                    f"arq:in-progress:{job_id}",
+                )
         except Exception as e:
-            print(f"[WARN] User {user_id} lock release failed: {e}")
+            print(f"[WARN] User {user_id} lock/arq cleanup failed: {e}")
         # Only lock owner may force final stopped state; non-owner duplicate jobs must not overwrite DB state.
         try:
             if lock_acquired and db is not None:
