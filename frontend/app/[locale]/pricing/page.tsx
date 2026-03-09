@@ -78,7 +78,7 @@ export default function PricingPage() {
                 {"featuresKey" in plan && (
                   <p className="mt-3 text-xs text-muted-foreground flex items-center gap-2">
                     <Check className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
-                    {t((plan as { featuresKey?: string }).featuresKey)}
+                    {t((plan as { featuresKey?: string }).featuresKey || "")}
                   </p>
                 )}
                 <div className="mt-6 flex-1" />

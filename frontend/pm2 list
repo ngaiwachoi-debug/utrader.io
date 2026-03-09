@@ -1,0 +1,29 @@
+[0;1;32m●[0m bifinexbot-api.service - Bifinexbot FastAPI
+     Loaded: loaded (/etc/systemd/system/bifinexbot-api.service; enabled; vendor preset: enabled)
+     Active: [0;1;32mactive (running)[0m since Mon 2026-03-09 00:22:42 CST; 28min ago
+   Main PID: 6954 (uvicorn)
+      Tasks: 1 (limit: 4105)
+     Memory: 73.3M
+        CPU: 3.533s
+     CGroup: /system.slice/bifinexbot-api.service
+             └─6954 /opt/utrader.io/venv/bin/python3.11 /opt/utrader.io/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+
+Mar 09 00:22:42 iZj6ci56dxnrilexk2yx1rZ systemd[1]: Started Bifinexbot FastAPI.
+Mar 09 00:22:43 iZj6ci56dxnrilexk2yx1rZ uvicorn[6954]: INFO:     Started server process [6954]
+Mar 09 00:22:43 iZj6ci56dxnrilexk2yx1rZ uvicorn[6954]: INFO:     Waiting for application startup.
+Mar 09 00:22:43 iZj6ci56dxnrilexk2yx1rZ uvicorn[6954]: INFO:     Application startup complete.
+Mar 09 00:22:43 iZj6ci56dxnrilexk2yx1rZ uvicorn[6954]: INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+
+[0;1;32m●[0m bifinexbot-worker.service - Bifinexbot ARQ Worker
+     Loaded: loaded (/etc/systemd/system/bifinexbot-worker.service; enabled; vendor preset: enabled)
+     Active: [0;1;32mactive (running)[0m since Mon 2026-03-09 00:41:37 CST; 9min ago
+   Main PID: 7305 (arq)
+      Tasks: 2 (limit: 4105)
+     Memory: 97.0M
+        CPU: 2.249s
+     CGroup: /system.slice/bifinexbot-worker.service
+             └─7305 /opt/utrader.io/venv/bin/python3.11 /opt/utrader.io/venv/bin/arq worker.WorkerSettings
+
+Mar 09 00:41:37 iZj6ci56dxnrilexk2yx1rZ systemd[1]: Started Bifinexbot ARQ Worker.
+Mar 09 00:41:38 iZj6ci56dxnrilexk2yx1rZ arq[7305]: 00:41:38: Starting worker for 1 functions: run_bot_task
+Mar 09 00:41:38 iZj6ci56dxnrilexk2yx1rZ arq[7305]: 00:41:38: redis_version=6.0.16 mem_usage=851.36K clients_connected=1 db_keys=0

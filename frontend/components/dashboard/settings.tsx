@@ -811,7 +811,7 @@ function ApiKeysTab({
               if (startRes.status === 400 && isInsufficient) {
                 toast.warning("Tokens required", {
                   description: INSUFFICIENT_TOKENS_MSG,
-                  action: onUpgradeClick ? { label: t("sidebar.subscription"), onClick: onUpgradeClick } : undefined,
+                  action: undefined,
                 })
               } else if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
               else if (startRes.status === 402) toast.warning("Bot not started", { description: msg })
@@ -863,7 +863,7 @@ function ApiKeysTab({
             if (startRes.status === 400 && isInsufficient) {
               toast.warning("Tokens required", {
                 description: INSUFFICIENT_TOKENS_MSG,
-                action: onUpgradeClick ? { label: t("sidebar.subscription"), onClick: onUpgradeClick } : undefined,
+                action: undefined,
               })
             } else if (startRes.status === 503) toast.warning("Bot queue unavailable", { description: msg })
             else if (startRes.status === 402) toast.warning("Bot not started", { description: msg })

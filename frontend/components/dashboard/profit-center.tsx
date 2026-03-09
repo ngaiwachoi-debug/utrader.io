@@ -50,10 +50,10 @@ function deriveChartHistoryFromTrades(
   rangeStart: Date,
   rangeEnd: Date
 ): { date: string; volume: number; interest: number }[] {
-  const start = rangeStart.getTime()
-  const end = rangeEnd.getTime()
   const byDay = new Map<string, { volume: number; interest: number }>()
   for (const t of trades) {
+    const start = rangeStart.getTime()
+    const end = rangeEnd.getTime()
     const ms = typeof t.mts_create === "number" ? t.mts_create : 0
     if (ms < start || ms > end) continue
     const d = new Date(ms)
@@ -64,12 +64,24 @@ function deriveChartHistoryFromTrades(
       interest: prev.interest + (typeof t.interest_usd === "number" ? t.interest_usd : 0),
     })
   }
-  return Array.from(byDay.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([dateKey, { volume, interest }]) => {
-      const [y, m, d] = dateKey.split("-")
-      return { date: `${m}-${d}`, volume: Math.round(volume * 100) / 100, interest: Math.round(interest * 100) / 100 }
+  const result: { date: string; volume: number; interest: number }[] = []
+  const cursor = new Date(rangeStart)
+  cursor.setHours(0, 0, 0, 0)
+  const end = new Date(rangeEnd)
+  end.setHours(23, 59, 59, 999)
+
+  while (cursor.getTime() <= end.getTime()) {
+    const key = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, "0")}-${String(cursor.getDate()).padStart(2, "0")}`
+    const bucket = byDay.get(key) ?? { volume: 0, interest: 0 }
+    result.push({
+      date: `${String(cursor.getMonth() + 1).padStart(2, "0")}-${String(cursor.getDate()).padStart(2, "0")}`,
+      volume: Math.round(bucket.volume * 100) / 100,
+      interest: Math.round(bucket.interest * 100) / 100,
     })
+    cursor.setDate(cursor.getDate() + 1)
+  }
+
+  return result
 }
 
 const chartData = [

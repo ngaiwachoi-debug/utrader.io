@@ -1767,9 +1767,9 @@ def _cache_user_snapshot(user: models.User):
 
             def _snapshot_get_keys(_ek=_enc_key, _es=_enc_secret, _eg=_enc_gemini):
                 return {
-                    "bfx_key": security.decrypt_key(_ek),
-                    "bfx_secret": security.decrypt_key(_es),
-                    "gemini_key": security.decrypt_key(_eg) if _eg else "",
+                    "bfx_key": security.decrypt_key(str(_ek)),
+                    "bfx_secret": security.decrypt_key(str(_es)),
+                    "gemini_key": security.decrypt_key(str(_eg)) if _eg else "",
                 }
 
             vault_snapshot = type("VaultSnapshot", (), {

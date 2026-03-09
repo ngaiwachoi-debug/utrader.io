@@ -939,7 +939,7 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
 
   const ensureReferralData = useCallback(
     (userId: number) => {
-      if (inFlightReferralData.current[userId]) return
+      if ((inFlightReferralData.current as any)[userId]) return
       inFlightReferralData.current[userId] = fetchReferralData(userId).finally(() => {
         delete inFlightReferralData.current[userId]
       })
@@ -951,11 +951,11 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     (userId: number) => {
       const entry = state.tokenBalance[userId]
       const refetch = () => {
-        if (inFlightTokenBalance.current[userId]) return inFlightTokenBalance.current[userId]
-        const p = fetchTokenBalance(userId).finally(() => {
-          delete inFlightTokenBalance.current[userId]
+        if ((inFlightTokenBalance.current as any)[userId]) return  (inFlightTokenBalance.current as any)[userId]
+        let p: any; p = (fetchTokenBalance as any)(userId).finally(() => {
+          delete  (inFlightTokenBalance.current as any)[userId]
         })
-        inFlightTokenBalance.current[userId] = p
+         (inFlightTokenBalance.current as any)[userId] = p
         return p
       }
       return {

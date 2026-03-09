@@ -29,7 +29,7 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
       return
     }
     // When NextAuth is unauthenticated, only continue if we have a dev token (e.g. "Dev: Login as choiwangai")
-    if (status !== "authenticated" && !session?.user) {
+    if (status !== "authenticated" && !(session as any)?.user) {
       const hasDevToken =
         typeof window !== "undefined" &&
         sessionStorage.getItem("bifinexbot_dev_backend_token")

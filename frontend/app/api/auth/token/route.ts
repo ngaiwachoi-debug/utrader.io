@@ -25,7 +25,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ token: null }, { status: 401 })
   }
   const payload = {
-    sub: token.sub ?? token.id ?? token.email,
+    sub: String(token.sub || "") ?? token.id ?? token.email,
     email: token.email,
   }
   const jwt = await new SignJWT(payload)

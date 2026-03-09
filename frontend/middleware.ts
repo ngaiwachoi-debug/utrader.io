@@ -10,7 +10,7 @@ function detectLocaleFromAcceptLanguage(acceptLanguage: string): string {
   const parts = acceptLanguage.split(",").map((s) => s.split(";")[0].trim().toLowerCase());
   for (const part of parts) {
     const lang = part.slice(0, 2);
-    if (supported.has(lang)) return lang;
+    if (supported.has(lang as any)) return lang;
     if (lang === "zh" || part.startsWith("zh")) return "zh";
     if (lang === "en" || part.startsWith("en")) return "en";
     if (part.startsWith("tl") || part.startsWith("fil")) return "fil";

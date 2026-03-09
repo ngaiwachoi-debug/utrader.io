@@ -11,3 +11,5 @@ backups/
 *.sql.gz
 stripe_webhook_debug.log
 stop_bot_debug.log
+venv/
+.env

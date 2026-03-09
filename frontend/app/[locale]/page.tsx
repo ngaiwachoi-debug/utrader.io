@@ -5,6 +5,7 @@ import { useParams, useSearchParams } from "next/navigation"
 import { signIn } from "next-auth/react"
 import { useT } from "@/lib/i18n"
 import { PublicLayoutHeader, PublicLayoutFooter } from "@/components/landing/public-layout"
+import { InstallAppButton } from "@/components/dashboard/install-app-button"
 import { Zap, Shield, TrendingUp, BarChart3, Cpu, Layers, Activity, Bot, LineChart, Settings2, ArrowRight, CheckCircle2, Lock } from "lucide-react"
 import { AaveStyleSection } from "@/components/landing/aave-style-section"
 import { AnimateOnScroll } from "@/components/landing/animate-on-scroll"
@@ -98,12 +99,9 @@ export default function LandingPage() {
               {t("login.signInWithGoogle")}
               <ArrowRight className="h-4 w-4" />
             </button>
-            <Link
-              href={`/${locale}/how-it-works`}
-              className="inline-flex items-center gap-2 rounded-xl border border-border bg-card/80 backdrop-blur-sm px-7 py-3.5 text-base font-semibold text-foreground hover:border-primary/40 hover:bg-primary/5 transition-all duration-200"
-            >
-              {t("landing.seeHowItWorks")}
-            </Link>
+            <div className="inline-flex items-center gap-2 rounded-xl border border-border bg-card/80 backdrop-blur-sm px-7 py-3.5 text-base font-semibold text-foreground hover:border-primary/40 hover:bg-primary/5 transition-all duration-200">
+              <InstallAppButton variant="drawer" />
+            </div>
           </div>
 
           {/* Trust badges */}

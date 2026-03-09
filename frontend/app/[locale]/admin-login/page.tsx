@@ -37,7 +37,7 @@ export default function AdminLoginPage() {
 
         <h1 className="text-2xl font-bold text-foreground mb-2">Admin login</h1>
         <p className="text-sm text-muted-foreground mb-6">
-          Sign in with Google. Only the configured admin email (ngaiwachoi@gmail.com) can access the admin panel.
+          Sign in with Google. Only the configured admin email (the configured administrator) can access the admin panel.
         </p>
 
         <button
