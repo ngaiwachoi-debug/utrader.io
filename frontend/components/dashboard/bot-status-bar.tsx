@@ -25,7 +25,7 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
   const {
     botActive, botStatus, loading, isRevalidating,
     error, setError, insufficientTokens,
-    isStarting, isStopping,
+    isStarting, isStopping, actionCooldownSec: ctxCooldown,
     refreshBotStatus, handleStart, handleStop,
     onUpgradeClick, isLoggedIn, hasApiKeys,
     showApiKeysPopup, setShowApiKeysPopup, onSettingsClick,
@@ -36,8 +36,9 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
 
   const isStartingState = botStatus === "starting" || isStarting
   const isStoppingState = botStatus === "stopping" || isStopping
+  const isTransitioning = isStartingState || isStoppingState
   const isActive = botActive === true && !isStoppingState
-  const isInactive = botActive === false && !isStartingState
+  const isInactive = (botActive === false || botActive === null) && !isStartingState
 
   const cooling = refreshCooldownSec > 0
 
@@ -83,9 +84,11 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
               className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium ${
                 statusLoading || statusUnknown
                   ? "border-border bg-card text-muted-foreground"
-                  : botActive
-                    ? "live-badge"
-                    : "border-border bg-card text-muted-foreground"
+                  : isTransitioning
+                    ? "border-primary/40 bg-primary/5 text-primary"
+                    : isActive
+                      ? "live-badge"
+                      : "border-border bg-card text-muted-foreground"
               }`}
               data-testid="bot-status-badge"
             >
@@ -130,54 +133,47 @@ export function BotStatusBar({ title, date, onRefresh, refreshCooldownSec = 0 }:
                 {t("liveStatus.refresh")}
               </button>
 
-              {/* Start Bot */}
-              {isInactive && !statusLoading && !statusUnknown && (
-                <button
-                  onClick={handleStart}
-                  disabled={isStartingState}
-                  title={!isLoggedIn ? "Sign in to start the bot" : !hasApiKeys ? "Connect your Bitfinex API keys first" : t("liveStatus.startBotTitle")}
-                  className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60 disabled:cursor-not-allowed transition-opacity"
-                  data-testid="bot-start-button"
-                >
-                  <Play className="h-3.5 w-3.5 shrink-0" />
-                  {t("liveStatus.startBot")}
-                </button>
-              )}
-
-              {/* Starting state */}
-              {isStartingState && !statusLoading && (
-                <button
-                  disabled
-                  className="flex items-center gap-2 rounded-lg bg-primary/60 px-4 py-2 text-xs font-semibold text-primary-foreground opacity-80 cursor-not-allowed"
-                >
-                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                  {t("liveStatus.starting")}
-                </button>
-              )}
-
-              {/* Stop Bot */}
-              {isActive && !statusLoading && (
-                <button
-                  onClick={handleStop}
-                  disabled={isStoppingState}
-                  title={t("liveStatus.stopBotTitle")}
-                  className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-2 text-xs font-semibold text-destructive hover:bg-destructive/20 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-                  data-testid="bot-stop-button"
-                >
-                  <Square className="h-3.5 w-3.5 shrink-0" />
-                  {t("liveStatus.stopBot")}
-                </button>
-              )}
-
-              {/* Stopping state */}
-              {isStoppingState && !statusLoading && (
-                <button
-                  disabled
-                  className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-4 py-2 text-xs font-semibold text-destructive opacity-70 cursor-not-allowed"
-                >
-                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                  {t("liveStatus.stopping")}
-                </button>
+              {/* Exactly one action button: Starting spinner > Stopping spinner > Stop > Start */}
+              {!statusLoading && !statusUnknown && (
+                isStartingState ? (
+                  <button
+                    disabled
+                    className="flex items-center gap-2 rounded-lg bg-primary/60 px-4 py-2 text-xs font-semibold text-primary-foreground opacity-80 cursor-not-allowed"
+                  >
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                    {t("liveStatus.starting")}
+                  </button>
+                ) : isStoppingState ? (
+                  <button
+                    disabled
+                    className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-4 py-2 text-xs font-semibold text-destructive opacity-70 cursor-not-allowed"
+                  >
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                    {t("liveStatus.stopping")}
+                  </button>
+                ) : isActive ? (
+                  <button
+                    onClick={handleStop}
+                    disabled={ctxCooldown > 0}
+                    title={t("liveStatus.stopBotTitle")}
+                    className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-2 text-xs font-semibold text-destructive hover:bg-destructive/20 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                    data-testid="bot-stop-button"
+                  >
+                    <Square className="h-3.5 w-3.5 shrink-0" />
+                    {t("liveStatus.stopBot")}
+                  </button>
+                ) : isInactive ? (
+                  <button
+                    onClick={handleStart}
+                    disabled={ctxCooldown > 0}
+                    title={!isLoggedIn ? "Sign in to start the bot" : !hasApiKeys ? "Connect your Bitfinex API keys first" : t("liveStatus.startBotTitle")}
+                    className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60 disabled:cursor-not-allowed transition-opacity"
+                    data-testid="bot-start-button"
+                  >
+                    <Play className="h-3.5 w-3.5 shrink-0" />
+                    {t("liveStatus.startBot")}
+                  </button>
+                ) : null
               )}
             </div>
           </div>

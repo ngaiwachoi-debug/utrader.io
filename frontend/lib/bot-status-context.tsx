@@ -9,7 +9,9 @@ import { useBotStats, useDashboardData } from "@/lib/dashboard-data-context"
 import { API_BASE as API_BACKEND } from "@/lib/api-config"
 const BOT_STATUS_POLL_MS = 90000
 /** Cooldown (seconds) after Start or Stop before either can be clicked again. */
-const BOT_ACTION_COOLDOWN_SEC = 10
+const BOT_ACTION_COOLDOWN_SEC = 5
+/** Fast poll interval during transitional states (starting/stopping). */
+const FAST_POLL_MS = 5_000
 
 const INSUFFICIENT_TOKENS_MESSAGE = "Please add tokens to run the bot. A minimum balance of 1 token is required."
 
@@ -105,10 +107,28 @@ export function BotStatusProvider({ children, onUpgradeClick, onSettingsClick }:
   // When status is "starting" or "stopping", poll more frequently to detect transitions
   useEffect(() => {
     if (userId == null) return
-    if (rawBotStatus !== "starting" && rawBotStatus !== "stopping") return
-    const fastPollId = setInterval(refreshBotStatus, 10_000)
+    if (rawBotStatus !== "starting" && rawBotStatus !== "stopping" && !isStarting && !isStopping) return
+    const fastPollId = setInterval(refreshBotStatus, FAST_POLL_MS)
     return () => clearInterval(fastPollId)
-  }, [userId, rawBotStatus, refreshBotStatus])
+  }, [userId, rawBotStatus, isStarting, isStopping, refreshBotStatus])
+
+  // Clear local isStarting/isStopping once backend confirms a final state
+  useEffect(() => {
+    if (rawBotStatus === "running" || rawBotStatus === "stopped") {
+      if (isStarting) setIsStarting(false)
+      if (isStopping) setIsStopping(false)
+    }
+  }, [rawBotStatus, isStarting, isStopping])
+
+  // Safety: force-clear transitional states after 30s to prevent stuck UI
+  useEffect(() => {
+    if (!isStarting && !isStopping) return
+    const timeout = setTimeout(() => {
+      setIsStarting(false)
+      setIsStopping(false)
+    }, 30_000)
+    return () => clearTimeout(timeout)
+  }, [isStarting, isStopping])
 
   // Tick down action cooldown every second
   useEffect(() => {
@@ -140,8 +160,8 @@ export function BotStatusProvider({ children, onUpgradeClick, onSettingsClick }:
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
       const res = await fetch(`${API_BACKEND}/start-bot`, { method: "POST", credentials: "include", headers })
       const text = await res.text()
-      const data = res.ok ? (text ? JSON.parse(text) : {}) : null
       if (!res.ok) {
+        setIsStarting(false)
         try {
           const j = text ? JSON.parse(text) : {}
           const detail = typeof j.detail === "string" ? j.detail : ""
@@ -155,21 +175,18 @@ export function BotStatusProvider({ children, onUpgradeClick, onSettingsClick }:
         } catch {
           setError(text || "Start failed")
         }
-      } else if (data && (data.bot_status === "running" || data.bot_status === "starting")) {
-        await refreshBotStatus()
-        getWallets(id).refetch()
-        getLendingStats(id).refetch()
-      } else {
-        await refreshBotStatus()
-        getWallets(id).refetch()
-        getLendingStats(id).refetch()
+        return
       }
+      // Fire-and-forget background refresh; isStarting stays true until backend confirms "running"
+      refreshBotStatus().catch(() => {})
+      getWallets(id).refetch()
+      getLendingStats(id).refetch()
     } catch (e) {
+      setIsStarting(false)
       const msg = e instanceof Error ? e.message : String(e)
       setError(msg === "Failed to fetch" || msg.includes("NetworkError") ? "API unreachable" : msg)
     } finally {
       startInProgressRef.current = false
-      setIsStarting(false)
     }
   }, [userId, refreshBotStatus, actionCooldownSec, getWallets, getLendingStats, id, isLoggedIn, hasApiKeys])
 
@@ -177,52 +194,35 @@ export function BotStatusProvider({ children, onUpgradeClick, onSettingsClick }:
     if (userId == null || actionCooldownSec > 0) return
     if (stopInProgressRef.current) return
     stopInProgressRef.current = true
-    const log = (msg: string, data?: object) => {
-      try {
-        console.log("[stop-bot]", msg, data ?? "")
-      } catch {
-        // no-op
-      }
-    }
     setActionCooldownSec(BOT_ACTION_COOLDOWN_SEC)
     try {
       setIsStopping(true)
       setError(null)
-      log("handleStop called", { userId })
       const token = await getBackendToken()
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
-      log("POST /stop-bot sending")
       const res = await fetch(`${API_BACKEND}/stop-bot`, { method: "POST", credentials: "include", headers })
       const text = await res.text()
-      log("POST /stop-bot response", { status: res.status, ok: res.ok, bodyLength: text?.length })
       if (!res.ok) {
+        setIsStopping(false)
         try {
           const j = text ? JSON.parse(text) : {}
           const detail = typeof j.detail === "string" ? j.detail : text
-          log("stop-bot error response", { status: res.status, detail: detail || text })
           setError(res.status === 429 ? (detail || "Too many start/stop requests. Please wait before trying again.") : (detail || "Stop failed"))
         } catch {
-          log("stop-bot error body parse failed", { text: text?.slice(0, 200) })
           setError(text || "Stop failed")
         }
-      } else {
-        try {
-          const data = text ? JSON.parse(text) : {}
-          log("stop-bot success", data)
-        } catch {
-          log("stop-bot success body", { raw: text?.slice(0, 200) })
-        }
-        await refreshBotStatus()
-        getWallets(id).refetch()
-        getLendingStats(id).refetch()
+        return
       }
+      // Fire-and-forget background refresh; isStopping stays true until backend confirms "stopped"
+      refreshBotStatus().catch(() => {})
+      getWallets(id).refetch()
+      getLendingStats(id).refetch()
     } catch (e) {
+      setIsStopping(false)
       const msg = e instanceof Error ? e.message : String(e)
-      log("stop-bot exception", { message: msg, name: e instanceof Error ? e.name : undefined })
       setError(msg === "Failed to fetch" || msg.includes("NetworkError") ? "API unreachable" : msg)
     } finally {
       stopInProgressRef.current = false
-      setIsStopping(false)
     }
   }, [userId, refreshBotStatus, actionCooldownSec, getWallets, getLendingStats, id])
 

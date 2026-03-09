@@ -3750,8 +3750,6 @@ async def start_bot(
     desired = getattr(current_user, "bot_desired_state", None) or "stopped"
     redis = await get_redis_or_raise()
     if status_before in ("running", "starting") and desired == "running":
-        # Always try enqueue once; _enqueue_bot_task is lock-aware and avoids duplicate active runs.
-        # This also self-heals stale DB/Redis states that would otherwise stay stuck at "starting".
         enqueued = await _enqueue_bot_task(redis, current_user.id)
         if enqueued:
             try:
@@ -3759,21 +3757,23 @@ async def start_bot(
                 db.commit()
             except Exception:
                 db.rollback()
+            _rcache_invalidate_user(current_user.id)
             logger.info("start_bot user_id=%s action=start self-heal enqueued=True bot_status_before=%s bot_status_after=starting", current_user.id, status_before)
             return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
+        _rcache_invalidate_user(current_user.id)
         return {"status": "success", "message": "Bot already running or queued.", "bot_status": status_before}
-    await _record_start_success(current_user.id)  # record so next start is cooldown-limited
+    await _record_start_success(current_user.id)
     enqueued = await _enqueue_bot_task(redis, current_user.id)
     if enqueued:
         try:
             current_user.bot_status = "starting"
             db.commit()
-            logger.info("start_bot user_id=%s action=start enqueued=True bot_status_before=%s bot_status_after=starting", current_user.id, status_before)
-            return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
         except Exception:
             db.rollback()
             logger.warning("start_bot user_id=%s db commit failed", current_user.id)
-            return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
+        _rcache_invalidate_user(current_user.id)
+        logger.info("start_bot user_id=%s action=start enqueued=True bot_status_before=%s bot_status_after=starting", current_user.id, status_before)
+        return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
     try:
         current_user.bot_status = current_user.bot_status or "starting"
         db.commit()
