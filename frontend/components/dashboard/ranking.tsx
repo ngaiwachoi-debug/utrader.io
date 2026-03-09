@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useMemo } from "react"
 import { Trophy, ChevronLeft, ChevronRight, DollarSign, TrendingUp, Zap, Crown, Shield } from "lucide-react"
 
 import { API_BASE as API_BACKEND } from "@/lib/api-config"
+import { useT } from "@/lib/i18n"
 
 type RankingRow = {
   rank: number
@@ -167,6 +168,7 @@ function generateFallbackReferralGain(): ReferralGainRow[] {
 type LeaderboardTab = "yield" | "referral"
 
 export function Ranking() {
+  const t = useT()
   const [tab, setTab] = useState<LeaderboardTab>("yield")
   const [data, setData] = useState<RankingResponse | null>(null)
   const [referralData, setReferralData] = useState<ReferralGainResponse | null>(null)
@@ -262,12 +264,12 @@ export function Ranking() {
       <div>
         <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
           <Trophy className="h-6 w-6 text-amber-500" />
-          Leaderboard
+          {t("ranking.title")}
         </h1>
         <p className="text-sm text-muted-foreground mt-1">
           {tab === "yield"
-            ? "Top traders ranked by yield. Trade, win, and climb the ranks. Refreshed daily after profit calculation."
-            : "Top referral gain by daily USDT. Refreshed daily after profit calculation."}
+            ? t("ranking.yieldDesc")
+            : t("ranking.referralDesc")}
         </p>
         <div className="flex gap-2 mt-3 border-b border-border pb-2">
           <button
@@ -279,7 +281,7 @@ export function Ranking() {
                 : "bg-secondary/50 text-muted-foreground hover:bg-secondary"
             }`}
           >
-            Yield Leaderboard
+            {t("ranking.yieldLeaderboard")}
           </button>
           <button
             type="button"
@@ -290,7 +292,7 @@ export function Ranking() {
                 : "bg-secondary/50 text-muted-foreground hover:bg-secondary"
             }`}
           >
-            Top referral gain
+            {t("ranking.topReferralGain")}
           </button>
         </div>
       </div>
@@ -299,7 +301,7 @@ export function Ranking() {
         <div>
           <h2 className="text-sm font-semibold text-foreground flex items-center gap-2 mb-3">
             <TrendingUp className="h-4 w-4 text-amber-500" />
-            Top referral gain
+            {t("ranking.topReferralGain")}
           </h2>
           <div className="rounded-xl border border-border bg-card overflow-hidden">
             {referralLoading ? (
@@ -376,10 +378,10 @@ export function Ranking() {
           <div className="rounded-xl border border-border bg-card p-5">
             <div className="flex items-center gap-2 text-muted-foreground">
               <DollarSign className="h-5 w-5 text-amber-500" />
-              <span className="text-xs font-medium">Total Generated Yield</span>
+              <span className="text-xs font-medium">{t("ranking.totalGeneratedYield")}</span>
             </div>
             <p className="mt-2 text-2xl font-bold text-amber-500">
-              ${summary.total_paid_out_usd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              ${Math.round(summary.total_paid_out_usd / 100).toLocaleString(undefined, { maximumFractionDigits: 0 })}
             </p>
           </div>
           <div className="rounded-xl border border-border bg-card p-5">

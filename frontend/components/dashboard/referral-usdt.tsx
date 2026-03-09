@@ -125,7 +125,7 @@ export function ReferralUsdt() {
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-2xl font-bold text-foreground">Referral & USDT Credit</h1>
+        <h1 className="text-2xl font-bold text-foreground">{t("referral.title")}</h1>
         <div className="flex items-center gap-2">
           {isRevalidating && data && (
             <span className="text-xs text-muted-foreground">Updating…</span>
@@ -151,22 +151,22 @@ export function ReferralUsdt() {
       {/* Top row: summary stat cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <div className="rounded-xl border border-border bg-card p-5">
-          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Total USDT Credit earned</p>
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("referral.totalUsdtEarned")}</p>
           <p className="mt-1 text-2xl font-bold text-primary">{(referralInfo?.total_usdt_credit_earned ?? 0).toFixed(4)}</p>
-          <p className="text-xs text-muted-foreground mt-0.5">From referrals (L1/L2/L3)</p>
+          <p className="text-xs text-muted-foreground mt-0.5">{t("referral.fromReferrals")}</p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
-          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">People signed up with your code</p>
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("referral.peopleSignedUp")}</p>
           <p className="mt-1 text-2xl font-bold text-foreground">{referralInfo?.referred_users_count ?? 0}</p>
           <p className="text-xs text-muted-foreground mt-0.5">
-            {(referralInfo?.referred_users_count ?? 0) === 0 ? "No one yet." : "Referred users"}
+            {(referralInfo?.referred_users_count ?? 0) === 0 ? t("referral.noOneYet") : t("referral.referredUsers")}
           </p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
-          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Available to withdraw</p>
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("referral.availableToWithdraw")}</p>
           <p className="mt-1 text-2xl font-bold text-foreground">{(usdtCredit?.available ?? 0).toFixed(2)}</p>
           <p className="text-xs text-muted-foreground mt-0.5">
-            {usdtCredit && usdtCredit.locked_pending > 0 ? `Locked pending: ${usdtCredit.locked_pending.toFixed(2)}` : "USDT Credit"}
+            {usdtCredit && usdtCredit.locked_pending > 0 ? `Locked pending: ${usdtCredit.locked_pending.toFixed(2)}` : t("referral.usdtCredit")}
           </p>
         </div>
       </div>
@@ -181,7 +181,7 @@ export function ReferralUsdt() {
               : "bg-secondary/50 text-muted-foreground hover:bg-secondary"
           }`}
         >
-          USDT Credit
+          {t("referral.usdtCredit")}
         </button>
         <button
           type="button"

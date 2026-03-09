@@ -90,7 +90,6 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
   const signedIn = status === "authenticated" && !!session?.user
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => getTabFromSearchParams(searchParams))
   const [showSecret, setShowSecret] = useState(false)
-  const [darkMode, setDarkMode] = useState(true)
 
   // USDT withdrawal address (from referral cache or referral-info API)
   const cachedAddress = referralCacheData?.referralInfo?.usdt_withdraw_address ?? ""
@@ -221,6 +220,15 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
     setActiveTab(tab)
   }, [searchParams])
 
+  const apiKeysSectionRef = useRef<HTMLDivElement>(null)
+  // Scroll to API keys section when landing on api-keys tab (e.g. from "Set Up API Key" popup)
+  useEffect(() => {
+    if (activeTab === "api-keys" && apiKeysSectionRef.current) {
+      const el = apiKeysSectionRef.current
+      requestAnimationFrame(() => el.scrollIntoView({ behavior: "smooth", block: "start" }))
+    }
+  }, [activeTab])
+
   const tabs: { id: SettingsTab; labelKey: string }[] = [
     { id: "general", labelKey: "settings.tabs.general" },
     { id: "api-keys", labelKey: "settings.tabs.apiKeys" },
@@ -283,7 +291,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
           <div className="flex items-center gap-3">
             <BarChart3 className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-xs font-semibold text-foreground">Current Plan</p>
+              <p className="text-xs font-semibold text-foreground">{t("settings.currentPlan")}</p>
               <p className="text-xs text-muted-foreground">{planName}</p>
             </div>
           </div>
@@ -308,7 +316,7 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
           <div className="flex items-center gap-3">
             <Calendar className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-xs font-semibold text-foreground">Registration Date</p>
+              <p className="text-xs font-semibold text-foreground">{t("settings.registrationDate")}</p>
               <p className="text-xs text-muted-foreground">
                 {createdAt ? (() => { try { const d = new Date(createdAt); return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); } catch { return "—"; } })() : "—"}
               </p>
@@ -382,8 +390,6 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
       <div className="rounded-xl border border-border bg-card p-5">
         {activeTab === "general" && (
           <GeneralTab
-            darkMode={darkMode}
-            setDarkMode={setDarkMode}
             usdtWithdrawAddress={usdtWithdrawAddress}
             setUsdtWithdrawAddress={setUsdtWithdrawAddress}
             onSaveUsdtAddress={saveUsdtAddress}
@@ -395,7 +401,11 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
           />
         )}
         {activeTab === "notifications" && <NotificationsTab />}
-        {activeTab === "api-keys" && <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} userId={userId} />}
+        {activeTab === "api-keys" && (
+          <div id="api-keys-section" ref={apiKeysSectionRef}>
+            <ApiKeysTab showSecret={showSecret} setShowSecret={setShowSecret} userId={userId} />
+          </div>
+        )}
         {activeTab === "community" && <CommunityTab />}
         {activeTab === "token-activity" && <TokenActivityTab />}
       </div>
@@ -405,8 +415,6 @@ export function SettingsPage({ onUpgradeClick }: SettingsPageProps) {
 
 /* ===================== GENERAL TAB (lending controls removed) ===================== */
 function GeneralTab({
-  darkMode,
-  setDarkMode,
   usdtWithdrawAddress,
   setUsdtWithdrawAddress,
   onSaveUsdtAddress,
@@ -416,8 +424,6 @@ function GeneralTab({
   originalUsdtAddress,
   setOriginalUsdtAddress,
 }: {
-  darkMode: boolean
-  setDarkMode: (v: boolean) => void
   usdtWithdrawAddress: string
   setUsdtWithdrawAddress: (v: string) => void
   onSaveUsdtAddress: () => Promise<void>
@@ -427,17 +433,18 @@ function GeneralTab({
   originalUsdtAddress: string
   setOriginalUsdtAddress: (v: string) => void
 }) {
+  const t = useT()
   return (
     <div className="flex flex-col gap-6">
       <div>
-        <h3 className="text-lg font-semibold text-foreground">General Settings</h3>
-        <p className="text-xs text-muted-foreground">Preferences for the dashboard</p>
+        <h3 className="text-lg font-semibold text-foreground">{t("settings.generalSettings")}</h3>
+        <p className="text-xs text-muted-foreground">{t("settings.preferencesDesc")}</p>
       </div>
 
       <div className="flex flex-col gap-4">
         <div>
-          <label className="text-sm font-medium text-foreground">USDT Withdrawal Address</label>
-          <p className="text-xs text-muted-foreground mb-1">TRC20 (T...) or ERC20 (0x...). Used for USDT Credit withdrawal requests.</p>
+          <label className="text-sm font-medium text-foreground">{t("settings.usdtWithdrawAddress")}</label>
+          <p className="text-xs text-muted-foreground mb-1">{t("settings.usdtAddressHint")}</p>
           {usdtWithdrawAddress && !isEditingUsdtAddress ? (
             // View mode: show address as read-only (greyed out)
             <div className="flex gap-2">
@@ -495,14 +502,14 @@ function GeneralTab({
           )}
         </div>
         <div>
-          <label className="text-sm font-medium text-foreground">Base Currency</label>
+          <label className="text-sm font-medium text-foreground">{t("settings.baseCurrency")}</label>
           <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50">
             <option>USD</option>
             <option>USDt</option>
           </select>
         </div>
         <div>
-          <label className="text-sm font-medium text-foreground">Time Zone</label>
+          <label className="text-sm font-medium text-foreground">{t("settings.timeZone")}</label>
           <select className="mt-1 w-full rounded-lg border border-border bg-secondary px-3 py-2.5 text-sm text-foreground outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50">
             <option>UTC</option>
             <option>EST</option>
@@ -510,13 +517,6 @@ function GeneralTab({
             <option>CET</option>
             <option>JST</option>
           </select>
-        </div>
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium text-foreground">Dark Mode</p>
-            <p className="text-xs text-muted-foreground">Enable dark mode for the dashboard</p>
-          </div>
-          <ToggleSwitch checked={darkMode} onChange={setDarkMode} />
         </div>
       </div>
     </div>
@@ -699,6 +699,7 @@ function ApiKeysTab({
   const [testingKeys, setTestingKeys] = useState(false)
   const [removingKey, setRemovingKey] = useState(false)
   const [apiKeyModificationLocked, setApiKeyModificationLocked] = useState(false)
+  const [showApiKeyHelp, setShowApiKeyHelp] = useState(false)
 
   const clearMessage = () => setMessage(null)
   const isPermissionsError = (text: string) => /missing permission|invalid api key|enable them|bitfinex api settings/i.test(text)
@@ -975,16 +976,16 @@ function ApiKeysTab({
       <div>
         <div className="flex items-center gap-2 mb-1">
           <Link2 className="h-5 w-5 text-primary" />
-          <h3 className="text-lg font-semibold text-foreground">Connect Bitfinex Account</h3>
+          <h3 className="text-lg font-semibold text-foreground">{t("settings.connectBitfinex")}</h3>
         </div>
-        <p className="text-xs text-muted-foreground">Enter your read-only API keys to start automated lending. Only one key can be stored.</p>
+        <p className="text-xs text-muted-foreground">{t("settings.apiKeysIntro")}</p>
       </div>
 
       {/* Current Configuration (Image 3: masked key, Created, status, Test, red bin) */}
       {hasKeys === true && (
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between flex-wrap gap-3">
-            <span className="text-sm font-semibold text-foreground">Current Configuration</span>
+            <span className="text-sm font-semibold text-foreground">{t("settings.currentConfig")}</span>
             <div className="flex items-center gap-2">
               {lastTestedAt ? (
                 <span className="rounded-full bg-primary/20 px-2.5 py-0.5 text-xs font-medium text-primary">{t("settings.verified")}</span>
@@ -1092,7 +1093,7 @@ function ApiKeysTab({
           </span>
           <Lock className="h-3.5 w-3.5 text-primary" />
           <span className="text-xs text-foreground">
-            Read-only access {"·"} Your funds stay secure
+            {t("settings.readOnlySecure")}
           </span>
         </div>
         <a 
@@ -1101,20 +1102,20 @@ function ApiKeysTab({
           rel={apiKeysHelpUrl.startsWith("http") ? "noopener noreferrer" : undefined}
           className="text-xs font-medium text-primary hover:text-primary transition-colors"
         >
-          {"Need help? \u2192"}
+          {t("settings.needHelp")}
         </a>
       </div>
 
       {/* Update API Keys (Image 3): allow insert when no keys; disable modify when has keys + lock window */}
       <div className="flex flex-col gap-4">
-        <h4 className="text-sm font-semibold text-foreground">{hasKeys ? t("settings.updateApiKeys") : "Add API Keys"}</h4>
+        <h4 className="text-sm font-semibold text-foreground">{hasKeys ? t("settings.updateApiKeys") : t("settings.addApiKeys")}</h4>
         {hasKeys && apiKeyModificationLocked && (
           <p className="text-xs text-amber-600 dark:text-amber-400">
             API key changes disabled during daily fee calculation (09:55–10:35 UTC). You can add a new key if you have none.
           </p>
         )}
         <div>
-          <label className="text-sm font-semibold text-foreground">API Key</label>
+          <label className="text-sm font-semibold text-foreground">{t("settings.apiKeyLabel")}</label>
           <input
             type="text"
             value={bfxKey}
@@ -1125,7 +1126,7 @@ function ApiKeysTab({
           />
         </div>
         <div>
-          <label className="text-sm font-semibold text-foreground">API Secret</label>
+          <label className="text-sm font-semibold text-foreground">{t("settings.apiSecretLabel")}</label>
           <div className="relative mt-1.5">
             <input
               type={showSecret ? "text" : "password"}
@@ -1230,16 +1231,43 @@ function ApiKeysTab({
             </li>
           </ol>
         </div>
-        <a
-          href="https://www.bitfinex.com"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-2 rounded-lg border border-border bg-secondary px-4 py-2.5 text-xs font-medium text-foreground hover:border-primary/50 transition-colors"
-        >
-          <ExternalLink className="h-3.5 w-3.5" />
-          Open Bitfinex
-        </a>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowApiKeyHelp(true)}
+            className="flex items-center gap-2 rounded-lg border border-border bg-secondary px-4 py-2.5 text-xs font-medium text-foreground hover:border-primary/50 transition-colors"
+          >
+            <BookOpen className="h-3.5 w-3.5" />
+            {t("apiKeyHelp.button")}
+          </button>
+          <a
+            href="https://www.bitfinex.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 rounded-lg border border-border bg-secondary px-4 py-2.5 text-xs font-medium text-foreground hover:border-primary/50 transition-colors"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Open Bitfinex
+          </a>
+        </div>
       </div>
+
+      {showApiKeyHelp && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowApiKeyHelp(false)}>
+          <div className="relative mx-4 max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-card p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <button type="button" onClick={() => setShowApiKeyHelp(false)} className="absolute right-3 top-3 rounded-lg p-1 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
+              <X className="h-4 w-4" />
+            </button>
+            <h3 className="text-lg font-bold text-foreground mb-4">{t("apiKeyHelp.title")}</h3>
+            <ol className="flex flex-col gap-2 text-sm text-muted-foreground mb-4">
+              <li>{t("apiKeyHelp.step1")}</li>
+              <li>{t("apiKeyHelp.step2")}</li>
+              <li>{t("apiKeyHelp.step3")}</li>
+            </ol>
+            <img src="/bitfinex-api-settings.png" alt="Bitfinex API settings" className="w-full rounded-lg border border-border" />
+          </div>
+        </div>
+      )}
 
       {/* Save Button: disabled when loading, or when user has keys and lock window is active */}
       <div className="flex justify-end">
@@ -1445,14 +1473,15 @@ function TokenActivityTab() {
 
 /* ===================== COMMUNITY TAB ===================== */
 function CommunityTab() {
+  const t = useT()
   return (
     <div className="flex flex-col gap-6">
       <div>
         <div className="flex items-center gap-2 mb-1">
           <MessageSquare className="h-5 w-5 text-primary" />
-          <h3 className="text-lg font-semibold text-foreground">{"Community & Support"}</h3>
+          <h3 className="text-lg font-semibold text-foreground">{t("settings.communitySupport")}</h3>
         </div>
-        <p className="text-xs text-muted-foreground">Connect with other bifinexbot.com users and get real-time support</p>
+        <p className="text-xs text-muted-foreground">{t("settings.communityDesc")}</p>
       </div>
 
       {/* Telegram */}
@@ -1461,17 +1490,17 @@ function CommunityTab() {
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#229ED9]">
             <Send className="h-5 w-5 text-foreground" />
           </div>
-          <h4 className="text-base font-semibold text-foreground">Join Our Telegram Community</h4>
+          <h4 className="text-base font-semibold text-foreground">{t("settings.joinTelegramCommunity")}</h4>
         </div>
         <ul className="flex flex-col gap-2 text-sm text-muted-foreground mb-4">
-          <li><span className="text-primary font-medium">Get instant support</span> from our team and experienced users</li>
-          <li><span className="text-chart-3 font-medium">Share strategies</span> and learn from successful lenders</li>
-          <li><span className="text-chart-2 font-medium">Receive updates</span> about new features and market insights</li>
-          <li><span className="text-destructive font-medium">Connect with the community</span> with bifinexbot.com users</li>
+          <li>{t("settings.getInstantSupport")}</li>
+          <li>{t("settings.shareStrategies")}</li>
+          <li>{t("settings.receiveUpdates")}</li>
+          <li>{t("settings.connectCommunity")}</li>
         </ul>
         <button className="flex items-center gap-2 rounded-lg bg-[#229ED9] px-4 py-2.5 text-sm font-semibold text-foreground hover:bg-[#229ED9]/80 transition-colors">
           <Send className="h-4 w-4" />
-          Join Telegram Group
+          {t("settings.joinTelegram")}
         </button>
       </div>
 
@@ -1481,11 +1510,11 @@ function CommunityTab() {
         <div className="rounded-xl border border-border bg-secondary/30 p-5">
           <div className="flex items-center gap-2 mb-2">
             <BookOpen className="h-4 w-4 text-muted-foreground" />
-            <h4 className="text-sm font-semibold text-foreground">Learning Hub</h4>
+            <h4 className="text-sm font-semibold text-foreground">{t("settings.learningHub")}</h4>
           </div>
-          <p className="text-xs text-muted-foreground mb-4">Comprehensive guides and tutorials for crypto lending success</p>
+          <p className="text-xs text-muted-foreground mb-4">{t("settings.learningHubDesc")}</p>
           <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-primary/50 transition-colors">
-            Explore Guides
+            {t("settings.exploreGuides")}
           </button>
         </div>
 
@@ -1493,11 +1522,11 @@ function CommunityTab() {
         <div className="rounded-xl border border-border bg-secondary/30 p-5">
           <div className="flex items-center gap-2 mb-2">
             <Shield className="h-4 w-4 text-muted-foreground" />
-            <h4 className="text-sm font-semibold text-foreground">Security Center</h4>
+            <h4 className="text-sm font-semibold text-foreground">{t("settings.securityCenter")}</h4>
           </div>
-          <p className="text-xs text-muted-foreground mb-4">Learn about our security measures and best practices</p>
+          <p className="text-xs text-muted-foreground mb-4">{t("settings.securityCenterDesc")}</p>
           <button className="rounded-lg border border-border bg-card px-4 py-2 text-xs font-medium text-foreground hover:border-primary/50 transition-colors">
-            Security Guide
+            {t("settings.securityGuide")}
           </button>
         </div>
       </div>

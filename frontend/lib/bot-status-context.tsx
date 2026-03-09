@@ -102,6 +102,14 @@ export function BotStatusProvider({ children, onUpgradeClick, onSettingsClick }:
     }
   }, [userId, refreshBotStatus])
 
+  // When status is "starting" or "stopping", poll more frequently to detect transitions
+  useEffect(() => {
+    if (userId == null) return
+    if (rawBotStatus !== "starting" && rawBotStatus !== "stopping") return
+    const fastPollId = setInterval(refreshBotStatus, 10_000)
+    return () => clearInterval(fastPollId)
+  }, [userId, rawBotStatus, refreshBotStatus])
+
   // Tick down action cooldown every second
   useEffect(() => {
     if (actionCooldownSec <= 0) return

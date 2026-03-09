@@ -182,11 +182,10 @@ export function PublicLayoutFooter() {
     { label: t("pages.howItWorks"), href: `/${locale}/how-it-works` },
     { label: t("pages.strategy"), href: `/${locale}/strategy` },
     { label: t("pages.pricing"), href: `/${locale}/pricing` },
-    { label: t("pages.faq"), href: `${homeHref}#faq` },
+    { label: t("pages.faq"), href: `/${locale}/faq` },
   ]
   const legalLinks = [
-    { label: t("landing.footerLogin"), href: "/login" },
-    { label: t("landing.footerDashboard"), href: "/dashboard" },
+    { label: t("landing.footerDashboard"), href: `/${locale}/dashboard` },
     { label: t("pages.terms"), href: `/${locale}/terms` },
     { label: t("pages.privacy"), href: `/${locale}/privacy` },
   ]

@@ -26,6 +26,11 @@ export const authOptions: NextAuthOptions = {
       }
       return "/?error=AccessDenied"
     },
+    async redirect({ url, baseUrl }) {
+      if (url.startsWith("/")) return `${baseUrl}${url}`
+      if (url.startsWith(baseUrl)) return url
+      return `${baseUrl}/dashboard`
+    },
     async session({ session, token }) {
       if (session.user) {
         (session.user as { id?: string }).id = token.sub ?? (token as { id?: string }).id

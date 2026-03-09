@@ -176,7 +176,7 @@ _RESPONSE_CACHE_TTLS = {
     "bot-stats": 10.0,
     "terminal-logs": 8.0,
     "notifications": 60.0,
-    "dashboard-fold": 15.0,
+    "dashboard-fold": 60.0,
     "token-add-history": 30.0,
     "deduction-history": 60.0,
     "wallets": 15.0,
@@ -1435,6 +1435,9 @@ async def lifespan(app: FastAPI):
     try:
         db = database.SessionLocal()
         try:
+            # Avoid blocking startup indefinitely if another transaction holds a lock on users.
+            db.execute(text("SET lock_timeout TO '2s'"))
+            db.execute(text("SET statement_timeout TO '5s'"))
             db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP"))
             db.commit()
             logger.info("Startup: users.last_login_at column ensured")
@@ -2460,6 +2463,24 @@ async def _get_bot_stats_data(user_id: int, db: Session) -> dict:
     vault = getattr(user, "vault", None) if user else None
     has_api_keys = bool(vault and getattr(vault, "encrypted_key", None))
 
+    # Self-heal: if DB says "starting" but no ARQ job is queued/running, reset to "stopped".
+    if bot_status == "starting" and redis is not None and user is not None:
+        try:
+            job_id = f"bot_user_{user_id}"
+            job_data = await redis.get(f"arq:job:{job_id}")
+            in_progress = await redis.exists(f"arq:in-progress:{job_id}")
+            if not job_data and not in_progress:
+                logger.info("bot_stats self-heal: user_id=%s stuck at 'starting' with no ARQ job, resetting to 'stopped'", user_id)
+                try:
+                    user.bot_status = "stopped"
+                    user.bot_desired_state = "stopped"
+                    db.commit()
+                    bot_status = "stopped"
+                except Exception:
+                    db.rollback()
+        except Exception as e:
+            logger.debug("bot_stats self-heal check failed user_id=%s: %s", user_id, e)
+
     if redis is None:
         return {
             "active": bot_status in ("running", "starting"),
@@ -3362,23 +3383,28 @@ async def _validate_and_save_bitfinex_keys(payload, current_user, db):
     # Step 5: Save validated key — encrypt API_SECRET (Fernet), save to DB
     balance = await mgr.compute_usd_balances()
 
-    hashed_id = hash_bitfinex_id(master_id)
-    existing = (
-        db.query(models.TrialHistory)
-        .filter(models.TrialHistory.hashed_bitfinex_id == hashed_id)
-        .first()
-    )
-    if existing:
-        return None, {
-            "error": "This Bitfinex account has already used the Free Trial. Please upgrade.",
-        }
+    premium_tiers = {"pro", "ultra", "ai_ultra", "whales"}
+    current_tier = (current_user.plan_tier or "").strip().lower()
+    is_premium = current_tier in premium_tiers
 
-    trial_row = models.TrialHistory(hashed_bitfinex_id=hashed_id)
-    db.add(trial_row)
+    if not is_premium:
+        # Free/New users: enforce trial uniqueness by Bitfinex account, then set trial defaults.
+        hashed_id = hash_bitfinex_id(master_id)
+        existing = (
+            db.query(models.TrialHistory)
+            .filter(models.TrialHistory.hashed_bitfinex_id == hashed_id)
+            .first()
+        )
+        if existing:
+            return None, {
+                "error": "This Bitfinex account has already used the Free Trial. Please upgrade.",
+            }
+        trial_row = models.TrialHistory(hashed_bitfinex_id=hashed_id)
+        db.add(trial_row)
 
-    current_user.plan_tier = "trial"
-    current_user.rebalance_interval = 30  # free tier: 30-min rebalancing
-    # No 7-day trial; free tier uses token credit (100 tokens)
+        current_user.plan_tier = "trial"
+        current_user.rebalance_interval = 30  # free tier: 30-min rebalancing
+        # No 7-day trial; free tier uses token credit (100 tokens)
 
     vault = (
         db.query(models.APIVault)
@@ -3403,7 +3429,8 @@ async def _validate_and_save_bitfinex_keys(payload, current_user, db):
         if hasattr(snap, "reconciliation_completed"):
             snap.reconciliation_completed = False  # 23:00 sweep will run reconciliation if key restored post-11:15
         db.commit()
-    return balance, {"message": "Exchange connected and trial activated."}
+    message = "Exchange connected." if is_premium else "Exchange connected and trial activated."
+    return balance, {"message": message}
 
 
 # Dev-only: connect exchange by user_id (no Google token). Set ALLOW_DEV_CONNECT=1 to enable.
@@ -3660,7 +3687,8 @@ async def _clear_arq_job_keys(redis, job_id: str) -> None:
     """Remove ARQ keys for job_id so the same id can be enqueued again (idempotent start after stop).
     Must also remove job_id from the abort sorted set (arq:abort), otherwise the worker sees it as aborted and logs 'aborted before start'."""
     try:
-        await redis.delete(ARQ_JOB_PREFIX + job_id, ARQ_RESULT_PREFIX + job_id)
+        # arq:in-progress:<job_id> can survive crashes for days and block re-runs with the same job id.
+        await redis.delete(ARQ_JOB_PREFIX + job_id, ARQ_RESULT_PREFIX + job_id, f"arq:in-progress:{job_id}")
         # Using gather to execute zrem in parallel to save round-trip latency to Upstash
         await asyncio.gather(
             redis.zrem(ARQ_QUEUE_NAME, job_id),
@@ -3720,9 +3748,20 @@ async def start_bot(
         )
     status_before = getattr(current_user, "bot_status", None) or "stopped"
     desired = getattr(current_user, "bot_desired_state", None) or "stopped"
-    if status_before in ("running", "starting") and desired == "running":
-        return {"status": "success", "message": "Bot already running or queued.", "bot_status": status_before}
     redis = await get_redis_or_raise()
+    if status_before in ("running", "starting") and desired == "running":
+        # Always try enqueue once; _enqueue_bot_task is lock-aware and avoids duplicate active runs.
+        # This also self-heals stale DB/Redis states that would otherwise stay stuck at "starting".
+        enqueued = await _enqueue_bot_task(redis, current_user.id)
+        if enqueued:
+            try:
+                current_user.bot_status = "starting"
+                db.commit()
+            except Exception:
+                db.rollback()
+            logger.info("start_bot user_id=%s action=start self-heal enqueued=True bot_status_before=%s bot_status_after=starting", current_user.id, status_before)
+            return {"status": "success", "message": f"Bot queued for user {current_user.id}", "bot_status": "starting"}
+        return {"status": "success", "message": "Bot already running or queued.", "bot_status": status_before}
     await _record_start_success(current_user.id)  # record so next start is cooldown-limited
     enqueued = await _enqueue_bot_task(redis, current_user.id)
     if enqueued:
@@ -4254,37 +4293,47 @@ LEDGER_FUNDING_CURRENCIES = (
 _LEDGER_STABLECOINS_ALWAYS = frozenset(("USD", "USDT", "USDt", "UST"))
 
 
-async def _get_ledger_currencies_for_user(mgr: BitfinexManager) -> Optional[List[str]]:
+def _extract_ledger_currencies_from_raw(credits_data: list, wallets_data: list) -> List[str]:
+    """Extract active funding currencies from pre-fetched credits/wallets Bitfinex data."""
+    currencies: set = set(_LEDGER_STABLECOINS_ALWAYS)
+    if isinstance(credits_data, list):
+        for row in credits_data:
+            try:
+                if isinstance(row, (list, tuple)) and len(row) > 1:
+                    sym = (row[1] or "").strip().upper()
+                    if sym.startswith("F"):
+                        sym = sym[1:]
+                    if sym:
+                        currencies.add(sym)
+            except (TypeError, IndexError):
+                pass
+    if isinstance(wallets_data, list):
+        for w in wallets_data:
+            try:
+                if isinstance(w, (list, tuple)) and len(w) > 2 and (w[0] or "").strip().lower() == "funding":
+                    c = (w[1] or "").strip().upper()
+                    if c:
+                        currencies.add(c)
+            except (TypeError, IndexError):
+                pass
+    return sorted(currencies) if currencies else list(_LEDGER_STABLECOINS_ALWAYS)
+
+
+async def _get_ledger_currencies_for_user(
+    mgr: BitfinexManager, fold_shared_bfx: Optional[dict] = None
+) -> Optional[List[str]]:
     """
     Option B: Get currencies the user has funding activity in (credits + wallets), so we fetch
     ledgers only for those and minimize API calls. Returns sorted list or None on error.
     Always includes USD, USDT, USDt, UST so stablecoin profit is never missed.
+    When fold_shared_bfx is provided, reuses pre-fetched data to avoid duplicate Bitfinex API calls.
     """
     try:
+        if fold_shared_bfx and fold_shared_bfx.get("credits") is not None and fold_shared_bfx.get("wallets") is not None:
+            return _extract_ledger_currencies_from_raw(fold_shared_bfx["credits"], fold_shared_bfx["wallets"])
         credits, err_c = await mgr.funding_credits(symbol=None)
         wallets, err_w = await mgr.wallets()
-        currencies: set = set(_LEDGER_STABLECOINS_ALWAYS)
-        if isinstance(credits, list):
-            for row in credits:
-                try:
-                    if isinstance(row, (list, tuple)) and len(row) > 1:
-                        sym = (row[1] or "").strip().upper()
-                        if sym.startswith("F"):
-                            sym = sym[1:]
-                        if sym:
-                            currencies.add(sym)
-                except (TypeError, IndexError):
-                    pass
-        if isinstance(wallets, list):
-            for w in wallets:
-                try:
-                    if isinstance(w, (list, tuple)) and len(w) > 2 and (w[0] or "").strip().lower() == "funding":
-                        c = (w[1] or "").strip().upper()
-                        if c:
-                            currencies.add(c)
-                except (TypeError, IndexError):
-                    pass
-        return sorted(currencies) if currencies else list(_LEDGER_STABLECOINS_ALWAYS)
+        return _extract_ledger_currencies_from_raw(credits, wallets)
     except Exception:
         return None
 
@@ -4354,6 +4403,8 @@ def _is_ledger_data_complete(latest_entry_mts: Optional[int]) -> bool:
     return (now_ms - latest_entry_mts) >= (LEDGER_FRESHNESS_MINUTES * 60 * 1000)
 
 
+_LEDGER_FETCH_CONCURRENCY = 3
+
 async def _fetch_all_margin_funding_entries(
     mgr: BitfinexManager,
     currencies: Optional[List[str]] = None,
@@ -4362,15 +4413,24 @@ async def _fetch_all_margin_funding_entries(
     Fetch Margin Funding ledger for the given currencies (or LEDGER_FUNDING_CURRENCIES if None).
     Returns (merged_entries, latest_mts, err). Each entry has entry[1]=CURRENCY, entry[3]=MTS, entry[5]=AMOUNT.
     All amounts must be converted to USD by caller via _gross_and_fees_from_ledger_entries(..., usd_prices=...).
+    Fetches up to _LEDGER_FETCH_CONCURRENCY currencies concurrently to reduce total latency.
     """
     to_fetch = list(currencies) if currencies else list(LEDGER_FUNDING_CURRENCIES)
     all_entries: list = []
     latest_mts: Optional[int] = None
     last_err: Optional[str] = None
-    for i, currency in enumerate(to_fetch):
-        if i > 0:
-            await asyncio.sleep(0.2)
-        entries, err = await _fetch_ledgers_script_style(mgr, currency, limit=100)
+    sem = asyncio.Semaphore(_LEDGER_FETCH_CONCURRENCY)
+
+    async def _fetch_one(currency: str) -> tuple[list, Optional[str]]:
+        async with sem:
+            return await _fetch_ledgers_script_style(mgr, currency, limit=100)
+
+    results = await asyncio.gather(*[_fetch_one(c) for c in to_fetch], return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            last_err = str(result)
+            continue
+        entries, err = result
         if err:
             last_err = err
             continue
@@ -4487,13 +4547,15 @@ async def _gross_profit_from_ledgers(
     mgr: BitfinexManager,
     start_ms: Optional[int] = None,
     fold_ticker_state: Optional[dict] = None,
+    fold_shared_bfx: Optional[dict] = None,
 ) -> tuple[float, float, Optional[str]]:
     """
     Sum gross profit and fees from ledgers (Margin Funding Payment) for all lending currencies.
     Uses Option B: fetch only currencies user has activity in (credits + wallets); fallback to full list.
     Converts every currency to USD via ticker prices (stablecoins 1:1). No start_ms/end_ms filter (cumulative).
+    When fold_shared_bfx is provided, reuses pre-fetched wallets/credits data from dashboard_fold.
     """
-    ledger_currencies = await _get_ledger_currencies_for_user(mgr)
+    ledger_currencies = await _get_ledger_currencies_for_user(mgr, fold_shared_bfx=fold_shared_bfx)
     if not ledger_currencies:
         ledger_currencies = list(LEDGER_FUNDING_CURRENCIES)
     all_entries, _, last_err = await _fetch_all_margin_funding_entries(mgr, currencies=ledger_currencies)
@@ -4510,11 +4572,13 @@ async def _gross_profit_from_ledgers(
 
 
 async def _refresh_user_lending_snapshot(
-    user_id: int, db: Session, fold_ticker_state: Optional[dict] = None
+    user_id: int, db: Session, fold_ticker_state: Optional[dict] = None,
+    fold_shared_bfx: Optional[dict] = None,
 ) -> tuple[LendingStatsResponse, bool, List[FundingTradeRecord]]:
     """
     Compute gross profit from Bitfinex: prefer ledgers (Margin Funding Payment from registration to latest),
     then fall back to funding trades. Persist to user_profit_snapshot and return (result, rate_limited, trade_records).
+    When fold_shared_bfx is provided, reuses pre-fetched wallets/credits data from dashboard_fold.
     """
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user or not user.vault:
@@ -4528,7 +4592,7 @@ async def _refresh_user_lending_snapshot(
 
     # Prefer ledgers-based gross profit (Margin Funding Payment between registration and latest)
     if start_ms is not None:
-        gross_ledgers, fees_ledgers, err_ledgers = await _gross_profit_from_ledgers(mgr, start_ms, fold_ticker_state)
+        gross_ledgers, fees_ledgers, err_ledgers = await _gross_profit_from_ledgers(mgr, start_ms, fold_ticker_state, fold_shared_bfx=fold_shared_bfx)
         if err_ledgers and bitfinex_cache.is_rate_limit_error(err_ledgers):
             if snap and snap.gross_profit_usd is not None:
                 gross = float(snap.gross_profit_usd)
@@ -4680,12 +4744,15 @@ async def _refresh_user_lending_snapshot(
 
 
 async def _get_lending_stats_data(
-    user_id: int, db: Session, source: Optional[str] = None, fold_ticker_state: Optional[dict] = None
+    user_id: int, db: Session, source: Optional[str] = None,
+    fold_ticker_state: Optional[dict] = None,
+    fold_shared_bfx: Optional[dict] = None,
 ) -> tuple[LendingStatsResponse, dict]:
     """
     Shared logic for lending stats. Returns (response, headers_dict).
     Used by GET /stats/{user_id}/lending and dashboard-fold.
     When fold_ticker_state is provided (from dashboard_fold), ticker is shared with wallets for single fetch.
+    When fold_shared_bfx is provided, reuses pre-fetched wallets/credits to avoid duplicate Bitfinex API calls.
     """
     out: dict = {}
     try:
@@ -4785,7 +4852,7 @@ async def _get_lending_stats_data(
             db_snap = float(fallback_gross) if fallback_gross is not None else None
             return (LendingStatsResponse(gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0, db_snapshot_gross=db_snap), out)
         try:
-            result, rate_limited, records = await _refresh_user_lending_snapshot(user_id, db, fold_ticker_state)
+            result, rate_limited, records = await _refresh_user_lending_snapshot(user_id, db, fold_ticker_state, fold_shared_bfx=fold_shared_bfx)
         except Exception:
             if fallback_gross is not None:
                 out["X-Data-Source"] = "db"
@@ -7517,12 +7584,16 @@ def _funding_balances_from_wallets(wallets: Any) -> Dict[str, float]:
     return result
 
 
-async def _portfolio_allocation_snapshot(mgr: BitfinexManager, fold_ticker_state: Optional[dict] = None) -> tuple:
+async def _portfolio_allocation_snapshot(
+    mgr: BitfinexManager, fold_ticker_state: Optional[dict] = None,
+    fold_shared_bfx: Optional[dict] = None,
+) -> tuple:
     """
     Wallets, credits, offers in rapid succession; one ticker fetch (or shared fold ticker when fold_ticker_state provided).
     Retries up to 3 times with backoff on transient failures (stable logic like other platforms).
     Returns (summary_dict, log_str, rate_limited: bool).
     Actively Earning = credits USD (from offers API); Pending = offers USD (from credits API); Idle = Total - credits - offers.
+    When fold_shared_bfx dict is provided, stores raw wallets/credits data so lending path can reuse them.
     """
     max_attempts = 3
     wallets, credits, offers = None, None, None
@@ -7548,6 +7619,10 @@ async def _portfolio_allocation_snapshot(mgr: BitfinexManager, fold_ticker_state
     wallets_data = wallets[0] if isinstance(wallets, tuple) else None
     credits_data = credits[0] if isinstance(credits, tuple) else None
     offers_data = offers[0] if isinstance(offers, tuple) else None
+
+    if fold_shared_bfx is not None:
+        fold_shared_bfx["wallets"] = wallets_data
+        fold_shared_bfx["credits"] = credits_data
 
     # Only compute when we have all three; otherwise return None so caller can serve cache or 200+incomplete.
     if wallets_data is None or credits_data is None or offers_data is None:
@@ -7680,13 +7755,16 @@ def _empty_wallet_response():
 
 
 async def _get_wallet_data(
-    user_id: int, user: "models.User", db: Session, fold_ticker_state: Optional[dict] = None
+    user_id: int, user: "models.User", db: Session,
+    fold_ticker_state: Optional[dict] = None,
+    fold_shared_bfx: Optional[dict] = None,
 ) -> tuple[dict, str]:
     """
     Shared logic for wallet summary. Returns (data_dict, source) where source is "cache" or "live".
     On error returns (_empty_wallet_response(), "live", incomplete). Raises HTTPException only for auth/404.
     When snapshot is incomplete and no cache, returns 200 with empty data and incomplete=True so dashboard still loads.
     When fold_ticker_state is provided (from dashboard_fold), ticker is shared with lending path for single fetch.
+    When fold_shared_bfx is provided, stores raw wallets/credits data so lending path can reuse them.
     """
     try:
         cached = await bitfinex_cache.get_cached(user_id, bitfinex_cache.KEY_WALLETS)
@@ -7728,7 +7806,7 @@ async def _get_wallet_data(
     keys = user.vault.get_keys()
     mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
     try:
-        summary, log_str, rate_limited = await _portfolio_allocation_snapshot(mgr, fold_ticker_state)
+        summary, log_str, rate_limited = await _portfolio_allocation_snapshot(mgr, fold_ticker_state, fold_shared_bfx=fold_shared_bfx)
         if os.getenv("LOG_PORTFOLIO_ALLOCATION"):
             print(f"[user_id={user_id}] {log_str}")
         if rate_limited:
@@ -7869,6 +7947,11 @@ async def _dashboard_fold_impl(current_user: models.User, db: Session):
         "arrived": 0,
     }
 
+    # Shared Bitfinex data: wallets path stores raw credits/wallets after fetching them;
+    # lending path checks and reuses if available, otherwise fetches its own (no worse than before).
+    # This opportunistically avoids 2 duplicate Bitfinex API calls (~1-3s saved).
+    fold_shared_bfx: dict = {}
+
     async def _wallets():
         if not vault:
             return _empty_wallet_response()
@@ -7877,7 +7960,7 @@ async def _dashboard_fold_impl(current_user: models.User, db: Session):
             user_w = db_w.query(models.User).filter(models.User.id == user_id).first()
             if not user_w:
                 return _empty_wallet_response()
-            data, _, _ = await _get_wallet_data(user_id, user_w, db_w, fold_ticker_state)
+            data, _, _ = await _get_wallet_data(user_id, user_w, db_w, fold_ticker_state, fold_shared_bfx=fold_shared_bfx)
             return data
         except HTTPException:
             raise
@@ -7898,7 +7981,10 @@ async def _dashboard_fold_impl(current_user: models.User, db: Session):
     async def _lending():
         db_l = database.SessionLocal()
         try:
-            lending_resp, _ = await _get_lending_stats_data(user_id, db_l, fold_ticker_state=fold_ticker_state)
+            lending_resp, _ = await _get_lending_stats_data(
+                user_id, db_l, fold_ticker_state=fold_ticker_state,
+                fold_shared_bfx=fold_shared_bfx,
+            )
             return lending_resp.model_dump()
         except Exception:
             return {"gross_profit": 0.0, "bitfinex_fee": 0.0, "net_profit": 0.0}
@@ -7907,20 +7993,8 @@ async def _dashboard_fold_impl(current_user: models.User, db: Session):
 
     wallets_data, bot_stats, lending_data = await asyncio.gather(_wallets(), _bot_stats(), _lending())
 
-    # When lending has gross profit but no trades (e.g. from cache/DB), fill trades in fold so frontend skips GET /api/funding-trades
-    if (
-        vault
-        and (lending_data.get("gross_profit") or 0) > 0
-        and not (lending_data.get("trades") and len(lending_data.get("trades", [])) > 0)
-    ):
-        try:
-            trade_records = await _fetch_funding_trade_records_for_user(user)
-            if trade_records:
-                FOLD_TRADES_CAP = 100
-                lending_data["total_trades_count"] = len(trade_records)
-                lending_data["trades"] = trade_records[-FOLD_TRADES_CAP:]
-        except Exception:
-            pass
+    # Trades are fetched by frontend via ensureLendingTrades → GET /api/funding-trades
+    # (removed from fold to avoid 1-5s sequential Bitfinex pagination on every dashboard load).
 
     try:
         user_status = _get_user_status_data(user_id, db)

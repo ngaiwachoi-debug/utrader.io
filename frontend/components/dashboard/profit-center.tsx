@@ -331,7 +331,7 @@ export function ProfitCenter({ onUpgradeClick }: ProfitCenterProps) {
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             {!loading && !error && gross === 0
-              ? t("dashboard.noDataYet") + " Gross comes from Bitfinex Margin Funding ledger (sum of EARNED). Use Refresh, or ensure the daily 9:40/10:00 UTC job has run and API keys are connected."
+              ? t("dashboard.noDataYet") + " " + t("dashboard.noDataGrossHint")
               : t("dashboard.grossProfitSinceRegistration")}
             {tradesCount != null && tradesCount > 0 && (
               <span className="ml-1"> · {tradesCount} repaid lending trade{tradesCount !== 1 ? "s" : ""} extracted</span>

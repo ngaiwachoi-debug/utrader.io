@@ -94,35 +94,35 @@ export function MarketStatus() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">Total Market Volume (24h)</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("marketStatus.totalVolume24h")}</span>
             <DollarSign className="h-4 w-4 text-primary" />
           </div>
           <p className="mt-2 text-2xl font-bold text-foreground">$775.3M</p>
-          <p className="text-xs text-muted-foreground">USD + USDt combined</p>
+          <p className="text-xs text-muted-foreground">{t("marketStatus.usdUsdtCombined")}</p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">Avg. USD Lend Rate</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("marketStatus.avgUsdLendRate")}</span>
             <TrendingUp className="h-4 w-4 text-primary" />
           </div>
           <p className="mt-2 text-2xl font-bold text-primary">2.63%</p>
-          <p className="text-xs text-muted-foreground">Current FRR</p>
+          <p className="text-xs text-muted-foreground">{t("marketStatus.currentFrr")}</p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">Avg. USDt Lend Rate</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("marketStatus.avgUsdtLendRate")}</span>
             <BarChart3 className="h-4 w-4 text-blue-400" />
           </div>
           <p className="mt-2 text-2xl font-bold text-blue-400">6.49%</p>
-          <p className="text-xs text-muted-foreground">Current FRR</p>
+          <p className="text-xs text-muted-foreground">{t("marketStatus.currentFrr")}</p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">Active Currencies</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("marketStatus.activeCurrencies")}</span>
             <Activity className="h-4 w-4 text-amber-500" />
           </div>
           <p className="mt-2 text-2xl font-bold text-foreground">10+</p>
-          <p className="text-xs text-muted-foreground">With lending depth</p>
+          <p className="text-xs text-muted-foreground">{t("marketStatus.withLendingDepth")}</p>
         </div>
       </div>
 
@@ -131,9 +131,9 @@ export function MarketStatus() {
         <div className="border-b border-border p-4">
           <div className="flex items-center gap-2">
             <PieChart className="h-4 w-4 text-primary" />
-            <h3 className="text-sm font-semibold text-foreground">Market Overview</h3>
+            <h3 className="text-sm font-semibold text-foreground">{t("marketStatus.marketOverview")}</h3>
           </div>
-          <p className="text-xs text-muted-foreground mt-1">Rates and volume by currency</p>
+          <p className="text-xs text-muted-foreground mt-1">{t("marketStatus.ratesByCurrency")}</p>
         </div>
         <div className="grid grid-cols-4 gap-2 border-b border-border px-4 py-2 text-xs font-medium text-muted-foreground">
           <span>Currency</span>

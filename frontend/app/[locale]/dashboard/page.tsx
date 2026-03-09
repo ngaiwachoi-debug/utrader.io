@@ -30,7 +30,7 @@ import { useT } from "@/lib/i18n"
 import { DateRangeProvider } from "@/lib/date-range-context"
 import { CurrentUserProvider, useCurrentUserId } from "@/lib/current-user-context"
 import { BotStatusProvider } from "@/lib/bot-status-context"
-import { DashboardDataProvider, useDashboardData, useUserStatus } from "@/lib/dashboard-data-context"
+import { DashboardDataProvider, useDashboardData, useUserStatus, useBotStats } from "@/lib/dashboard-data-context"
 
 function normalizePlanTier(raw: string): string {
   const s = (raw ?? "trial").toString().trim().toLowerCase()
@@ -76,8 +76,11 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [paymentReturnStatus, setPaymentReturnStatus] = useState<"success" | "cancel" | null>(null)
+  const [apiKeyPopupDismissed, setApiKeyPopupDismissed] = useState(false)
   const paymentProcessedRef = useRef(false)
   const prefetchedUserIdRef = useRef<number | null>(null)
+  const botStats = useBotStats(id)
+  const showApiKeyPopup = !apiKeyPopupDismissed && botStats.data != null && !botStats.data.has_api_keys && userId != null
 
   useEffect(() => {
     if (userId != null && prefetchedUserIdRef.current !== userId) {
@@ -176,6 +179,28 @@ function DashboardLayout({ searchParams }: { searchParams: ReturnType<typeof use
         </div>
 
         <MobileNav activePage={activePage} onPageChange={setActivePage} t={t} />
+
+        <Dialog open={showApiKeyPopup} onOpenChange={(open) => { if (!open) setApiKeyPopupDismissed(true) }}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{t("apiKeyPopup.title")}</DialogTitle>
+              <DialogDescription>{t("apiKeyPopup.description")}</DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                onClick={() => {
+                  setApiKeyPopupDismissed(true)
+                  const params = new URLSearchParams(searchParams?.toString() ?? "")
+                  params.set("page", "settings")
+                  params.set("tab", "api-keys")
+                  router.push(`${pathname}?${params.toString()}`)
+                }}
+              >
+                {t("apiKeyPopup.button")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         <Dialog open={paymentReturnStatus === "success"} onOpenChange={(open) => !open && setPaymentReturnStatus(null)}>
           <DialogContent>

@@ -1,9 +1,8 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import Link from "next/link"
 import { useRouter, usePathname } from "next/navigation"
-import { signOut } from "next-auth/react"
+import { signIn, signOut } from "next-auth/react"
 import { clearBackendTokenCache, getBackendToken } from "@/lib/auth"
 import { Star, Search, Bell, HelpCircle, User, Globe, LogOut, Sun, Moon, AlertTriangle, Coins, Menu } from "lucide-react"
 import { useTheme } from "next-themes"
@@ -226,10 +225,13 @@ export function Header({ onUpgradeClick, onOpenMobileMenu }: HeaderProps) {
                 <span className="text-xs">{t("header.logout")}</span>
               </button>
             ) : (
-              <Link href="/login" className="hidden md:flex items-center gap-1.5 rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
+              <button
+                onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+                className="hidden md:flex items-center gap-1.5 rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
+              >
                 <User className="h-4 w-4" />
                 <span className="text-xs">{t("header.login")}</span>
-              </Link>
+              </button>
             )}
             {/* Language Select: desktop only (mobile has it in drawer) */}
             <Select value={language} onValueChange={handleLocaleChange}>

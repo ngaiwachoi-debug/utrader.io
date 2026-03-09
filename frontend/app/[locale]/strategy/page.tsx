@@ -4,7 +4,7 @@ import Link from "next/link"
 import { useParams } from "next/navigation"
 import { useT } from "@/lib/i18n"
 import { PublicLayoutHeader, PublicLayoutFooter } from "@/components/landing/public-layout"
-import { ArrowLeft, Radio, Filter, Layers, TrendingUp, Zap, BarChart3, Shield, Award, Cpu, LineChart, Bot, Check, X } from "lucide-react"
+import { ArrowLeft, Radio, Filter, Layers, TrendingUp, Zap, BarChart3, Shield, Award, Cpu, LineChart, Check, X } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 
 export default function StrategyPage() {
@@ -166,16 +166,6 @@ export default function StrategyPage() {
             ))}
           </div>
         </section>
-
-        <div className="text-center">
-          <Link
-            href="/login"
-            className="inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
-          >
-            <Bot className="h-4 w-4" />
-            {t("landing.startFreeTrial")}
-          </Link>
-        </div>
       </main>
       <PublicLayoutFooter />
     </div>

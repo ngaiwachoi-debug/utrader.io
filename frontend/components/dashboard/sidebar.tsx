@@ -1,7 +1,6 @@
 "use client"
 
 import { useState } from "react"
-import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
   DollarSign,
@@ -20,7 +19,7 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useT } from "@/lib/i18n"
-import { signOut } from "next-auth/react"
+import { signIn, signOut } from "next-auth/react"
 import { clearBackendTokenCache } from "@/lib/auth"
 import { useSession } from "next-auth/react"
 
@@ -146,13 +145,13 @@ export function Sidebar({ activePage, onPageChange, collapsed, onToggle, planTie
           </>
         ) : (
           !collapsed && (
-            <Link
-              href="/login"
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm font-semibold text-primary hover:bg-primary/10 transition-colors"
+            <button
+              onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+              className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm font-semibold text-primary hover:bg-primary/10 transition-colors"
             >
               <User className="h-4 w-4" />
               <span>{t("sidebar.signIn")}</span>
-            </Link>
+            </button>
           )
         )}
       </div>
