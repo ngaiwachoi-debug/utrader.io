@@ -4919,12 +4919,16 @@ async def get_funding_trades(
     """
     if not current_user.vault:
         return FundingTradesResponse(trades=[], gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
-    keys = current_user.vault.get_keys()
-    mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
-    start_ms = None
-    if getattr(current_user.vault, "created_at", None) and current_user.vault.created_at:
-        start_ms = int(current_user.vault.created_at.timestamp() * 1000)
-    trades, err = await _fetch_all_funding_trades(mgr, start_ms)
+    try:
+        keys = current_user.vault.get_keys()
+        mgr = BitfinexManager(keys["bfx_key"], keys["bfx_secret"])
+        start_ms = None
+        if getattr(current_user.vault, "created_at", None) and current_user.vault.created_at:
+            start_ms = int(current_user.vault.created_at.timestamp() * 1000)
+        trades, err = await _fetch_all_funding_trades(mgr, start_ms)
+    except Exception as e:
+        logger.warning("get_funding_trades user_id=%s failed to load keys/trades: %s", current_user.id, e)
+        return FundingTradesResponse(trades=[], gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
     if err or not trades:
         return FundingTradesResponse(trades=[], gross_profit=0.0, bitfinex_fee=0.0, net_profit=0.0)
     ticker_prices = _ticker_prices_from_trades(trades)

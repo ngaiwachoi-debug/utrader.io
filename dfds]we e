@@ -1,0 +1,50 @@
+* [33m562daa8[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mproduction[m[33m, [m[1;31morigin/production[m[33m, [m[1;31mgithub/production[m[33m)[m security: remove environment secrets and update gitignore
+* [33m0f1d467[m[33m ([m[1;31morigin/2026-02-26-5ila-2ae8a[m[33m, [m[1;31mgithub/2026-02-26-5ila-2ae8a[m[33m)[m Zombie protection: stale key cleanup, empty-wallet circuit breaker, weekly cleanup, dormant users; token deduction stops bot at 0; last_login_at; Alibaba VPC doc; zombie test script
+* [33mc74495d[m Backend: BFX rate limiter, websocket, logging; env examples; backup scripts; dashboard/next config updates
+* [33m0c052cc[m Landing redesign: Aave-style section, partner logos, i18n carousel, public header mobile menu, theme hydration fix
+* [33mfebb439[m fix: clean arq:retry and arq:in-progress keys on bot stop/cleanup to prevent stuck jobs
+* [33mdde09e4[m fix: ARQ worker job_timeout, bot UI/UX overhaul, IDOR security fixes, auto-restart watchdog
+* [33mdc85e8e[m API perf, referral/bootstrap, Stripe restart, bot fixes, admin referral %, docs and scripts
+* [33m86755fd[m Token add log: store and show full detail (deposit, subscription, admin); dashboard perf; deduction multiplier; next-intl; docs and scripts
+* [33mb7b09a3[m fix: Stop Bot reliability + UI double-click and worker/backend stop handling
+* [33m5c165c1[m Misc: bot-status-bar, header, dashboard context, i18n, admin, main; remove install-app-button and manifest
+* [33m757b86c[m i18n: reorder languages (English first, Chinese second, then by global usage)
+* [33m29d5bb7[m Dashboard: tier table, True ROI gating, API key banner, install app, languages (pt/fil/id/ja), bot bar hide when no keys
+* [33ma8b5cc4[m fdgfdgfdgfdgfdgdfgddfdsfdsfsdfdsfsdfsdfsdfdsferwrwedvxcvgv
+* [33m94d7b09[m Dashboard, admin, token ledger, bot status, restart scripts, migrations and docs
+* [33m67d5700[m Fix ARQ queue stuck: clear arq:abort on re-enqueue; worker exit behavior; bot diagnosis scripts
+* [33m23b181b[m Update CORS configuration to allow API calls from additional frontend ports (3003) for improved development flexibility.
+* [33m58b7b1f[m 156156156nfghfghfhfhfhffgdfgdgfd
+* [33m8ab212e[m Cache / rate-limit feedback
+* [33mca5ff71[m Fix: UTC time zone conversion in profit tracker
+* [33m8715df8[m Update SettingsPage component to manage token states. Replaced trial remaining days with tokens remaining, tokens used, and initial ftoken credit for improved user status tracking.
+* [33m8ebc0b1[m Enhance ProfitCenter and Subscription components with improved API integration and state management. Updated ProfitCenter to handle gross and net profit calculations from refresh data, and modified Subscription to manage token purchases and display usage metrics. Cleaned up LiveStatus by removing unused user context and optimizing rendering logic.
+* [33m0bf391f[m Enhance logging and refactor API request handling in WallStreet_Omni_FullEngine. Added optional log_lines parameter to capture logs for Whales terminal. Replaced print statements with a dedicated _log method for consistent logging. Updated _generate_signature and _api_request methods to improve payload handling and error management.
+* [33m9be35f6[m fghfghfghgfhggfhfgjfgnfgdfbd
+* [33m58a1000[m fdgfdgdfgdfgfg
+* [33m57a2157[m Refactor ProfitCenter and LiveStatus components to utilize current user context and improve API integration. Added error handling and loading states, and updated data fetching logic to support user-specific data retrieval.
+* [33mf9e53e7[m[33m ([m[1;31morigin/master[m[33m, [m[1;31mgithub/master[m[33m)[m dfgdgf
+* [33mea7ac1d[m sdfdsfasfasdfdsfasdsff
+* [33m6eeca83[m bdfgbgdfghhgfh
+* [33m6a5f852[m test
+* [33me4ec0ac[m dsfsf
+* [33m6575b37[m gregr
+* [33mad26cef[m ttretertger
+* [33m7974123[m ttret
+* [33m95f6455[m fff
+* [33m95d9342[m f
+* [33m6fe1b77[m reverse back
+* [33m3b3cd72[m Cache / rate-limit feedback
+* [33m1c3fb92[m Cache / rate-limit feedback
+* [33mfc5a10b[m Cache / rate-limit feedback
+* [33mae90c59[m Cache / rate-limit feedback
+* [33m00f11c3[m Fix: Attempted Bitfinex logic port and CORS update
+* [33m0bf6adf[m Yod
+* [33meb23a4c[m Yo
+* [33m4d18366[m Final cleanup of folder structure and translation paths
+* [33med40df6[m Organized frontend messages and cleaned root
+* [33mce44a82[m Security: Finalize gitignore to protect env files
+* [33mde076e9[m Organized frontend messages and cleaned root
+* [33mf50ff25[m Organized frontend messages and cleaned root
+* [33m6d58974[m Fix structure: Remove accidental Node.js files from Python root
+* [33m743fb86[m Initialize clean project structure with Auth and I18n files

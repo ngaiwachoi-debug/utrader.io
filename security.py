@@ -75,6 +75,7 @@ def encrypt_key(api_key: str) -> str:
 def decrypt_key(encrypted_key: str) -> str:
     """
     Decrypts an API key. Tries Fernet first (when ENCRYPTION_KEY is set), then AES-256-GCM.
+    Falls back to the original value for legacy/plaintext rows migrated from older environments.
     """
     if not encrypted_key:
         return ""
@@ -85,8 +86,13 @@ def decrypt_key(encrypted_key: str) -> str:
         except InvalidToken:
             pass
 
-    aesgcm = AESGCM(_AES_KEY)
-    blob = base64.b64decode(encrypted_key.encode("utf-8"))
-    nonce, ct = blob[:12], blob[12:]
-    pt = aesgcm.decrypt(nonce, ct, None)
-    return pt.decode("utf-8")
+    try:
+        aesgcm = AESGCM(_AES_KEY)
+        blob = base64.b64decode(encrypted_key.encode("utf-8"))
+        nonce, ct = blob[:12], blob[12:]
+        pt = aesgcm.decrypt(nonce, ct, None)
+        return pt.decode("utf-8")
+    except Exception:
+        # Some older/migrated rows may already contain plaintext keys instead of encrypted blobs.
+        # Returning the original value keeps runtime paths working instead of crashing with 500s.
+        return encrypted_key
