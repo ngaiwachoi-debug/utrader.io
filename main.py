@@ -2463,14 +2463,14 @@ async def _get_bot_stats_data(user_id: int, db: Session) -> dict:
     vault = getattr(user, "vault", None) if user else None
     has_api_keys = bool(vault and getattr(vault, "encrypted_key", None))
 
-    # Self-heal: if DB says "starting" but no ARQ job is queued/running, reset to "stopped".
-    if bot_status == "starting" and redis is not None and user is not None:
+    # Self-heal: if DB says "starting" or "stopping" but no ARQ job is queued/running, reset to "stopped".
+    if bot_status in ("starting", "stopping") and redis is not None and user is not None:
         try:
             job_id = f"bot_user_{user_id}"
             job_data = await redis.get(f"arq:job:{job_id}")
             in_progress = await redis.exists(f"arq:in-progress:{job_id}")
             if not job_data and not in_progress:
-                logger.info("bot_stats self-heal: user_id=%s stuck at 'starting' with no ARQ job, resetting to 'stopped'", user_id)
+                logger.info("bot_stats self-heal: user_id=%s stuck at '%s' with no ARQ job, resetting to 'stopped'", user_id, bot_status)
                 try:
                     user.bot_status = "stopped"
                     user.bot_desired_state = "stopped"
@@ -3795,17 +3795,17 @@ async def stop_bot(
     await _check_stop_cooldown(user_id)
     from arq.jobs import Job
     status_before = getattr(current_user, "bot_status", None) or "stopped"
-    logger.info("stop_bot user_id=%s status_before=%s updating DB", user_id, status_before)
-    # Plan C: DB first so UI never stuck on "starting" if job aborted before start
+    logger.info("stop_bot user_id=%s status_before=%s updating DB to stopping", user_id, status_before)
+    # Phase 1: Set "stopping" so frontend polls see the transitional state.
     try:
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if user:
             if hasattr(user, "bot_desired_state"):
                 user.bot_desired_state = "stopped"
             if hasattr(user, "bot_status"):
-                user.bot_status = "stopped"
+                user.bot_status = "stopping"
             db.commit()
-            logger.info("stop_bot user_id=%s DB updated bot_status=stopped", user_id)
+            logger.info("stop_bot user_id=%s DB updated bot_status=stopping", user_id)
         else:
             logger.warning("stop_bot user_id=%s user not found in DB", user_id)
     except Exception as e:
@@ -3814,17 +3814,19 @@ async def stop_bot(
         except Exception:
             pass
         logger.exception("stop_bot user_id=%s DB update failed: %s", user_id, e)
+    _rcache_invalidate_user(user_id)
+
+    # Phase 2: Abort ARQ job and clean up Redis keys.
     aborted = False
     job_id = f"bot_user_{user_id}"
     try:
         redis = await get_redis_or_raise()
-        await _record_stop_success(user_id)  # record so next stop is cooldown-limited
+        await _record_stop_success(user_id)
         logger.info("stop_bot user_id=%s job_id=%s calling job.abort(timeout=5)", user_id, job_id)
         job = Job(job_id=job_id, redis=redis)
         aborted = await job.abort(timeout=5)
         logger.info("stop_bot user_id=%s job.abort() returned aborted=%s", user_id, aborted)
         await _clear_arq_job_keys(redis, job_id)
-        # Release the per-user run lock so a fresh start can proceed immediately
         try:
             await redis.delete(f"bot_run_lock:{user_id}")
         except Exception:
@@ -3849,10 +3851,22 @@ async def stop_bot(
             logger.info("stop_bot user_id=%s ARQ keys + run lock cleared after exception", user_id)
         except Exception as e2:
             logger.exception("stop_bot user_id=%s clear_arq_job_keys failed: %s", user_id, e2)
+
+    # Phase 3: Finalize to "stopped" now that job is cleaned up.
+    try:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if user and hasattr(user, "bot_status"):
+            user.bot_status = "stopped"
+            db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     _rcache_invalidate_user(user_id)
     logger.info("stop_bot EXIT user_id=%s aborted=%s bot_status_before=%s bot_status_after=stopped", user_id, aborted, status_before)
     _write_stop_bot_debug(user_id, status_before, aborted, None)
-    return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
+    return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopping"}
 
 
 # Legacy-style control endpoints that address bots by numeric user_id directly.
@@ -3920,19 +3934,22 @@ async def stop_bot_for_user(
     from arq.jobs import Job
     user = db.query(models.User).filter(models.User.id == user_id).first()
     status_before = getattr(user, "bot_status", None) if user else None
-    # Plan C: DB first (same logic as authenticated stop)
+    # Phase 1: Set "stopping" so polls see the transitional state.
     if user:
         try:
             if hasattr(user, "bot_desired_state"):
                 user.bot_desired_state = "stopped"
             if hasattr(user, "bot_status"):
-                user.bot_status = "stopped"
+                user.bot_status = "stopping"
             db.commit()
         except Exception:
             try:
                 db.rollback()
             except Exception:
                 pass
+    _rcache_invalidate_user(user_id)
+
+    # Phase 2: Abort ARQ job and clean up.
     aborted = False
     try:
         redis = await get_redis_or_raise()
@@ -3959,8 +3976,22 @@ async def stop_bot_for_user(
             await redis.delete(f"bot_run_lock:{user_id}")
         except Exception:
             pass
+
+    # Phase 3: Finalize to "stopped".
+    if user:
+        try:
+            user = db.query(models.User).filter(models.User.id == user_id).first()
+            if user and hasattr(user, "bot_status"):
+                user.bot_status = "stopped"
+                db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    _rcache_invalidate_user(user_id)
     logger.info("stop_bot_for_user user_id=%s aborted=%s bot_status_before=%s bot_status_after=stopped", user_id, aborted, status_before)
-    return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopped"}
+    return {"status": "success", "message": "Shutdown signal sent" if aborted else "Bot stopped.", "bot_status": "stopping"}
 
 
 @app.post("/dev/run-daily-deduction")

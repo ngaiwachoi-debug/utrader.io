@@ -60,9 +60,11 @@ export function BotStatusProvider({ children, onUpgradeClick, onSettingsClick }:
   const botActive =
     rawBotStatus === "running" || rawBotStatus === "starting"
       ? true
-      : rawBotStatus === "stopped"
-        ? false
-        : (botStats.data?.active ?? null)
+      : rawBotStatus === "stopping"
+        ? true
+        : rawBotStatus === "stopped"
+          ? false
+          : (botStats.data?.active ?? null)
   const botStatus = rawBotStatus || "stopped"
   const hasApiKeys = botStats.data?.has_api_keys ?? false
   const [insufficientTokens, setInsufficientTokens] = useState(false)
